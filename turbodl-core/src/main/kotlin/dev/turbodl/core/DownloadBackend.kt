@@ -1,0 +1,120 @@
+package dev.turbodl.core
+
+import java.io.File
+
+/**
+ * Download backend extension point (defined in core; reusable by the optional runtime).
+ *
+ * Design (hybrid A+B): core ships a built-in HTTP backend so it works standalone,
+ * while this interface lets the optional plugin runtime override the built-in one
+ * or add new protocols (HLS, FTP, magnet, ...) via a registry — WITHOUT core ever
+ * depending on the runtime module.
+ *
+ * A backend is responsible for the protocol layer: probing, fetching bytes into the
+ * work directory, and reporting progress through [BackendContext]. Merging, task
+ * state machine, events, and integrity checks stay in the engine ([TurboClient]).
+ *
+ * NOTE: reserved — future JS Provider / third-party shim adapter plugins may supply
+ * their own DownloadBackend implementations through the runtime's registry.
+ */
+interface DownloadBackend {
+    /** Stable identifier for diagnostics/logging (e.g. "builtin-http"). */
+    val name: String
+
+    /** Whether this backend can handle the given request (typically by URL scheme). */
+    fun supports(request: DownloadRequest): Boolean
+
+    /**
+     * Perform the download. Implementations should:
+     *  - honor [BackendContext.isActive] and cooperative coroutine cancellation;
+     *  - report total size via [BackendContext.reportTotalSize] once known;
+     *  - report progress via [BackendContext.reportProgress];
+     *  - optionally rate-limit writes via [BackendContext.throttle];
+     *  - write output into [BackendContext.workDir] and return ordered parts to merge.
+     *
+     * Throwing an exception signals failure (the engine will surface it as a failed task).
+     */
+    suspend fun download(context: BackendContext): BackendResult
+}
+
+/**
+ * Result of a backend download: an ordered list of files to be concatenated into the
+ * final destination, plus the authoritative total size (-1 if unknown).
+ * A single-file result (e.g. whole-file fallback) is simply a one-element list.
+ *
+ * [partOffsets] 可选：每个分片在最终文件中的**起始偏移**（与 [orderedParts] 一一对应）。
+ *
+ * 【为什么需要它】收尾托管会让在飞分片提前收工，其文件长度可能**超过**让出点，
+ * 与接手的分片产生**重叠**。按顺序拼接会把重叠部分算两次（长度校验失败）；
+ * 而按显式偏移写入是幂等的 —— 重叠区间会被写到同一位置，内容一致，结果仍正确。
+ *
+ * 为 null 时退回"顺序拼接"语义（第三方 backend 无需感知本字段）。
+ */
+class BackendResult(
+    val orderedParts: List<File>,
+    val totalBytes: Long,
+    val partOffsets: List<Long>? = null,
+)
+
+/**
+ * Services the engine provides to a backend during a download.
+ * Kept as a public interface so third-party backends never touch core internals.
+ */
+interface BackendContext {
+    val taskId: Long
+    val request: DownloadRequest
+
+    /** Per-task temporary working directory (already created). */
+    val workDir: File
+
+    /** Effective engine configuration snapshot. */
+    val config: TurboConfig
+
+    /** False once the task is paused/canceled; backends must stop promptly. */
+    fun isActive(): Boolean
+
+    /** Consume rate-limit budget for [bytes]; suspends when the global limit is exceeded. */
+    suspend fun throttle(bytes: Long)
+
+    /** Report the authoritative total size once known (-1 if unknown/streaming). */
+    fun reportTotalSize(total: Long)
+
+    /**
+     * 上报探测到的服务器元数据（尽力而为：任何字段都可能为 null）。
+     *
+     * 仅供宿主参考（如用服务器建议文件名重命名、记录 MIME），不影响引擎行为。
+     * 默认空实现，第三方 backend 无需实现。
+     *
+     * @param probeMs 探测阶段耗时（毫秒）。调用方已知大小且跳过探测时为 0；
+     *                宿主可据此区分「解析慢」到底是探测慢还是首连接慢。
+     * @param resumeNote 续传判定摘要（如 `parts=true weak=true changed=false print=MATCH discard=false`）。
+     *                   宿主可据此定位「断点续传为什么不生效」：是没找到旧分片、还是校验器变了、
+     *                   还是指纹比对不通过。
+     */
+    fun reportMetadata(
+        suggestedFileName: String?,
+        contentType: String?,
+        etag: String?,
+        lastModified: String?,
+        probeMs: Long = -1,
+        resumeNote: String = "",
+    ) { /* no-op by default */ }
+
+    /** Report cumulative downloaded bytes and current active connection count. */
+    suspend fun reportProgress(absoluteBytes: Long, activeConnections: Int)
+}
+
+/**
+ * Resolver that maps a request to the backend that should handle it.
+ *
+ * core installs no resolver by default and always uses the built-in HTTP backend.
+ * The optional runtime registers a resolver (its BackendRegistry) so that plugin
+ * backends can override the built-in or add protocols. Returning null means
+ * "let the engine fall back to the built-in backend".
+ *
+ * NOTE: reserved — the runtime's BackendRegistry implements this; core never
+ * references the runtime.
+ */
+fun interface BackendResolver {
+    fun resolve(request: DownloadRequest): DownloadBackend?
+}

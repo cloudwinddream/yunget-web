@@ -1,0 +1,308 @@
+// ---------- 通用 ----------
+async function api(path, method = 'GET', body) {
+  const opt = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body !== undefined) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt);
+  return r.json();
+}
+function showMsg(id, text, ok) {
+  const el = document.getElementById(id);
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+  el.textContent = text;
+}
+function hideMsg(id) { document.getElementById(id).className = 'msg'; }
+function fmtSize(n) {
+  if (!n || n <= 0) return '-';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v >= 100 ? 0 : 1) + ' ' + u[i];
+}
+function fmtSpeed(n) { return n > 0 ? fmtSize(n) + '/s' : ''; }
+
+// ---------- 页签 ----------
+document.querySelectorAll('nav.tabs button').forEach(b => {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('nav.tabs button').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    const tab = document.getElementById('tab-' + b.dataset.tab);
+    tab.classList.add('active');
+    stopTaskPoll();
+    if (b.dataset.tab === 'accounts') loadPlatforms();
+    if (b.dataset.tab === 'tasks') { loadTasks(); startTaskPoll(); }
+    if (b.dataset.tab === 'settings') loadSettings();
+  });
+});
+
+// ---------- 账号 ----------
+const LOGIN_HINTS = {
+  quark: 'pan.quark.cn', uc: 'drive.uc.cn', baidu: 'pan.baidu.com', c139: 'yun.139.com'
+};
+async function loadPlatforms() {
+  const r = await api('/api/platforms');
+  if (!r.ok) return;
+  const grid = document.getElementById('platGrid');
+  grid.innerHTML = '';
+  r.data.forEach(p => {
+    const d = document.createElement('div');
+    d.className = 'plat';
+    let body = '';
+    if (p.loginType === 'cookie') {
+      body = `
+        <label>Cookie（${LOGIN_HINTS[p.id] || ''}，F12 → 网络 → 复制请求头 Cookie）</label>
+        <textarea class="cookie" id="ck-${p.id}" placeholder="粘贴完整的 Cookie 字符串"></textarea>
+        <div class="row" style="margin-top:10px">
+          <button class="btn small" onclick="cookieLogin('${p.id}')">保存并验证</button>
+          ${p.loggedIn ? `<button class="danger small" onclick="logout('${p.id}')">退出</button>` : ''}
+        </div>`;
+    } else if (p.id === 'pan123') {
+      body = `
+        <label>账号（手机号/邮箱）</label><input type="text" id="u-${p.id}">
+        <label>密码</label><input type="password" id="p-${p.id}">
+        <div class="row" style="margin-top:10px">
+          <button class="btn small" onclick="pwdLogin('${p.id}')">登录</button>
+          ${p.loggedIn ? `<button class="danger small" onclick="logout('${p.id}')">退出</button>` : ''}
+        </div>`;
+    } else if (p.id === 'xunlei') {
+      body = `
+        <label>账号（手机号）</label><input type="text" id="u-xunlei">
+        <label>密码</label><input type="password" id="p-xunlei">
+        <div class="row" style="margin-top:10px">
+          <button class="btn small" onclick="xunleiLogin()">登录</button>
+          ${p.loggedIn ? `<button class="danger small" onclick="logout('xunlei')">退出</button>` : ''}
+        </div>
+        <div id="sms-xunlei" style="display:none">
+          <label>短信验证码（已发送到手机）</label>
+          <div class="row"><input type="text" id="smscode-xunlei" style="max-width:160px" placeholder="6位验证码">
+          <button class="btn small" onclick="xunleiSmsLogin()">验证并登录</button></div>
+        </div>`;
+    }
+    d.innerHTML = `
+      <h3>${p.name} <span class="badge ${p.loggedIn ? 'on' : ''}">${p.loggedIn ? '已登录' : '未登录'}</span></h3>
+      <div class="nick">${p.loggedIn && p.nickname ? '昵称：' + escapeHtml(p.nickname) : ''}</div>
+      ${body}
+      <div class="msg" id="msg-${p.id}"></div>`;
+    grid.appendChild(d);
+  });
+}
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function cookieLogin(pid) {
+  const v = document.getElementById('ck-' + pid).value.trim();
+  hideMsg('msg-' + pid);
+  if (!v) { showMsg('msg-' + pid, '请先粘贴 Cookie', false); return; }
+  const r = await api('/api/accounts/' + pid, 'POST', { cookie: v });
+  if (r.ok) { showMsg('msg-' + pid, '登录成功：' + (r.data.nickname || ''), true); setTimeout(loadPlatforms, 800); }
+  else showMsg('msg-' + pid, r.message || '登录失败', false);
+}
+async function pwdLogin(pid) {
+  const u = document.getElementById('u-' + pid).value.trim();
+  const p = document.getElementById('p-' + pid).value;
+  hideMsg('msg-' + pid);
+  if (!u || !p) { showMsg('msg-' + pid, '请输入账号和密码', false); return; }
+  const r = await api('/api/accounts/' + pid, 'POST', { username: u, password: p });
+  if (r.ok && r.data.nickname) { showMsg('msg-' + pid, '登录成功：' + r.data.nickname, true); setTimeout(loadPlatforms, 800); }
+  else if (r.ok) showMsg('msg-' + pid, '登录成功', true), setTimeout(loadPlatforms, 800);
+  else showMsg('msg-' + pid, r.message || '登录失败', false);
+}
+let xunleiSmsState = null;
+async function xunleiLogin() {
+  const u = document.getElementById('u-xunlei').value.trim();
+  const p = document.getElementById('p-xunlei').value;
+  hideMsg('msg-xunlei');
+  if (!u || !p) { showMsg('msg-xunlei', '请输入账号和密码', false); return; }
+  showMsg('msg-xunlei', '登录中…', true);
+  const r = await api('/api/accounts/xunlei', 'POST', { username: u, password: p });
+  if (!r.ok) { showMsg('msg-xunlei', r.message || '登录失败', false); return; }
+  const d = r.data;
+  if (d.needSms) {
+    // 新设备需短信验证：自动发送短信
+    const s = await api('/api/accounts/xunlei/sms', 'POST', { mobile: u });
+    if (!s.ok) { showMsg('msg-xunlei', s.message || '短信发送失败', false); return; }
+    xunleiSmsState = { mobile: u, creditKey: s.data.creditKey, smsToken: s.data.smsToken };
+    document.getElementById('sms-xunlei').style.display = 'block';
+    showMsg('msg-xunlei', '已发送短信验证码，请输入后验证', true);
+  } else if (d.nickname) {
+    showMsg('msg-xunlei', '登录成功：' + d.nickname, true);
+    setTimeout(loadPlatforms, 800);
+  } else {
+    showMsg('msg-xunlei', d.message || '登录失败', false);
+  }
+}
+async function xunleiSmsLogin() {
+  const code = document.getElementById('smscode-xunlei').value.trim();
+  if (!code || !xunleiSmsState) { showMsg('msg-xunlei', '请先获取短信验证码', false); return; }
+  const r = await api('/api/accounts/xunlei/sms-login', 'POST',
+    { mobile: xunleiSmsState.mobile, code, creditKey: xunleiSmsState.creditKey, smsToken: xunleiSmsState.smsToken });
+  if (r.ok) { showMsg('msg-xunlei', '登录成功：' + (r.data.nickname || ''), true); setTimeout(loadPlatforms, 800); }
+  else showMsg('msg-xunlei', r.message || '验证失败', false);
+}
+async function logout(pid) {
+  await api('/api/accounts/' + pid, 'DELETE');
+  loadPlatforms();
+}
+
+// ---------- 解析 ----------
+let curSession = null, curDirFid = '0', dirStack = [], curFiles = [];
+async function parseShare() {
+  const link = document.getElementById('shareLink').value.trim();
+  const pwd = document.getElementById('sharePwd').value.trim();
+  hideMsg('parseMsg');
+  if (!link) { showMsg('parseMsg', '请粘贴分享链接', false); return; }
+  const btn = document.getElementById('parseBtn');
+  btn.disabled = true; btn.textContent = '解析中…';
+  try {
+    const r = await api('/api/parse', 'POST', { link, pwd });
+    if (!r.ok) { showMsg('parseMsg', r.message || '解析失败', false); return; }
+    curSession = r.data.sessionId;
+    curDirFid = '0'; dirStack = [];
+    document.getElementById('fileCard').style.display = 'block';
+    document.getElementById('parseTitle').textContent = r.data.title || '分享文件';
+    document.getElementById('parsePlat').textContent = r.data.platformName;
+    await loadDir('0', '根目录');
+    showMsg('parseMsg', '解析成功', true);
+  } finally { btn.disabled = false; btn.textContent = '解析'; }
+}
+async function loadDir(fid, name) {
+  const r = await api(`/api/sessions/${curSession}/files?dirFid=${encodeURIComponent(fid)}`);
+  if (!r.ok) { showMsg('parseMsg', r.message || '获取文件列表失败', false); return; }
+  curFiles = r.data; curDirFid = fid;
+  renderFiles(); renderCrumb();
+}
+function renderCrumb() {
+  const c = document.getElementById('crumb');
+  c.innerHTML = '';
+  const mk = (label, idx) => {
+    const b = document.createElement('button'); b.textContent = label;
+    b.onclick = () => {
+      dirStack = dirStack.slice(0, idx);
+      const t = idx === 0 ? { fid: '0', name: '根目录' } : dirStack[idx - 1];
+      loadDir(t.fid, t.name);
+    };
+    return b;
+  };
+  c.appendChild(mk('根目录', 0));
+  dirStack.forEach((d, i) => {
+    const s = document.createElement('span'); s.className = 'sep'; s.textContent = '/'; c.appendChild(s);
+    c.appendChild(mk(d.name, i + 1));
+  });
+}
+function renderFiles() {
+  const el = document.getElementById('fileList');
+  if (!curFiles.length) { el.innerHTML = '<div class="empty">空文件夹</div>'; return; }
+  const dirs = curFiles.filter(f => f.isdir), files = curFiles.filter(f => !f.isdir);
+  const sorted = [...dirs, ...files];
+  let html = '<table class="files"><tr><th style="width:34px"></th><th>文件名</th><th style="width:90px">大小</th><th style="width:130px">修改时间</th></tr>';
+  sorted.forEach((f, i) => {
+    const cb = f.isdir ? '' : `<input type="checkbox" data-i="${curFiles.indexOf(f)}" onchange="updateSel()">`;
+    const name = f.isdir
+      ? `<a href="javascript:void(0)" onclick="enterDir(${curFiles.indexOf(f)})" style="color:#1a73e8">📁 ${escapeHtml(f.fname)}</a>`
+      : `📄 ${escapeHtml(f.fname)}`;
+    html += `<tr><td>${cb}</td><td>${name}</td><td>${f.isdir ? '-' : fmtSize(f.fsize)}</td><td style="color:#999;font-size:12px">${escapeHtml(f.modifyTime || '')}</td></tr>`;
+  });
+  el.innerHTML = html + '</table>';
+  updateSel();
+}
+function enterDir(i) {
+  const f = curFiles[i];
+  dirStack.push({ fid: f.fid, name: f.fname });
+  loadDir(f.fid, f.fname);
+}
+function toggleAll(on) {
+  document.querySelectorAll('#fileList input[type=checkbox]').forEach(c => c.checked = on);
+  updateSel();
+}
+function updateSel() {
+  const n = document.querySelectorAll('#fileList input[type=checkbox]:checked').length;
+  document.getElementById('selInfo').textContent = n ? `已选 ${n} 个文件` : '';
+}
+async function downloadSelected() {
+  const idx = [...document.querySelectorAll('#fileList input[type=checkbox]:checked')].map(c => +c.dataset.i);
+  hideMsg('dlMsg');
+  if (!idx.length) { showMsg('dlMsg', '请先勾选要下载的文件', false); return; }
+  const btn = document.getElementById('dlBtn');
+  btn.disabled = true; btn.textContent = '取链中…（每个文件需转存+取直链）';
+  try {
+    const files = idx.map(i => curFiles[i]);
+    const r = await api('/api/downloads', 'POST', { sessionId: curSession, files });
+    if (!r.ok) { showMsg('dlMsg', r.message || '提交失败', false); return; }
+    showMsg('dlMsg', `已加入 ${r.data.taskIds.length} 个下载任务，可到「下载任务」页查看进度`, true);
+  } finally { btn.disabled = false; btn.textContent = '下载选中'; }
+}
+async function directDownload() {
+  const url = document.getElementById('directUrl').value.trim();
+  const name = document.getElementById('directName').value.trim();
+  hideMsg('directMsg');
+  if (!url) { showMsg('directMsg', '请输入下载链接', false); return; }
+  const r = await api('/api/downloads/direct', 'POST', { url, fileName: name });
+  if (r.ok) showMsg('directMsg', '已加入下载任务，可到「下载任务」页查看进度', true);
+  else showMsg('directMsg', r.message || '提交失败', false);
+}
+
+// ---------- 下载任务 ----------
+let pollTimer = null;
+function startTaskPoll() { stopTaskPoll(); pollTimer = setInterval(loadTasks, 2000); }
+function stopTaskPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+const STATUS_TXT = { downloading: '下载中', paused: '已暂停', completed: '已完成', failed: '失败' };
+async function loadTasks() {
+  const r = await api('/api/tasks');
+  if (!r.ok) return;
+  const list = r.data;
+  document.getElementById('taskCount').textContent = list.length ? `(${list.length})` : '';
+  const el = document.getElementById('taskList');
+  if (!list.length) { el.innerHTML = '<div class="empty">暂无下载任务</div>'; return; }
+  el.innerHTML = '';
+  list.forEach(t => {
+    const d = document.createElement('div');
+    d.className = 'task';
+    const pct = t.total > 0 ? Math.min(100, Math.round(t.downloaded * 100 / t.total)) : 0;
+    const bar = t.status === 'completed' ? 'done' : (t.status === 'failed' ? 'fail' : '');
+    let actions = '';
+    if (t.status === 'downloading') actions += `<button class="ghost small" onclick="taskOp(${t.id},'pause')">暂停</button>`;
+    if (t.status === 'paused' || t.status === 'failed') actions += `<button class="ghost small" onclick="taskOp(${t.id},'resume')">继续</button>`;
+    if (t.status === 'completed') actions += `<a class="btn small" style="text-decoration:none;display:inline-block" href="/api/tasks/${t.id}/file">保存到本地</a>`;
+    actions += `<button class="danger small" onclick="taskDel(${t.id}, ${t.status === 'completed'})">删除</button>`;
+    d.innerHTML = `
+      <div class="name">${escapeHtml(t.fileName)}</div>
+      <div class="pbar ${bar}"><div style="width:${t.status === 'completed' ? 100 : pct}%"></div></div>
+      <div class="meta">
+        <span class="status ${t.status}">${STATUS_TXT[t.status] || t.status}</span>
+        <span>${fmtSize(t.downloaded)} / ${fmtSize(t.total)}${t.total > 0 && t.status !== 'completed' ? ' · ' + pct + '%' : ''}</span>
+        ${t.status === 'downloading' && t.speed > 0 ? `<span>${fmtSpeed(t.speed)}</span>` : ''}
+      </div>
+      ${t.error ? `<div class="err-text">${escapeHtml(t.error)}</div>` : ''}
+      <div class="actions">${actions}</div>`;
+    el.appendChild(d);
+  });
+}
+async function taskOp(id, op) { await api(`/api/tasks/${id}/${op}`, 'POST'); loadTasks(); }
+async function taskDel(id, completed) {
+  const del = completed ? confirm('同时删除服务器上的文件？') : true;
+  if (!completed || del !== null) {
+    await api(`/api/tasks/${id}?deleteFile=${completed && del ? 'true' : 'false'}`, 'DELETE');
+    loadTasks();
+  }
+}
+
+// ---------- 设置 ----------
+async function loadSettings() {
+  const r = await api('/api/settings');
+  if (!r.ok) return;
+  const s = r.data;
+  document.getElementById('setConn').value = s.maxConnections;
+  document.getElementById('setConc').value = s.maxConcurrentTasks;
+  document.getElementById('setLimit').value = (s.speedLimitBps / 1048576).toFixed(1);
+  document.getElementById('setRetry').value = s.maxRetries;
+}
+async function saveSettings() {
+  hideMsg('setMsg');
+  const s = {
+    maxConnections: Math.max(1, parseInt(document.getElementById('setConn').value) || 16),
+    maxConcurrentTasks: Math.max(1, parseInt(document.getElementById('setConc').value) || 3),
+    speedLimitBps: Math.round((parseFloat(document.getElementById('setLimit').value) || 0) * 1048576),
+    maxRetries: Math.max(0, parseInt(document.getElementById('setRetry').value) || 0)
+  };
+  const r = await api('/api/settings', 'PUT', s);
+  showMsg('setMsg', r.ok ? '设置已保存并即时生效' : (r.message || '保存失败'), r.ok);
+}

@@ -1,0 +1,13 @@
+services:
+  yunget-web:
+    build: .
+    image: yunget-web:latest
+    container_name: yunget-web
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data   # 下载文件 / 账号凭证 / 任务记录持久化
+    environment:
+      - YUNGET_DATA_DIR=/data
+      - PORT=8080
+    restart: unless-stopped

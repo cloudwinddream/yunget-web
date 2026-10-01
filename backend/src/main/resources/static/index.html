@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YunGet 网页版</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>☁️ YunGet 网页版</h1>
+  <span class="sub">网盘分享解析 · 高速下载 · 夸克 / UC / 迅雷 / 百度 / 123 / 139</span>
+</header>
+<nav class="tabs">
+  <button class="active" data-tab="parse">解析下载</button>
+  <button data-tab="accounts">账号</button>
+  <button data-tab="tasks">下载任务 <span id="taskCount"></span></button>
+  <button data-tab="settings">设置</button>
+</nav>
+<main>
+  <!-- 解析下载 -->
+  <section class="tab active" id="tab-parse">
+    <div class="card">
+      <h2>分享链接解析</h2>
+      <label>分享链接</label>
+      <input type="text" id="shareLink" placeholder="粘贴夸克 / UC / 迅雷 / 百度 / 123 / 139 的分享链接">
+      <label>提取码（如有）</label>
+      <input type="text" id="sharePwd" placeholder="4 位提取码，可留空（链接里自带的可自动识别）" style="max-width:300px">
+      <div class="row" style="margin-top:12px">
+        <button class="btn" id="parseBtn" onclick="parseShare()">解析</button>
+        <span class="hint">解析前请先到「账号」页登录对应网盘</span>
+      </div>
+      <div class="msg" id="parseMsg"></div>
+    </div>
+    <div class="card" id="fileCard" style="display:none">
+      <h2><span id="parseTitle"></span> <span class="hint" id="parsePlat"></span></h2>
+      <div class="crumb" id="crumb"></div>
+      <div class="toolbar">
+        <button class="ghost small" onclick="toggleAll(true)">全选文件</button>
+        <button class="ghost small" onclick="toggleAll(false)">取消全选</button>
+        <button class="btn small" id="dlBtn" onclick="downloadSelected()">下载选中</button>
+        <span class="hint" id="selInfo"></span>
+      </div>
+      <div id="fileList"></div>
+      <div class="msg" id="dlMsg"></div>
+    </div>
+    <div class="card">
+      <h2>普通直链下载</h2>
+      <label>文件直链（http/https）</label>
+      <input type="text" id="directUrl" placeholder="https://...">
+      <label>保存文件名（可选）</label>
+      <input type="text" id="directName" placeholder="留空则自动识别" style="max-width:300px">
+      <div class="row" style="margin-top:12px">
+        <button class="btn" onclick="directDownload()">开始下载</button>
+      </div>
+      <div class="msg" id="directMsg"></div>
+    </div>
+  </section>
+
+  <!-- 账号 -->
+  <section class="tab" id="tab-accounts">
+    <div class="card">
+      <h2>网盘账号</h2>
+      <p class="hint" style="margin-top:0">
+        夸克 / UC / 百度 / 139 使用 <b>Cookie 登录</b>：在电脑浏览器登录对应网盘网页版后，按
+        <code>F12</code> → <code>网络(Network)</code> → 刷新页面 → 任选一个请求 →
+        复制请求头中的 <code>Cookie</code> 整串粘贴到下方。<br>
+        迅雷使用账号密码登录（新设备首次登录需短信验证）；123 云盘使用账号密码登录。
+      </p>
+    </div>
+    <div class="grid" id="platGrid"></div>
+  </section>
+
+  <!-- 下载任务 -->
+  <section class="tab" id="tab-tasks">
+    <div class="card">
+      <h2>下载任务</h2>
+      <div class="toolbar">
+        <button class="ghost small" onclick="loadTasks()">刷新</button>
+        <span class="hint">文件保存在服务器下载目录，完成后点「保存到本地」经浏览器取回</span>
+      </div>
+      <div id="taskList"><div class="empty">暂无下载任务</div></div>
+    </div>
+  </section>
+
+  <!-- 设置 -->
+  <section class="tab" id="tab-settings">
+    <div class="card">
+      <h2>下载设置</h2>
+      <div class="setrow"><label>每任务连接数</label><input type="text" id="setConn" inputmode="numeric"><span class="hint">1–128，默认 16</span></div>
+      <div class="setrow"><label>同时下载任务数</label><input type="text" id="setConc" inputmode="numeric"><span class="hint">1–64，默认 3</span></div>
+      <div class="setrow"><label>全局限速（MB/s）</label><input type="text" id="setLimit" inputmode="decimal"><span class="hint">0 = 不限速</span></div>
+      <div class="setrow"><label>失败重试次数</label><input type="text" id="setRetry" inputmode="numeric"><span class="hint">0–50，默认 3</span></div>
+      <div class="row" style="margin-top:14px"><button class="btn" onclick="saveSettings()">保存设置</button></div>
+      <div class="msg" id="setMsg"></div>
+    </div>
+    <div class="card">
+      <h2>关于</h2>
+      <p class="hint">YunGet 网页版由开源项目 YunGet（AGPL-3.0）移植，下载引擎为 TurboDL。本服务仅供个人学习使用，网盘接口来自逆向分析，可能随官方改版失效。</p>
+    </div>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
