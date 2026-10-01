@@ -29,6 +29,18 @@
 | 14 | 服务重启后任务恢复 | ✅ 任务记录从 tasks.json 恢复 |
 | 15 | 服务重启后设置恢复 | ✅ |
 | 16 | ShareLinkParser 单元测试（6 平台 + 非法输入） | ✅ 11/11 通过 |
+| 17 | 夸克扫码 token 接口可达性（curl） | ✅ 返回真实 token，`status=2000000` |
+| 18 | `POST /api/qrlogin/quark` | ✅ 沙箱内网络被拦截时优雅返回失败信息，服务不崩溃 |
+| 19 | `POST /api/qrlogin/baidu` | ✅ `{"ok":false,"message":"该平台暂不支持扫码登录，请用 Cookie 方式"}` |
+| 20 | `GET /api/qrlogin/quark/status`（未知 session） | ✅ `{"status":"expired","message":"二维码已过期，请重新获取"}` |
+| 21 | `DELETE /api/qrlogin/session` | ✅ `{"done":true}` |
+| 22 | 扫码 JSON 解析逻辑（token/ticket/等待态/Set-Cookie 提取） | ✅ 用真实接口样本离线验证通过 |
+| 23 | `POST /api/tasks/batch-delete`（空列表） | ✅ `{"deleted":0}` |
+| 24 | `GET /api/settings` 含 `autoDownload` | ✅ 默认为 true |
+| 25 | `PUT /api/settings` 持久化 `autoDownload` | ✅ 改 false 后 GET 一致 |
+| 26 | 前端 `qrcode.js` 二维码生成（node） | ✅ 正常输出 SVG |
+| 27 | 前端 `app.js` / `qrcode.js` 语法 | ✅ `node --check` 通过 |
+| 28 | 静态资源 `/qrcode.js`、首页含扫码弹窗/全选/自动下载开关 | ✅ 均为 200，元素存在 |
 
 ## 已知限制（非代码问题）
 
@@ -39,6 +51,11 @@
 2. **六个网盘的真实联网解析未实测**：无真实 Cookie/Token/分享链接。
    解析协议代码完整移植自上游 Android 版（26 个文件），逻辑一致。
 3. 上游网盘接口来自逆向分析，可能随官方更新失效；百度账号有风控风险。
+4. **扫码登录的完整链路（扫码→确认→Cookie 落地）需真实账号实测**：
+   沙箱内 Java 出站被拦截，且无可扫码的夸克/UC 账号。
+   已验证：取 token 接口真实可用、二维码可正常渲染、轮询/过期/失败
+   各状态处理正确、扫码成功后走现有 `saveCookie` 校验链路。
+   百度/139 暂无可验证的扫码接口，保留手动填入。
 
 ## 安全提醒
 

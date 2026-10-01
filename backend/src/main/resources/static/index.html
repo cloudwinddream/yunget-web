@@ -77,7 +77,13 @@
       <h2>下载任务</h2>
       <div class="toolbar">
         <button class="ghost small" onclick="loadTasks()">刷新</button>
-        <span class="hint">文件保存在服务器下载目录，完成后点「保存到本地」经浏览器取回</span>
+        <span class="hint">文件保存在服务器下载目录，完成后自动经浏览器取回（可在设置中关闭）</span>
+      </div>
+      <div class="ckbar">
+        <input type="checkbox" id="ckAll" onchange="toggleTaskCk(this.checked)">
+        <label for="ckAll">全选</label>
+        <button class="danger small" onclick="delSelected()">删除所选</button>
+        <span class="hint" id="selCount"></span>
       </div>
       <div id="taskList"><div class="empty">暂无下载任务</div></div>
     </div>
@@ -91,6 +97,7 @@
       <div class="setrow"><label>同时下载任务数</label><input type="text" id="setConc" inputmode="numeric"><span class="hint">1–64，默认 3</span></div>
       <div class="setrow"><label>全局限速（MB/s）</label><input type="text" id="setLimit" inputmode="decimal"><span class="hint">0 = 不限速</span></div>
       <div class="setrow"><label>失败重试次数</label><input type="text" id="setRetry" inputmode="numeric"><span class="hint">0–50，默认 3</span></div>
+      <div class="setrow"><label>完成后自动下载到本地</label><input type="checkbox" id="setAutoDl" style="width:18px;height:18px"><span class="hint">任务完成时自动触发浏览器下载</span></div>
       <div class="row" style="margin-top:14px"><button class="btn" onclick="saveSettings()">保存设置</button></div>
       <div class="msg" id="setMsg"></div>
     </div>
@@ -99,7 +106,17 @@
       <p class="hint">YunGet 网页版由开源项目 YunGet（AGPL-3.0）移植，下载引擎为 TurboDL。本服务仅供个人学习使用，网盘接口来自逆向分析，可能随官方改版失效。</p>
     </div>
   </section>
+  <!-- 扫码登录弹窗 -->
+  <div class="modal" id="qrModal" style="display:none">
+    <div class="modal-box">
+      <h3 id="qrTitle">扫码登录</h3>
+      <div id="qrImg"></div>
+      <div class="msg" id="qrStatus">请用手机 App 扫码确认</div>
+      <div class="row" style="justify-content:center"><button class="ghost small" onclick="qrCancel()">取消</button></div>
+    </div>
+  </div>
 </main>
+<script src="qrcode.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

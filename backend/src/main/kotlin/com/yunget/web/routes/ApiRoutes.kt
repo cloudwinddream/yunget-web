@@ -2,7 +2,9 @@ package com.yunget.web.routes
 
 import com.yunget.app.data.network.model.ShareFile
 import com.yunget.web.model.ApiResult
+import com.yunget.web.model.BatchDeleteRequest
 import com.yunget.web.model.CookieLoginRequest
+import com.yunget.web.model.QrStatusResponse
 import com.yunget.web.model.DirectDownloadRequest
 import com.yunget.web.model.DownloadSubmitRequest
 import com.yunget.web.model.FileItem
@@ -17,6 +19,7 @@ import com.yunget.web.model.ok
 import com.yunget.web.service.DownloadService
 import com.yunget.web.service.NetdiskService
 import com.yunget.web.service.Platform
+import com.yunget.web.service.QrLoginService
 import io.ktor.http.ContentDisposition
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
@@ -107,6 +110,50 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService) {
         delete("/accounts/{platform}") {
             val platform = call.parameters["platform"] ?: return@delete call.respond(fail("缺少平台参数"))
             netdisk.logout(platform)
+            call.respond(ok(mapOf("done" to true)))
+        }
+
+        // ---------- 扫码登录（夸克 / UC）----------
+        post("/qrlogin/{platform}") {
+            val platform = call.parameters["platform"] ?: return@post call.respond(fail("缺少平台参数"))
+            if (!QrLoginService.supported(platform)) {
+                return@post call.respond(fail("该平台暂不支持扫码登录，请用 Cookie 方式"))
+            }
+            try {
+                val (sessionId, qrUrl) = QrLoginService.start(platform)
+                call.respond(ok(mapOf("sessionId" to sessionId, "qrUrl" to qrUrl)))
+            } catch (e: Exception) {
+                call.respond(fail("获取二维码失败：${e.message}"))
+            }
+        }
+        get("/qrlogin/{platform}/status") {
+            val platform = call.parameters["platform"] ?: return@get call.respond(fail("缺少平台参数"))
+            val sessionId = call.request.queryParameters["sessionId"]
+                ?: return@get call.respond(fail("缺少 sessionId"))
+            val r = QrLoginService.poll(sessionId)
+            when (r.status) {
+                "success" -> {
+                    val nr = netdisk.saveCookie(platform, r.cookie ?: "")
+                    nr.fold(
+                        onSuccess = { call.respond(ok(QrStatusResponse("success", nickname = it))) },
+                        onFailure = {
+                            call.respond(
+                                ok(
+                                    QrStatusResponse(
+                                        "failed",
+                                        message = "扫码成功，但 Cookie 验证失败：${it.message}"
+                                    )
+                                )
+                            )
+                        }
+                    )
+                }
+                else -> call.respond(ok(QrStatusResponse(r.status, message = r.message)))
+            }
+        }
+        delete("/qrlogin/session") {
+            val sessionId = call.request.queryParameters["sessionId"]
+            if (sessionId != null) QrLoginService.cancel(sessionId)
             call.respond(ok(mapOf("done" to true)))
         }
 
@@ -211,6 +258,15 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService) {
             val deleteFile = call.request.queryParameters["deleteFile"] == "true"
             downloads.delete(id, deleteFile)
             call.respond(ok(mapOf("done" to true)))
+        }
+
+        post("/tasks/batch-delete") {
+            val req = call.receive<BatchDeleteRequest>()
+            var n = 0
+            req.ids.forEach { id ->
+                runCatching { downloads.delete(id, req.deleteFile); n++ }
+            }
+            call.respond(ok(mapOf("deleted" to n)))
         }
 
         get("/tasks/{id}/file") {

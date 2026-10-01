@@ -20,6 +20,10 @@ function fmtSize(n) {
 }
 function fmtSpeed(n) { return n > 0 ? fmtSize(n) + '/s' : ''; }
 
+// 全局设置（启动时加载，供自动下载等使用）
+let SETTINGS = { autoDownload: true };
+(async () => { try { const r = await api('/api/settings'); if (r.ok) SETTINGS = r.data; } catch (e) {} })();
+
 // ---------- 页签 ----------
 document.querySelectorAll('nav.tabs button').forEach(b => {
   b.addEventListener('click', () => {
@@ -54,6 +58,7 @@ async function loadPlatforms() {
         <textarea class="cookie" id="ck-${p.id}" placeholder="粘贴完整的 Cookie 字符串"></textarea>
         <div class="row" style="margin-top:10px">
           <button class="btn small" onclick="cookieLogin('${p.id}')">保存并验证</button>
+          ${(p.id === 'quark' || p.id === 'uc') ? `<button class="btn small" onclick="qrLogin('${p.id}')">扫码登录</button>` : ''}
           ${p.loggedIn ? `<button class="danger small" onclick="logout('${p.id}')">退出</button>` : ''}
         </div>`;
     } else if (p.id === 'pan123') {
@@ -141,6 +146,50 @@ async function xunleiSmsLogin() {
 async function logout(pid) {
   await api('/api/accounts/' + pid, 'DELETE');
   loadPlatforms();
+}
+
+// ---------- 扫码登录（夸克 / UC）----------
+let qrTimer = null, qrSessionId = null;
+async function qrLogin(pid) {
+  hideMsg('msg-' + pid);
+  const r = await api('/api/qrlogin/' + pid, 'POST');
+  if (!r.ok) { showMsg('msg-' + pid, r.message || '获取二维码失败', false); return; }
+  qrSessionId = r.data.sessionId;
+  document.getElementById('qrTitle').textContent = (pid === 'uc' ? 'UC网盘' : '夸克网盘') + '扫码登录';
+  try {
+    const qr = qrcode(0, 'M');
+    qr.addData(r.data.qrUrl);
+    qr.make();
+    document.getElementById('qrImg').innerHTML = qr.createSvgTag({ scalable: true });
+  } catch (e) {
+    document.getElementById('qrImg').innerHTML = '<p class="hint">二维码生成失败</p>';
+  }
+  const st = document.getElementById('qrStatus');
+  st.className = 'msg'; st.textContent = '请用手机 App 扫码确认';
+  document.getElementById('qrModal').style.display = 'flex';
+  clearInterval(qrTimer);
+  qrTimer = setInterval(() => qrPoll(pid), 2000);
+}
+async function qrPoll(pid) {
+  const r = await api('/api/qrlogin/' + pid + '/status?sessionId=' + encodeURIComponent(qrSessionId));
+  if (!r.ok) { qrStop('获取状态失败，请重试'); return; }
+  const s = r.data.status;
+  if (s === 'success') {
+    qrStop();
+    document.getElementById('qrModal').style.display = 'none';
+    loadPlatforms();
+  }
+  else if (s === 'expired') qrStop('二维码已过期，请关闭后重新获取');
+  else if (s === 'failed') qrStop(r.data.message || '登录失败，请重试');
+}
+function qrStop(msg) {
+  if (qrTimer) { clearInterval(qrTimer); qrTimer = null; }
+  if (msg) document.getElementById('qrStatus').textContent = msg;
+}
+async function qrCancel() {
+  if (qrSessionId) { try { await api('/api/qrlogin/session?sessionId=' + encodeURIComponent(qrSessionId), 'DELETE'); } catch (e) {} }
+  qrStop();
+  document.getElementById('qrModal').style.display = 'none';
 }
 
 // ---------- 解析 ----------
@@ -245,13 +294,28 @@ let pollTimer = null;
 function startTaskPoll() { stopTaskPoll(); pollTimer = setInterval(loadTasks, 2000); }
 function stopTaskPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 const STATUS_TXT = { downloading: '下载中', paused: '已暂停', completed: '已完成', failed: '失败' };
+let prevTaskStatus = null;      // 上一轮各任务状态，用于检测"新完成"
+let taskMap = {};               // id -> task
+const selectedTasks = new Set();
 async function loadTasks() {
   const r = await api('/api/tasks');
   if (!r.ok) return;
   const list = r.data;
   document.getElementById('taskCount').textContent = list.length ? `(${list.length})` : '';
+  taskMap = {};
+  const cur = {};
+  list.forEach(t => {
+    taskMap[t.id] = t;
+    cur[t.id] = t.status;
+    // 新完成的任务：自动触发浏览器下载
+    if (SETTINGS.autoDownload && prevTaskStatus && prevTaskStatus[t.id] !== 'completed' && t.status === 'completed') {
+      triggerDownload(t.id);
+    }
+  });
+  prevTaskStatus = cur;
+  [...selectedTasks].forEach(id => { if (!(id in cur)) selectedTasks.delete(id); });
   const el = document.getElementById('taskList');
-  if (!list.length) { el.innerHTML = '<div class="empty">暂无下载任务</div>'; return; }
+  if (!list.length) { el.innerHTML = '<div class="empty">暂无下载任务</div>'; updateSelCount(); return; }
   el.innerHTML = '';
   list.forEach(t => {
     const d = document.createElement('div');
@@ -264,17 +328,60 @@ async function loadTasks() {
     if (t.status === 'completed') actions += `<a class="btn small" style="text-decoration:none;display:inline-block" href="/api/tasks/${t.id}/file">保存到本地</a>`;
     actions += `<button class="danger small" onclick="taskDel(${t.id}, ${t.status === 'completed'})">删除</button>`;
     d.innerHTML = `
-      <div class="name">${escapeHtml(t.fileName)}</div>
-      <div class="pbar ${bar}"><div style="width:${t.status === 'completed' ? 100 : pct}%"></div></div>
-      <div class="meta">
-        <span class="status ${t.status}">${STATUS_TXT[t.status] || t.status}</span>
-        <span>${fmtSize(t.downloaded)} / ${fmtSize(t.total)}${t.total > 0 && t.status !== 'completed' ? ' · ' + pct + '%' : ''}</span>
-        ${t.status === 'downloading' && t.speed > 0 ? `<span>${fmtSpeed(t.speed)}</span>` : ''}
-      </div>
-      ${t.error ? `<div class="err-text">${escapeHtml(t.error)}</div>` : ''}
-      <div class="actions">${actions}</div>`;
+      <div class="trow">
+        <input type="checkbox" class="taskCk" data-id="${t.id}" ${selectedTasks.has(t.id) ? 'checked' : ''} onchange="taskCkChanged(this)">
+        <div class="tbody">
+          <div class="name">${escapeHtml(t.fileName)}</div>
+          <div class="pbar ${bar}"><div style="width:${t.status === 'completed' ? 100 : pct}%"></div></div>
+          <div class="meta">
+            <span class="status ${t.status}">${STATUS_TXT[t.status] || t.status}</span>
+            <span>${fmtSize(t.downloaded)} / ${fmtSize(t.total)}${t.total > 0 && t.status !== 'completed' ? ' · ' + pct + '%' : ''}</span>
+            ${t.status === 'downloading' && t.speed > 0 ? `<span>${fmtSpeed(t.speed)}</span>` : ''}
+          </div>
+          ${t.error ? `<div class="err-text">${escapeHtml(t.error)}</div>` : ''}
+          <div class="actions">${actions}</div>
+        </div>
+      </div>`;
     el.appendChild(d);
   });
+  updateSelCount();
+  const all = document.querySelectorAll('.taskCk');
+  document.getElementById('ckAll').checked = all.length > 0 && [...all].every(c => c.checked);
+}
+function triggerDownload(id) {
+  const a = document.createElement('a');
+  a.href = '/api/tasks/' + id + '/file';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => a.remove(), 1000);
+}
+function toggleTaskCk(on) {
+  document.querySelectorAll('.taskCk').forEach(c => {
+    c.checked = on;
+    const id = +c.dataset.id;
+    if (on) selectedTasks.add(id); else selectedTasks.delete(id);
+  });
+  updateSelCount();
+}
+function taskCkChanged(cb) {
+  const id = +cb.dataset.id;
+  if (cb.checked) selectedTasks.add(id); else selectedTasks.delete(id);
+  updateSelCount();
+  const all = document.querySelectorAll('.taskCk');
+  document.getElementById('ckAll').checked = all.length > 0 && [...all].every(c => c.checked);
+}
+function updateSelCount() {
+  document.getElementById('selCount').textContent = selectedTasks.size ? `已选 ${selectedTasks.size} 项` : '';
+}
+async function delSelected() {
+  if (!selectedTasks.size) return;
+  const ids = [...selectedTasks];
+  const anyCompleted = ids.some(id => taskMap[id] && taskMap[id].status === 'completed');
+  const delFile = anyCompleted ? confirm('所选包含已完成任务，同时删除服务器上的文件？') : false;
+  await api('/api/tasks/batch-delete', 'POST', { ids, deleteFile: delFile });
+  selectedTasks.clear();
+  loadTasks();
 }
 async function taskOp(id, op) { await api(`/api/tasks/${id}/${op}`, 'POST'); loadTasks(); }
 async function taskDel(id, completed) {
@@ -290,10 +397,12 @@ async function loadSettings() {
   const r = await api('/api/settings');
   if (!r.ok) return;
   const s = r.data;
+  SETTINGS = s;
   document.getElementById('setConn').value = s.maxConnections;
   document.getElementById('setConc').value = s.maxConcurrentTasks;
   document.getElementById('setLimit').value = (s.speedLimitBps / 1048576).toFixed(1);
   document.getElementById('setRetry').value = s.maxRetries;
+  document.getElementById('setAutoDl').checked = s.autoDownload !== false;
 }
 async function saveSettings() {
   hideMsg('setMsg');
@@ -301,8 +410,10 @@ async function saveSettings() {
     maxConnections: Math.max(1, parseInt(document.getElementById('setConn').value) || 16),
     maxConcurrentTasks: Math.max(1, parseInt(document.getElementById('setConc').value) || 3),
     speedLimitBps: Math.round((parseFloat(document.getElementById('setLimit').value) || 0) * 1048576),
-    maxRetries: Math.max(0, parseInt(document.getElementById('setRetry').value) || 0)
+    maxRetries: Math.max(0, parseInt(document.getElementById('setRetry').value) || 0),
+    autoDownload: document.getElementById('setAutoDl').checked
   };
+  SETTINGS = s;
   const r = await api('/api/settings', 'PUT', s);
   showMsg('setMsg', r.ok ? '设置已保存并即时生效' : (r.message || '保存失败'), r.ok);
 }

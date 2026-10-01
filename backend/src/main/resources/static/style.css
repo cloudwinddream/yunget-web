@@ -60,3 +60,12 @@ table.files tr.dir:hover td { background: #f6f9ff; }
 .empty { text-align: center; color: #aaa; padding: 30px 0; font-size: 14px; }
 .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
 @media (max-width: 640px) { .setrow label { width: 120px; } header h1 { font-size: 16px; } }
+.modal { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 100; }
+.modal-box { background: #fff; border-radius: 12px; padding: 24px; width: 320px; max-width: 90vw; text-align: center; }
+.modal-box h3 { margin: 0 0 14px; font-size: 16px; }
+.modal-box #qrImg svg { width: 220px; height: 220px; }
+.modal-box .msg { min-height: 20px; margin: 10px 0; font-size: 13px; }
+.task .trow { display: flex; gap: 10px; align-items: flex-start; }
+.task .trow .taskCk { margin-top: 3px; width: 16px; height: 16px; flex-shrink: 0; }
+.task .tbody { flex: 1; min-width: 0; }
+.ckbar { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; font-size: 13px; }

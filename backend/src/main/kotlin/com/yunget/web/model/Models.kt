@@ -74,11 +74,18 @@ data class SettingsData(
     val maxConnections: Int = 16,
     val maxConcurrentTasks: Int = 3,
     val speedLimitBps: Long = 0,
-    val maxRetries: Int = 3
+    val maxRetries: Int = 3,
+    val autoDownload: Boolean = true
 )
 
 @Serializable
 data class CookieLoginRequest(val cookie: String)
+
+@Serializable
+data class QrStatusResponse(val status: String, val nickname: String? = null, val message: String? = null)
+
+@Serializable
+data class BatchDeleteRequest(val ids: List<Long>, val deleteFile: Boolean = false)
 
 @Serializable
 data class PasswordLoginRequest(val username: String, val password: String)
