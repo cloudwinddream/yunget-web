@@ -32,7 +32,6 @@ import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.put
 import io.ktor.server.routing.route
-import java.net.URLEncoder
 
 fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService) {
     route("/api") {
@@ -221,11 +220,13 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService) {
                 call.respond(HttpStatusCode.NotFound, fail("文件不存在或任务未完成"))
                 return@get
             }
-            val encoded = URLEncoder.encode(file.name, "UTF-8").replace("+", "%20")
+            // filename* 按 RFC 5987 编码：直接传原始文件名，由 Ktor 负责
+            // 百分号编码。注意不能自己先 URLEncoder.encode，否则 Ktor 会
+            // 对 % 再编码一次（%25），导致中文文件名下载时显示为乱码。
             call.response.header(
                 HttpHeaders.ContentDisposition,
                 ContentDisposition.Attachment.withParameter(
-                    ContentDisposition.Parameters.FileNameAsterisk, encoded
+                    ContentDisposition.Parameters.FileNameAsterisk, file.name
                 ).toString()
             )
             call.respond(LocalFileContent(file, ContentType.Application.OctetStream))
