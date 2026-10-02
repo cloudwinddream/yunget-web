@@ -20,10 +20,6 @@ function fmtSize(n) {
 }
 function fmtSpeed(n) { return n > 0 ? fmtSize(n) + '/s' : ''; }
 
-// 全局设置（启动时加载，供自动下载等使用）
-let SETTINGS = { autoDownload: true };
-(async () => { try { const r = await api('/api/settings'); if (r.ok) SETTINGS = r.data; } catch (e) {} })();
-
 // ---------- 页签 ----------
 document.querySelectorAll('nav.tabs button').forEach(b => {
   b.addEventListener('click', () => {
@@ -34,7 +30,7 @@ document.querySelectorAll('nav.tabs button').forEach(b => {
     tab.classList.add('active');
     stopTaskPoll();
     if (b.dataset.tab === 'accounts') loadPlatforms();
-    if (b.dataset.tab === 'tasks') { loadTasks(); startTaskPoll(); }
+    if (b.dataset.tab === 'tasks') { loadTasks(); startTaskPoll(); loadCache(); }
     if (b.dataset.tab === 'settings') loadSettings();
   });
 });
@@ -294,7 +290,6 @@ let pollTimer = null;
 function startTaskPoll() { stopTaskPoll(); pollTimer = setInterval(loadTasks, 2000); }
 function stopTaskPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 const STATUS_TXT = { downloading: '下载中', paused: '已暂停', completed: '已完成', failed: '失败' };
-let prevTaskStatus = null;      // 上一轮各任务状态，用于检测"新完成"
 let taskMap = {};               // id -> task
 const selectedTasks = new Set();
 async function loadTasks() {
@@ -307,12 +302,7 @@ async function loadTasks() {
   list.forEach(t => {
     taskMap[t.id] = t;
     cur[t.id] = t.status;
-    // 新完成的任务：自动触发浏览器下载
-    if (SETTINGS.autoDownload && prevTaskStatus && prevTaskStatus[t.id] !== 'completed' && t.status === 'completed') {
-      triggerDownload(t.id);
-    }
   });
-  prevTaskStatus = cur;
   [...selectedTasks].forEach(id => { if (!(id in cur)) selectedTasks.delete(id); });
   const el = document.getElementById('taskList');
   if (!list.length) { el.innerHTML = '<div class="empty">暂无下载任务</div>'; updateSelCount(); return; }
@@ -347,14 +337,6 @@ async function loadTasks() {
   updateSelCount();
   const all = document.querySelectorAll('.taskCk');
   document.getElementById('ckAll').checked = all.length > 0 && [...all].every(c => c.checked);
-}
-function triggerDownload(id) {
-  const a = document.createElement('a');
-  a.href = '/api/tasks/' + id + '/file';
-  a.style.display = 'none';
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => a.remove(), 1000);
 }
 function toggleTaskCk(on) {
   document.querySelectorAll('.taskCk').forEach(c => {
@@ -397,12 +379,10 @@ async function loadSettings() {
   const r = await api('/api/settings');
   if (!r.ok) return;
   const s = r.data;
-  SETTINGS = s;
   document.getElementById('setConn').value = s.maxConnections;
   document.getElementById('setConc').value = s.maxConcurrentTasks;
   document.getElementById('setLimit').value = (s.speedLimitBps / 1048576).toFixed(1);
   document.getElementById('setRetry').value = s.maxRetries;
-  document.getElementById('setAutoDl').checked = s.autoDownload !== false;
 }
 async function saveSettings() {
   hideMsg('setMsg');
@@ -410,10 +390,55 @@ async function saveSettings() {
     maxConnections: Math.max(1, parseInt(document.getElementById('setConn').value) || 16),
     maxConcurrentTasks: Math.max(1, parseInt(document.getElementById('setConc').value) || 3),
     speedLimitBps: Math.round((parseFloat(document.getElementById('setLimit').value) || 0) * 1048576),
-    maxRetries: Math.max(0, parseInt(document.getElementById('setRetry').value) || 0),
-    autoDownload: document.getElementById('setAutoDl').checked
+    maxRetries: Math.max(0, parseInt(document.getElementById('setRetry').value) || 0)
   };
-  SETTINGS = s;
   const r = await api('/api/settings', 'PUT', s);
   showMsg('setMsg', r.ok ? '设置已保存并即时生效' : (r.message || '保存失败'), r.ok);
+}
+
+// ---------- 服务器缓存文件夹 ----------
+let cacheDirPath = '';
+async function loadCache() {
+  const el = document.getElementById('cacheList');
+  try {
+    const r = await api('/api/cache');
+    if (!r.ok) { el.innerHTML = '<div class="empty">读取缓存目录失败</div>'; return; }
+    cacheDirPath = r.data.dir || '';
+    document.getElementById('cacheDir').textContent = cacheDirPath;
+    const files = r.data.files || [];
+    if (!files.length) { el.innerHTML = '<div class="empty">暂无缓存文件</div>'; return; }
+    el.innerHTML = '';
+    files.forEach(f => {
+      const d = document.createElement('div');
+      d.className = 'task';
+      const dt = f.modifiedAt ? new Date(f.modifiedAt).toLocaleString() : '';
+      d.innerHTML = `
+      <div class="trow">
+        <div class="tbody">
+          <div class="name">${escapeHtml(f.name)}</div>
+          <div class="meta"><span>${fmtSize(f.size)}</span><span style="color:#999">${dt}</span></div>
+          <div class="actions">
+            <a class="btn small" style="text-decoration:none;display:inline-block" href="/api/cache/file?name=${encodeURIComponent(f.name)}">保存到本地</a>
+            <button class="danger small" onclick="cacheDel('${escapeHtml(f.name).replace(/'/g, "\\'")}')">删除</button>
+          </div>
+        </div>
+      </div>`;
+      el.appendChild(d);
+    });
+  } catch (e) {
+    el.innerHTML = '<div class="empty">读取缓存目录失败</div>';
+  }
+}
+async function cacheDel(name) {
+  if (!confirm('确定删除服务器上的缓存文件「' + name + '」吗？')) return;
+  const r = await api('/api/cache/file?name=' + encodeURIComponent(name), 'DELETE');
+  const el = document.getElementById('cacheMsg');
+  if (r.ok) { showMsg('cacheMsg', '已删除', true); loadCache(); }
+  else showMsg('cacheMsg', r.message || '删除失败', false);
+}
+function copyCacheDir() {
+  const t = cacheDirPath || document.getElementById('cacheDir').textContent;
+  if (!t) return;
+  if (navigator.clipboard) navigator.clipboard.writeText(t).then(() => showMsg('cacheMsg', '路径已复制', true));
+  else { prompt('服务器缓存目录路径：', t); }
 }

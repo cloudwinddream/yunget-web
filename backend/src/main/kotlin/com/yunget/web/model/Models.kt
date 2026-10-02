@@ -74,8 +74,20 @@ data class SettingsData(
     val maxConnections: Int = 16,
     val maxConcurrentTasks: Int = 3,
     val speedLimitBps: Long = 0,
-    val maxRetries: Int = 3,
-    val autoDownload: Boolean = true
+    val maxRetries: Int = 3
+)
+
+@Serializable
+data class CacheFileInfo(
+    val name: String,
+    val size: Long,
+    val modifiedAt: Long
+)
+
+@Serializable
+data class CacheListResponse(
+    val dir: String,
+    val files: List<CacheFileInfo>
 )
 
 @Serializable

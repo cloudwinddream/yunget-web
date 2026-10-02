@@ -36,11 +36,14 @@
 | 21 | `DELETE /api/qrlogin/session` | ✅ `{"done":true}` |
 | 22 | 扫码 JSON 解析逻辑（token/ticket/等待态/Set-Cookie 提取） | ✅ 用真实接口样本离线验证通过 |
 | 23 | `POST /api/tasks/batch-delete`（空列表） | ✅ `{"deleted":0}` |
-| 24 | `GET /api/settings` 含 `autoDownload` | ✅ 默认为 true |
-| 25 | `PUT /api/settings` 持久化 `autoDownload` | ✅ 改 false 后 GET 一致 |
+| 24 | `GET /api/settings` 不再含 `autoDownload`（v1.0.1 已移除自动下载） | ✅ 字段已删除，旧配置文件自动兼容忽略 |
+| 25 | `PUT /api/settings` 持久化（无 `autoDownload`） | ✅ GET 一致 |
 | 26 | 前端 `qrcode.js` 二维码生成（node） | ✅ 正常输出 SVG |
 | 27 | 前端 `app.js` / `qrcode.js` 语法 | ✅ `node --check` 通过 |
-| 28 | 静态资源 `/qrcode.js`、首页含扫码弹窗/全选/自动下载开关 | ✅ 均为 200，元素存在 |
+| 28 | 静态资源 `/qrcode.js`、首页含扫码弹窗/全选（自动下载开关已移除） | ✅ 均为 200，元素存在 |
+| 29 | `GET /api/cache`（v1.0.1 新增：服务器缓存目录浏览） | ✅ 返回 dir + files 列表 |
+| 30 | `GET /api/cache/file?name=`（v1.0.1 新增：缓存文件取回） | ✅ 存在文件返回附件，不存在返回 404 |
+| 31 | `DELETE /api/cache/file?name=`（v1.0.1 新增：删除缓存文件） | ✅ 删除成功返回 done，路径穿越被拒绝 |
 
 ## 已知限制（非代码问题）
 

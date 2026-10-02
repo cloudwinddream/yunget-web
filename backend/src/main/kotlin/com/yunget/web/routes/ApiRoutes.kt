@@ -3,6 +3,7 @@ package com.yunget.web.routes
 import com.yunget.app.data.network.model.ShareFile
 import com.yunget.web.model.ApiResult
 import com.yunget.web.model.BatchDeleteRequest
+import com.yunget.web.model.CacheListResponse
 import com.yunget.web.model.CookieLoginRequest
 import com.yunget.web.model.QrStatusResponse
 import com.yunget.web.model.DirectDownloadRequest
@@ -286,6 +287,43 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService) {
                 ).toString()
             )
             call.respond(LocalFileContent(file, ContentType.Application.OctetStream))
+        }
+
+        // ---------- 服务器缓存目录 ----------
+        get("/cache") {
+            call.respond(
+                ok(
+                    CacheListResponse(
+                        dir = downloads.cacheDir().absolutePath,
+                        files = downloads.listCacheFiles()
+                    )
+                )
+            )
+        }
+
+        get("/cache/file") {
+            val name = call.request.queryParameters["name"]
+            val file = name?.let { downloads.cacheFile(it) }
+            if (file == null) {
+                call.respond(HttpStatusCode.NotFound, fail("文件不存在"))
+                return@get
+            }
+            call.response.header(
+                HttpHeaders.ContentDisposition,
+                ContentDisposition.Attachment.withParameter(
+                    ContentDisposition.Parameters.FileNameAsterisk, file.name
+                ).toString()
+            )
+            call.respond(LocalFileContent(file, ContentType.Application.OctetStream))
+        }
+
+        delete("/cache/file") {
+            val name = call.request.queryParameters["name"]
+            if (name.isNullOrBlank() || !downloads.deleteCacheFile(name)) {
+                call.respond(fail("删除失败，文件不存在"))
+                return@delete
+            }
+            call.respond(ok(mapOf("done" to true)))
         }
 
         // ---------- 设置 ----------

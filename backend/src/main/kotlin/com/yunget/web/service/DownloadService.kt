@@ -1,5 +1,6 @@
 package com.yunget.web.service
 
+import com.yunget.web.model.CacheFileInfo
 import com.yunget.web.model.SettingsData
 import com.yunget.web.model.TaskInfo
 import dev.turbodl.core.DnsMode
@@ -201,6 +202,27 @@ class DownloadService(dataDir: File) {
         if (t.status != "completed") return null
         return t.savePath.takeIf { it.isNotBlank() }?.let { File(it) }?.takeIf { it.exists() }
     }
+
+    // ---------- 服务器缓存目录 ----------
+
+    /** 缓存目录（即下载落盘目录） */
+    fun cacheDir(): File = downloadsDir
+
+    /** 列出缓存目录中的文件（按修改时间倒序） */
+    fun listCacheFiles(): List<CacheFileInfo> =
+        downloadsDir.listFiles { f -> f.isFile }?.sortedByDescending { it.lastModified() }
+            ?.map { CacheFileInfo(it.name, it.length(), it.lastModified()) } ?: emptyList()
+
+    /** 按文件名取缓存文件，失败/越权返回 null（防路径穿越） */
+    fun cacheFile(name: String): File? {
+        if (name.isBlank() || name.contains("..")) return null
+        val base = downloadsDir.canonicalPath
+        val f = File(downloadsDir, name).canonicalFile
+        if (!f.canonicalPath.startsWith(base + File.separator)) return null
+        return f.takeIf { it.isFile && it.exists() }
+    }
+
+    fun deleteCacheFile(name: String): Boolean = cacheFile(name)?.delete() == true
 
     fun shutdown() {
         runCatching { scope.let { } }

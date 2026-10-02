@@ -13,6 +13,9 @@ WORKDIR /app
 COPY --from=build /app/yunget-web.jar ./yunget-web.jar
 ENV YUNGET_DATA_DIR=/data
 ENV PORT=8080
+# 中文文件名需要 UTF-8 locale，否则缓存目录列不出中文文件
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
 VOLUME /data
 EXPOSE 8080
 CMD ["java", "-Xmx1g", "-jar", "yunget-web.jar"]

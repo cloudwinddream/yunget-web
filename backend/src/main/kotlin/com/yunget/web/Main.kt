@@ -34,6 +34,16 @@ fun main() {
 
     log.info("数据目录: ${dataDir.absolutePath}")
 
+    // 中文文件名依赖 JVM 的文件名编码；POSIX/C locale 下缓存目录会列不出中文文件
+    val jnu = System.getProperty("sun.jnu.encoding", "")
+    if (!jnu.equals("UTF-8", ignoreCase = true)) {
+        log.warn(
+            "当前文件名编码为 {}，中文文件名可能无法正常列出；" +
+                "建议使用 UTF-8 locale 启动，例如：LANG=C.UTF-8 LC_ALL=C.UTF-8 java -jar yunget-web.jar",
+            jnu
+        )
+    }
+
     // 迅雷设备指纹（首次启动生成并持久化，此后复用）
     XunleiDeviceFingerprint.init(dataDir)
 
