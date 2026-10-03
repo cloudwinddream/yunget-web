@@ -100,6 +100,9 @@ class DownloadService(dataDir: File) {
         maxConcurrentTasks = s.maxConcurrentTasks.coerceIn(1, 64),
         globalSpeedLimitBytesPerSec = s.speedLimitBps.coerceAtLeast(0),
         maxRetries = s.maxRetries.coerceIn(0, 50),
+        // 网盘直链必探测：先跟随 302 拿到最终 CDN 地址再分片，否则每个分片重走重定向、
+        // 容易被节点拒绝，表现为"下载中但 0 速度"。顺带拿到 ETag 校验器，断点续传更稳。
+        skipProbeWhenSizeKnown = false,
         dynamicSegmentation = true,
         segmentsPerConnection = 4,
         forceHttp1 = true,
