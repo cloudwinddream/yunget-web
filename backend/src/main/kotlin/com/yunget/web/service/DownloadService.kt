@@ -37,13 +37,18 @@ data class TaskRecord(
 
 /**
  * 下载服务：TurboDL 引擎的 Web 封装。
- * - 任务落盘到设置中的下载目录（默认 dataDir/downloads）
+ * - 任务落盘到设置中的下载目录（默认当前用户的下载目录，如 ~/Downloads）
  * - 任务元数据持久化到 tasks.json，重启后可恢复（下载中→已暂停）
  * - 断点续传靠 stableKey="web-<id>" 复用分片目录
  */
 class DownloadService(dataDir: File) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private val defaultDownloadsDir = File(dataDir, "downloads").apply { mkdirs() }
+    // 默认下载目录：当前用户的下载目录（如 ~/Downloads）；取不到用户主目录时退回 dataDir/downloads
+    private val defaultDownloadsDir: File = (
+        System.getProperty("user.home")?.takeIf { it.isNotBlank() }
+            ?.let { File(it, "Downloads") }
+            ?: File(dataDir, "downloads")
+        ).apply { mkdirs() }
     private val tmpDir = File(dataDir, "tmp").apply { mkdirs() }
     private val chunkDir = File(dataDir, "chunks").apply { mkdirs() }
     private val tasksFile = File(dataDir, "tasks.json")

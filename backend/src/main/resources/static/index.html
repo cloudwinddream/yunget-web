@@ -98,7 +98,7 @@
       <div class="setrow"><label>同时下载任务数</label><input type="text" id="setConc" inputmode="numeric"><span class="hint">1–64，默认 3</span></div>
       <div class="setrow"><label>全局限速（MB/s）</label><input type="text" id="setLimit" inputmode="decimal"><span class="hint">0 = 不限速</span></div>
       <div class="setrow"><label>失败重试次数</label><input type="text" id="setRetry" inputmode="numeric"><span class="hint">0–50，默认 3</span></div>
-      <div class="setrow"><label>下载目录</label><input type="text" id="setDir" style="min-width:320px"><span class="hint">文件直接下载到服务器上的这个目录，留空则用默认目录</span></div>
+      <div class="setrow"><label>下载目录</label><input type="text" id="setDir" style="min-width:320px"><button type="button" class="ghost small" onclick="openDirPicker()">选择…</button><span class="hint">文件直接下载到服务器上的这个目录，留空则用当前用户的下载目录（如 ~/Downloads）</span></div>
       <div class="row" style="margin-top:14px"><button class="btn" onclick="saveSettings()">保存设置</button></div>
       <div class="msg" id="setMsg"></div>
     </div>
@@ -114,6 +114,25 @@
       <div id="qrImg"></div>
       <div class="msg" id="qrStatus">请用手机 App 扫码确认</div>
       <div class="row" style="justify-content:center"><button class="ghost small" onclick="qrCancel()">取消</button></div>
+    </div>
+  </div>
+  <!-- 下载目录选择弹窗 -->
+  <div class="modal" id="dirModal" style="display:none">
+    <div class="modal-box dir-box">
+      <h3>选择下载目录（服务器上）</h3>
+      <div class="dirpath" id="dirCur"></div>
+      <div class="row" style="justify-content:flex-start;gap:8px">
+        <button class="ghost small" onclick="dirUp()">⬆ 上级</button>
+        <button class="ghost small" onclick="dirHome()">⌂ 主目录</button>
+      </div>
+      <div class="dirlist" id="dirList"></div>
+      <div class="row" style="justify-content:space-between;margin-top:12px">
+        <button class="ghost small" onclick="dirUseDefault()">用默认目录</button>
+        <span>
+          <button class="ghost small" onclick="dirCancel()">取消</button>
+          <button class="btn small" onclick="dirConfirm()">选此目录</button>
+        </span>
+      </div>
     </div>
   </div>
 </main>

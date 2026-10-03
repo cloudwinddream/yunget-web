@@ -75,8 +75,15 @@ data class SettingsData(
     val maxConcurrentTasks: Int = 3,
     val speedLimitBps: Long = 0,
     val maxRetries: Int = 3,
-    // 服务器上的下载目录；留空则用默认目录（dataDir/downloads）
+    // 服务器上的下载目录；留空则用当前用户的下载目录（如 ~/Downloads）
     val downloadDir: String = ""
+)
+
+@Serializable
+data class DirListResponse(
+    val path: String,
+    val parent: String,
+    val dirs: List<String>
 )
 
 @Serializable

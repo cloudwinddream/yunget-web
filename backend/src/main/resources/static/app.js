@@ -394,3 +394,54 @@ async function saveSettings() {
   showMsg('setMsg', r.ok ? '设置已保存并即时生效' : (r.message || '保存失败'), r.ok);
 }
 
+
+// ---------- 下载目录选择（服务器目录浏览） ----------
+let pickerPath = '', pickerParent = '';
+async function openDirPicker() {
+  document.getElementById('dirModal').style.display = 'flex';
+  // 默认打开上次保存的目录；取不到再回主目录
+  const last = document.getElementById('setDir').value.trim();
+  await loadDir(last || null, true);
+}
+async function loadDir(path, fallbackHome) {
+  const q = path ? '?path=' + encodeURIComponent(path) : '';
+  const r = await api('/api/fs/dirs' + q);
+  if (!r.ok) {
+    if (fallbackHome && path) { await loadDir(null, false); return; }
+    document.getElementById('dirList').innerHTML = '<div class="dirempty">读取目录失败</div>';
+    return;
+  }
+  pickerPath = r.data.path; pickerParent = r.data.parent || '';
+  document.getElementById('dirCur').textContent = pickerPath;
+  const list = document.getElementById('dirList');
+  if (!r.data.dirs.length) { list.innerHTML = '<div class="dirempty">（无子目录）</div>'; return; }
+  list.innerHTML = '';
+  r.data.dirs.forEach(name => {
+    const d = document.createElement('div');
+    d.className = 'diritem';
+    d.textContent = '📁 ' + name;
+    d.onclick = () => loadDir(joinDir(pickerPath, name), false);
+    list.appendChild(d);
+  });
+}
+function joinDir(base, name) {
+  if (/^[a-zA-Z]:[\\/]$/.test(base) || base.endsWith('\\')) return base + name;
+  if (base.endsWith('/')) return base + name;
+  const sep = base.includes('\\') ? '\\' : '/';
+  return base + sep + name;
+}
+function dirUp() { if (pickerParent) loadDir(pickerParent, true); }
+function dirHome() { loadDir(null, false); }
+function dirCancel() { document.getElementById('dirModal').style.display = 'none'; }
+async function dirConfirm() {
+  document.getElementById('setDir').value = pickerPath;
+  dirCancel();
+  await saveSettings();
+}
+async function dirUseDefault() {
+  document.getElementById('setDir').value = '';
+  dirCancel();
+  await saveSettings();
+  // 保存后重新加载，输入框会显示默认目录的实际路径
+  loadSettings();
+}

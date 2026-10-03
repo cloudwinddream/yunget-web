@@ -4,6 +4,7 @@ import com.yunget.app.data.network.model.ShareFile
 import com.yunget.web.model.ApiResult
 import com.yunget.web.model.BatchDeleteRequest
 import com.yunget.web.model.CookieLoginRequest
+import com.yunget.web.model.DirListResponse
 import com.yunget.web.model.QrStatusResponse
 import com.yunget.web.model.DirectDownloadRequest
 import com.yunget.web.model.DownloadSubmitRequest
@@ -267,6 +268,27 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService) {
                 runCatching { downloads.delete(id, req.deleteFile); n++ }
             }
             call.respond(ok(mapOf("deleted" to n)))
+        }
+
+        // ---------- 服务器目录浏览（供设置页选择下载目录） ----------
+        get("/fs/dirs") {
+            val raw = call.request.queryParameters["path"]?.takeIf { it.isNotBlank() }
+                ?: System.getProperty("user.home") ?: "/"
+            val dir = runCatching { java.io.File(raw).canonicalFile }.getOrNull()
+            if (dir == null || !dir.isDirectory) {
+                call.respond(fail("目录不存在"))
+                return@get
+            }
+            val dirs = dir.listFiles { f -> f.isDirectory }?.map { it.name }?.sorted() ?: emptyList()
+            call.respond(
+                ok(
+                    DirListResponse(
+                        path = dir.absolutePath,
+                        parent = dir.parentFile?.absolutePath ?: "",
+                        dirs = dirs
+                    )
+                )
+            )
         }
 
         // ---------- 设置 ----------
