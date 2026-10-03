@@ -4,8 +4,8 @@
 out/
 
 # 本地数据（运行时生成，含账号凭据）
-data/
-.yunget-web/
+/data/
+/.yunget-web/
 
 # 工具链（构建脚本会自动下载）
 /tools/
