@@ -37,6 +37,8 @@ data class TaskRecord(
     val platform: String = "",
     // 来源文件稳定键（platform+fid+size）：分片目录按它命名，删任务重下同文件也能续传；空=按任务 id
     val resumeKey: String = "",
+    // 已自动重试次数（失败后退避续传；有明显进度推进会清零）
+    val autoRetry: Int = 0,
     // 文件夹下载批次（普通单文件下载为空）
     val batchId: String = "",
     val batchName: String = "",
@@ -71,6 +73,9 @@ class DownloadService(dataDir: File) {
     private val etas = ConcurrentHashMap<Long, Long>()
     private val callbacks = ConcurrentHashMap<Long, suspend () -> Unit>()
     private val headersCache = ConcurrentHashMap<Long, Map<String, String>>()
+    // 失败自动重试：待执行的重试 Job + 失败时的进度基线（进度推进足够多则重置重试计数）
+    private val retryJobs = ConcurrentHashMap<Long, kotlinx.coroutines.Job>()
+    private val retryBaseline = ConcurrentHashMap<Long, Long>()
 
     var settings: SettingsData = loadSettings()
         private set
@@ -84,6 +89,8 @@ class DownloadService(dataDir: File) {
     init {
         loadTasks()
         scope.launch { client.events.collect { onEvent(it) } }
+        // 重启恢复：上次关机时正等着自动重试的任务，重新排队
+        tasks.values.filter { it.status == "retry_wait" }.forEach { scheduleRetry(it.id) }
     }
 
     // ---------- 配置 ----------
@@ -105,7 +112,10 @@ class DownloadService(dataDir: File) {
         warmUpConnections = true,
         slowStart = true,
         trustAllCerts = false,
-        trustWeakValidator = false
+        // 网盘直链场景：CDN 常不给 ETag/Last-Modified（弱校验器）。弱校验下让分片指纹 MISMATCH
+        // 整批丢分片太脆（实测续传从 0 重下），故信任弱校验器续传；文件变没变由引擎按
+        // len/etag 字段的正向证据判定（见 BuiltinHttpBackend 续传校验）。
+        trustWeakValidator = true
     )
 
     fun updateSettings(s: SettingsData) {
@@ -199,12 +209,13 @@ class DownloadService(dataDir: File) {
     }
 
     fun pause(id: Long) {
+        cancelRetry(id)
         val turboId = turboIds.remove(id)
         if (turboId != null) turboToTask.remove(turboId)
         speeds.remove(id); etas.remove(id)
         scope.launch {
             if (turboId != null) runCatching { client.pause(turboId) }
-            tasks[id]?.let { tasks[id] = it.copy(status = "paused") }
+            tasks[id]?.let { tasks[id] = it.copy(status = "paused", autoRetry = 0) }
             persistTasks()
         }
     }
@@ -212,10 +223,35 @@ class DownloadService(dataDir: File) {
     fun resume(id: Long) {
         val t = tasks[id] ?: return
         if (t.status == "completed") return
+        cancelRetry(id)
+        // 手动继续：重试计数清零，给自动重试重新留额度
+        tasks[id] = t.copy(autoRetry = 0)
         startInternal(id)
     }
 
+    /** 自动重试退避：第 n 次失败后等 1/2/4/8/10…分钟再续（限流窗口通常按分钟计） */
+    private fun retryDelayMs(attempt: Int): Long =
+        minOf(60_000L * (1L shl minOf((attempt - 1).coerceAtLeast(0), 4)), 600_000L)
+
+    private fun scheduleRetry(id: Long) {
+        if (!settings.autoRetry) return
+        val t = tasks[id] ?: return
+        cancelRetry(id)
+        retryJobs[id] = scope.launch {
+            kotlinx.coroutines.delay(retryDelayMs(t.autoRetry))
+            retryJobs.remove(id)
+            // 等待期间用户可能暂停/删除/手动继续：状态变了就作罢
+            if (tasks[id]?.status == "retry_wait") startInternal(id)
+        }
+    }
+
+    private fun cancelRetry(id: Long) {
+        retryJobs.remove(id)?.cancel()
+        retryBaseline.remove(id)
+    }
+
     fun delete(id: Long, deleteFile: Boolean) {
+        cancelRetry(id)
         val turboId = turboIds.remove(id)
         if (turboId != null) turboToTask.remove(turboId)
         speeds.remove(id); etas.remove(id)
@@ -268,13 +304,21 @@ class DownloadService(dataDir: File) {
                         TaskState.DOWNLOADING, TaskState.PROBING, TaskState.QUEUED -> "downloading"
                         else -> t.status
                     }
+                    // 自动重试计数：自失败点后又推进 ≥32MB，说明这次重试是有效的，清零重新计数
+                    var newRetry = t.autoRetry
+                    val base = retryBaseline[id]
+                    if (newRetry > 0 && base != null && p.downloadedBytes >= base + 32L * 1024 * 1024) {
+                        newRetry = 0
+                        retryBaseline.remove(id)
+                    }
                     if (p.downloadedBytes != t.downloaded ||
-                        (p.totalBytes > 0 && p.totalBytes != t.total) || st != t.status
+                        (p.totalBytes > 0 && p.totalBytes != t.total) || st != t.status || newRetry != t.autoRetry
                     ) {
                         tasks[id] = t.copy(
                             downloaded = p.downloadedBytes,
                             total = if (p.totalBytes > 0) p.totalBytes else t.total,
-                            status = st
+                            status = st,
+                            autoRetry = newRetry
                         )
                         // 进度落盘节流：不做高频写
                         if (System.currentTimeMillis() - lastPersistTs > 5000) persistTasks()
@@ -286,8 +330,19 @@ class DownloadService(dataDir: File) {
                 turboIds.remove(id)?.let { turboToTask.remove(it) }
                 speeds.remove(id); etas.remove(id)
                 File(tmpDir, "task_${id}.part").delete()
-                tasks[id]?.let { tasks[id] = it.copy(status = "failed", error = ev.reason) }
-                persistTasks()
+                val t = tasks[id] ?: return@launch
+                val maxAuto = if (settings.autoRetry) settings.autoRetryMax.coerceIn(0, 50) else 0
+                if (t.autoRetry < maxAuto) {
+                    // 自动重试：退避后续传（被限流时等一阵再试往往就好了）；手动暂停可随时打断等待
+                    val next = t.autoRetry + 1
+                    retryBaseline[id] = t.downloaded
+                    tasks[id] = t.copy(status = "retry_wait", error = ev.reason, autoRetry = next)
+                    persistTasks()
+                    scheduleRetry(id)
+                } else {
+                    tasks[id] = t.copy(status = "failed", error = ev.reason)
+                    persistTasks()
+                }
             }
             is TurboEvent.StateChanged -> {
                 if (ev.state == TaskState.PAUSED || ev.state == TaskState.CANCELED) {

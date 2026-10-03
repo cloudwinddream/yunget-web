@@ -98,7 +98,8 @@
       <div class="setrow"><label>分网盘连接数</label><span id="platformConnInputs"></span><span class="hint">留空 = 跟随全局；如迅雷易被限流可单独调低</span></div>
       <div class="setrow"><label>同时下载任务数</label><input type="text" id="setConc" inputmode="numeric"><span class="hint">1–64，默认 3</span></div>
       <div class="setrow"><label>全局限速（MB/s）</label><input type="text" id="setLimit" inputmode="decimal"><span class="hint">0 = 不限速</span></div>
-      <div class="setrow"><label>失败重试次数</label><input type="text" id="setRetry" inputmode="numeric"><span class="hint">0–50，默认 3</span></div>
+      <div class="setrow"><label>失败重试次数</label><input type="text" id="setRetry" inputmode="numeric"><span class="hint">0–50，默认 3（单个分片的重试）</span></div>
+      <div class="setrow"><label>失败自动续传</label><input type="checkbox" id="setAutoRetry"><span>开启，最多</span><input type="text" id="setAutoRetryMax" inputmode="numeric" style="width:52px"><span>次</span><span class="hint">任务失败后隔 1→2→4→8→10 分钟自动继续，被限流时不用手动守着点</span></div>
       <div class="setrow"><label>下载目录</label><input type="text" id="setDir" style="min-width:320px"><button type="button" class="ghost small" onclick="openDirPicker()">选择…</button><span class="hint">文件直接下载到服务器上的这个目录，留空则用当前用户的下载目录（如 ~/Downloads）</span></div>
       <div class="row" style="margin-top:14px"><button class="btn" onclick="saveSettings()">保存设置</button></div>
       <div class="msg" id="setMsg"></div>

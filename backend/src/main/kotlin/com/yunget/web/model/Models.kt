@@ -104,7 +104,10 @@ data class SettingsData(
     // 服务器上的下载目录；留空则用当前用户的下载目录（如 ~/Downloads）
     val downloadDir: String = "",
     // 分网盘连接数覆盖（键：quark/uc/xunlei/baidu/pan123/c139）；缺省或 <=0 表示跟随全局连接数
-    val platformConnections: Map<String, Int> = emptyMap()
+    val platformConnections: Map<String, Int> = emptyMap(),
+    // 失败后自动重试（退避 1→2→4→8→10 分钟），适合被限流后隔一阵自动续传
+    val autoRetry: Boolean = true,
+    val autoRetryMax: Int = 10
 )
 
 @Serializable

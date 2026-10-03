@@ -129,7 +129,17 @@ internal class BuiltinHttpBackend(
             // 因此 `changed` 现在**要求 `now` 本身是完整可用的令牌**：
             // 至少要含 `len=` 或 `etag=`/`lm=` 之一；只有 `weak` 或空串一律不算"变了"。
             val nowUsable = now.contains("len=") || now.contains("etag=") || now.contains("lm=")
-            val changed = prev.isNotEmpty() && prev != now && nowUsable
+            // 宽容判定：仅在「有确凿变更证据」时才算变了——两边都有 len 且不等，或两边都有 etag 且不等。
+            // 校验器格式会漂移（一轮只有 len|weak、下一轮 CDN 边缘带上 etag），整串比对会把已下的分片
+            // 整批误杀（实测网盘直链暂停续传从 0 重下），故改为按字段比对。
+            fun fieldOf(tok: String, key: String): String? =
+                tok.split('|').firstOrNull { it.startsWith("$key=") }?.substringAfter('=')
+            val prevLen = prev.takeIf { it.isNotEmpty() }?.let { fieldOf(it, "len") }
+            val nowLen = fieldOf(now, "len")
+            val prevEtag = prev.takeIf { it.isNotEmpty() }?.let { fieldOf(it, "etag") }
+            val nowEtag = fieldOf(now, "etag")
+            val changed = (prevLen != null && nowLen != null && prevLen != nowLen) ||
+                (prevEtag != null && nowEtag != null && prevEtag != nowEtag)
             val weakButResuming = probe.isWeak && !context.config.trustWeakValidator
             val hasOldParts = hasResumableParts
 

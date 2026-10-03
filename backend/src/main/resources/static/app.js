@@ -332,7 +332,7 @@ async function directDownload() {
 let pollTimer = null;
 function startTaskPoll() { stopTaskPoll(); pollTimer = setInterval(loadTasks, 2000); }
 function stopTaskPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
-const STATUS_TXT = { downloading: '下载中', merging: '合并中', paused: '已暂停', completed: '已完成', failed: '失败' };
+const STATUS_TXT = { downloading: '下载中', merging: '合并中', retry_wait: '等待重试', paused: '已暂停', completed: '已完成', failed: '失败' };
 let taskMap = {};               // id -> task
 const selectedTasks = new Set();
 const expandedBatches = new Set();
@@ -342,8 +342,8 @@ function renderTask(t) {
   const pct = t.total > 0 ? Math.min(100, Math.round(t.downloaded * 100 / t.total)) : 0;
   const bar = t.status === 'completed' ? 'done' : (t.status === 'failed' ? 'fail' : '');
   let actions = '';
-  if (t.status === 'downloading') actions += `<button class="ghost small" onclick="taskOp(${t.id},'pause')">暂停</button>`;
-  if (t.status === 'paused' || t.status === 'failed') actions += `<button class="ghost small" onclick="taskOp(${t.id},'resume')">继续</button>`;
+  if (t.status === 'downloading' || t.status === 'retry_wait') actions += `<button class="ghost small" onclick="taskOp(${t.id},'pause')">暂停</button>`;
+  if (t.status === 'paused' || t.status === 'failed' || t.status === 'retry_wait') actions += `<button class="ghost small" onclick="taskOp(${t.id},'resume')">继续</button>`;
   actions += `<button class="danger small" onclick="taskDel(${t.id})">删除</button>`;
   d.innerHTML = `
       <div class="trow">
@@ -368,7 +368,7 @@ function renderBatch(batchId, batchName, kids) {
   wrap.className = 'batch';
   const done = kids.filter(t => t.status === 'completed').length;
   const failed = kids.filter(t => t.status === 'failed').length;
-  const downloading = kids.filter(t => t.status === 'downloading' || t.status === 'merging').length;
+  const downloading = kids.filter(t => t.status === 'downloading' || t.status === 'merging' || t.status === 'retry_wait').length;
   const totalBytes = kids.reduce((a, t) => a + (t.total || 0), 0);
   const downBytes = kids.reduce((a, t) => a + Math.min(t.downloaded || 0, t.total || (t.downloaded || 0)), 0);
   const speed = kids.reduce((a, t) => a + (t.speed || 0), 0);
@@ -501,6 +501,8 @@ async function loadSettings() {
   document.getElementById('setConc').value = s.maxConcurrentTasks;
   document.getElementById('setLimit').value = (s.speedLimitBps / 1048576).toFixed(1);
   document.getElementById('setRetry').value = s.maxRetries;
+  document.getElementById('setAutoRetry').checked = s.autoRetry !== false;
+  document.getElementById('setAutoRetryMax').value = s.autoRetryMax ?? 10;
   document.getElementById('setDir').value = s.downloadDir || '';
 }
 async function saveSettings() {
@@ -516,6 +518,8 @@ async function saveSettings() {
     maxConcurrentTasks: Math.max(1, parseInt(document.getElementById('setConc').value) || 3),
     speedLimitBps: Math.round((parseFloat(document.getElementById('setLimit').value) || 0) * 1048576),
     maxRetries: Math.max(0, parseInt(document.getElementById('setRetry').value) || 0),
+    autoRetry: document.getElementById('setAutoRetry').checked,
+    autoRetryMax: Math.max(0, parseInt(document.getElementById('setAutoRetryMax').value) || 0),
     downloadDir: document.getElementById('setDir').value.trim()
   };
   const r = await api('/api/settings', 'PUT', s);
