@@ -401,13 +401,13 @@ async function openDirPicker() {
   document.getElementById('dirModal').style.display = 'flex';
   // 默认打开上次保存的目录；取不到再回主目录
   const last = document.getElementById('setDir').value.trim();
-  await loadDir(last || null, true);
+  await loadPickerDir(last || null, true);
 }
-async function loadDir(path, fallbackHome) {
+async function loadPickerDir(path, fallbackHome) {
   const q = path ? '?path=' + encodeURIComponent(path) : '';
   const r = await api('/api/fs/dirs' + q);
   if (!r.ok) {
-    if (fallbackHome && path) { await loadDir(null, false); return; }
+    if (fallbackHome && path) { await loadPickerDir(null, false); return; }
     document.getElementById('dirList').innerHTML = '<div class="dirempty">读取目录失败</div>';
     return;
   }
@@ -420,7 +420,7 @@ async function loadDir(path, fallbackHome) {
     const d = document.createElement('div');
     d.className = 'diritem';
     d.textContent = '📁 ' + name;
-    d.onclick = () => loadDir(joinDir(pickerPath, name), false);
+    d.onclick = () => loadPickerDir(joinDir(pickerPath, name), false);
     list.appendChild(d);
   });
 }
@@ -430,8 +430,8 @@ function joinDir(base, name) {
   const sep = base.includes('\\') ? '\\' : '/';
   return base + sep + name;
 }
-function dirUp() { if (pickerParent) loadDir(pickerParent, true); }
-function dirHome() { loadDir(null, false); }
+function dirUp() { if (pickerParent) loadPickerDir(pickerParent, true); }
+function dirHome() { loadPickerDir(null, false); }
 function dirCancel() { document.getElementById('dirModal').style.display = 'none'; }
 async function dirConfirm() {
   document.getElementById('setDir').value = pickerPath;
