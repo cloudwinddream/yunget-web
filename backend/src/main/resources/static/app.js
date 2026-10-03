@@ -30,7 +30,7 @@ document.querySelectorAll('nav.tabs button').forEach(b => {
     tab.classList.add('active');
     stopTaskPoll();
     if (b.dataset.tab === 'accounts') loadPlatforms();
-    if (b.dataset.tab === 'tasks') { loadTasks(); startTaskPoll(); loadCache(); }
+    if (b.dataset.tab === 'tasks') { loadTasks(); startTaskPoll(); }
     if (b.dataset.tab === 'settings') loadSettings();
   });
 });
@@ -315,8 +315,7 @@ async function loadTasks() {
     let actions = '';
     if (t.status === 'downloading') actions += `<button class="ghost small" onclick="taskOp(${t.id},'pause')">暂停</button>`;
     if (t.status === 'paused' || t.status === 'failed') actions += `<button class="ghost small" onclick="taskOp(${t.id},'resume')">继续</button>`;
-    if (t.status === 'completed') actions += `<a class="btn small" style="text-decoration:none;display:inline-block" href="/api/tasks/${t.id}/file">保存到本地</a>`;
-    actions += `<button class="danger small" onclick="taskDel(${t.id}, ${t.status === 'completed'})">删除</button>`;
+    actions += `<button class="danger small" onclick="taskDel(${t.id})">删除</button>`;
     d.innerHTML = `
       <div class="trow">
         <input type="checkbox" class="taskCk" data-id="${t.id}" ${selectedTasks.has(t.id) ? 'checked' : ''} onchange="taskCkChanged(this)">
@@ -356,22 +355,19 @@ function taskCkChanged(cb) {
 function updateSelCount() {
   document.getElementById('selCount').textContent = selectedTasks.size ? `已选 ${selectedTasks.size} 项` : '';
 }
-async function delSelected() {
+async function delSelected(withFile) {
   if (!selectedTasks.size) return;
   const ids = [...selectedTasks];
-  const anyCompleted = ids.some(id => taskMap[id] && taskMap[id].status === 'completed');
-  const delFile = anyCompleted ? confirm('所选包含已完成任务，同时删除服务器上的文件？') : false;
-  await api('/api/tasks/batch-delete', 'POST', { ids, deleteFile: delFile });
+  if (withFile && !confirm(`删除所选 ${ids.length} 个任务记录，并同时删除服务器上的文件？`)) return;
+  await api('/api/tasks/batch-delete', 'POST', { ids, deleteFile: !!withFile });
   selectedTasks.clear();
   loadTasks();
 }
 async function taskOp(id, op) { await api(`/api/tasks/${id}/${op}`, 'POST'); loadTasks(); }
-async function taskDel(id, completed) {
-  const del = completed ? confirm('同时删除服务器上的文件？') : true;
-  if (!completed || del !== null) {
-    await api(`/api/tasks/${id}?deleteFile=${completed && del ? 'true' : 'false'}`, 'DELETE');
-    loadTasks();
-  }
+async function taskDel(id) {
+  // 单个删除：仅删除任务记录（文件保留；如需连文件删除，用复选框 +「删除所选（任务+文件）」）
+  await api(`/api/tasks/${id}?deleteFile=false`, 'DELETE');
+  loadTasks();
 }
 
 // ---------- 设置 ----------
@@ -383,6 +379,7 @@ async function loadSettings() {
   document.getElementById('setConc').value = s.maxConcurrentTasks;
   document.getElementById('setLimit').value = (s.speedLimitBps / 1048576).toFixed(1);
   document.getElementById('setRetry').value = s.maxRetries;
+  document.getElementById('setDir').value = s.downloadDir || '';
 }
 async function saveSettings() {
   hideMsg('setMsg');
@@ -390,55 +387,10 @@ async function saveSettings() {
     maxConnections: Math.max(1, parseInt(document.getElementById('setConn').value) || 16),
     maxConcurrentTasks: Math.max(1, parseInt(document.getElementById('setConc').value) || 3),
     speedLimitBps: Math.round((parseFloat(document.getElementById('setLimit').value) || 0) * 1048576),
-    maxRetries: Math.max(0, parseInt(document.getElementById('setRetry').value) || 0)
+    maxRetries: Math.max(0, parseInt(document.getElementById('setRetry').value) || 0),
+    downloadDir: document.getElementById('setDir').value.trim()
   };
   const r = await api('/api/settings', 'PUT', s);
   showMsg('setMsg', r.ok ? '设置已保存并即时生效' : (r.message || '保存失败'), r.ok);
 }
 
-// ---------- 服务器缓存文件夹 ----------
-let cacheDirPath = '';
-async function loadCache() {
-  const el = document.getElementById('cacheList');
-  try {
-    const r = await api('/api/cache');
-    if (!r.ok) { el.innerHTML = '<div class="empty">读取缓存目录失败</div>'; return; }
-    cacheDirPath = r.data.dir || '';
-    document.getElementById('cacheDir').textContent = cacheDirPath;
-    const files = r.data.files || [];
-    if (!files.length) { el.innerHTML = '<div class="empty">暂无缓存文件</div>'; return; }
-    el.innerHTML = '';
-    files.forEach(f => {
-      const d = document.createElement('div');
-      d.className = 'task';
-      const dt = f.modifiedAt ? new Date(f.modifiedAt).toLocaleString() : '';
-      d.innerHTML = `
-      <div class="trow">
-        <div class="tbody">
-          <div class="name">${escapeHtml(f.name)}</div>
-          <div class="meta"><span>${fmtSize(f.size)}</span><span style="color:#999">${dt}</span></div>
-          <div class="actions">
-            <a class="btn small" style="text-decoration:none;display:inline-block" href="/api/cache/file?name=${encodeURIComponent(f.name)}">保存到本地</a>
-            <button class="danger small" onclick="cacheDel('${escapeHtml(f.name).replace(/'/g, "\\'")}')">删除</button>
-          </div>
-        </div>
-      </div>`;
-      el.appendChild(d);
-    });
-  } catch (e) {
-    el.innerHTML = '<div class="empty">读取缓存目录失败</div>';
-  }
-}
-async function cacheDel(name) {
-  if (!confirm('确定删除服务器上的缓存文件「' + name + '」吗？')) return;
-  const r = await api('/api/cache/file?name=' + encodeURIComponent(name), 'DELETE');
-  const el = document.getElementById('cacheMsg');
-  if (r.ok) { showMsg('cacheMsg', '已删除', true); loadCache(); }
-  else showMsg('cacheMsg', r.message || '删除失败', false);
-}
-function copyCacheDir() {
-  const t = cacheDirPath || document.getElementById('cacheDir').textContent;
-  if (!t) return;
-  if (navigator.clipboard) navigator.clipboard.writeText(t).then(() => showMsg('cacheMsg', '路径已复制', true));
-  else { prompt('服务器缓存目录路径：', t); }
-}

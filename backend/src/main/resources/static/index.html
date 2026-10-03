@@ -77,25 +77,16 @@
       <h2>下载任务</h2>
       <div class="toolbar">
         <button class="ghost small" onclick="loadTasks()">刷新</button>
-        <span class="hint">文件先保存在服务器缓存目录，任务完成后点「保存到本地」取回</span>
+        <span class="hint">文件直接保存在服务器下载目录（可在设置中修改）</span>
       </div>
       <div class="ckbar">
         <input type="checkbox" id="ckAll" onchange="toggleTaskCk(this.checked)">
         <label for="ckAll">全选</label>
-        <button class="danger small" onclick="delSelected()">删除所选</button>
+        <button class="danger small" onclick="delSelected(false)">删除所选（仅任务）</button>
+        <button class="danger small" onclick="delSelected(true)">删除所选（任务+文件）</button>
         <span class="hint" id="selCount"></span>
       </div>
       <div id="taskList"><div class="empty">暂无下载任务</div></div>
-    </div>
-    <div class="card">
-      <h2>服务器缓存文件夹</h2>
-      <div class="toolbar">
-        <button class="ghost small" onclick="loadCache()">刷新</button>
-        <button class="ghost small" onclick="copyCacheDir()">复制路径</button>
-        <span class="hint" id="cacheDir" style="word-break:break-all"></span>
-      </div>
-      <div id="cacheList"><div class="empty">暂无缓存文件</div></div>
-      <div class="msg" id="cacheMsg"></div>
     </div>
   </section>
 
@@ -107,6 +98,7 @@
       <div class="setrow"><label>同时下载任务数</label><input type="text" id="setConc" inputmode="numeric"><span class="hint">1–64，默认 3</span></div>
       <div class="setrow"><label>全局限速（MB/s）</label><input type="text" id="setLimit" inputmode="decimal"><span class="hint">0 = 不限速</span></div>
       <div class="setrow"><label>失败重试次数</label><input type="text" id="setRetry" inputmode="numeric"><span class="hint">0–50，默认 3</span></div>
+      <div class="setrow"><label>下载目录</label><input type="text" id="setDir" style="min-width:320px"><span class="hint">文件直接下载到服务器上的这个目录，留空则用默认目录</span></div>
       <div class="row" style="margin-top:14px"><button class="btn" onclick="saveSettings()">保存设置</button></div>
       <div class="msg" id="setMsg"></div>
     </div>

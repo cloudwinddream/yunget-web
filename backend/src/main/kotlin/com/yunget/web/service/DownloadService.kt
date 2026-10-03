@@ -1,6 +1,5 @@
 package com.yunget.web.service
 
-import com.yunget.web.model.CacheFileInfo
 import com.yunget.web.model.SettingsData
 import com.yunget.web.model.TaskInfo
 import dev.turbodl.core.DnsMode
@@ -38,13 +37,13 @@ data class TaskRecord(
 
 /**
  * 下载服务：TurboDL 引擎的 Web 封装。
- * - 任务落盘到 data/downloads，完成后浏览器可直接取回
+ * - 任务落盘到设置中的下载目录（默认 dataDir/downloads）
  * - 任务元数据持久化到 tasks.json，重启后可恢复（下载中→已暂停）
  * - 断点续传靠 stableKey="web-<id>" 复用分片目录
  */
 class DownloadService(dataDir: File) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private val downloadsDir = File(dataDir, "downloads").apply { mkdirs() }
+    private val defaultDownloadsDir = File(dataDir, "downloads").apply { mkdirs() }
     private val tmpDir = File(dataDir, "tmp").apply { mkdirs() }
     private val chunkDir = File(dataDir, "chunks").apply { mkdirs() }
     private val tasksFile = File(dataDir, "tasks.json")
@@ -96,12 +95,33 @@ class DownloadService(dataDir: File) {
     )
 
     fun updateSettings(s: SettingsData) {
-        settings = s
+        val dir = s.downloadDir.trim()
+        if (dir.isNotBlank()) {
+            val f = File(dir)
+            val ok = try {
+                f.mkdirs()
+                f.isDirectory && f.canWrite()
+            } catch (e: Exception) {
+                false
+            }
+            if (!ok) throw IllegalArgumentException("下载目录无法创建或不可写：$dir")
+        }
+        settings = s.copy(downloadDir = dir)
         try {
-            settingsFile.writeText(json.encodeToString(s))
+            settingsFile.writeText(json.encodeToString(settings))
         } catch (e: Exception) { e.printStackTrace() }
         client.updateConfig(buildConfig(s))
     }
+
+    /** 实际生效的下载目录（设置留空时用默认目录） */
+    fun resolvedDownloadsDir(): File {
+        val custom = settings.downloadDir.trim()
+        return if (custom.isBlank()) defaultDownloadsDir else File(custom).apply { mkdirs() }
+    }
+
+    /** 给前端展示的设置（downloadDir 填为当前生效目录，方便查看与修改） */
+    fun settingsForDisplay(): SettingsData =
+        settings.copy(downloadDir = resolvedDownloadsDir().absolutePath)
 
     private fun loadSettings(): SettingsData = try {
         if (settingsFile.exists()) json.decodeFromString(settingsFile.readText()) else SettingsData()
@@ -197,33 +217,6 @@ class DownloadService(dataDir: File) {
 
     fun get(id: Long): TaskRecord? = tasks[id]
 
-    fun fileForDownload(id: Long): File? {
-        val t = tasks[id] ?: return null
-        if (t.status != "completed") return null
-        return t.savePath.takeIf { it.isNotBlank() }?.let { File(it) }?.takeIf { it.exists() }
-    }
-
-    // ---------- 服务器缓存目录 ----------
-
-    /** 缓存目录（即下载落盘目录） */
-    fun cacheDir(): File = downloadsDir
-
-    /** 列出缓存目录中的文件（按修改时间倒序） */
-    fun listCacheFiles(): List<CacheFileInfo> =
-        downloadsDir.listFiles { f -> f.isFile }?.sortedByDescending { it.lastModified() }
-            ?.map { CacheFileInfo(it.name, it.length(), it.lastModified()) } ?: emptyList()
-
-    /** 按文件名取缓存文件，失败/越权返回 null（防路径穿越） */
-    fun cacheFile(name: String): File? {
-        if (name.isBlank() || name.contains("..")) return null
-        val base = downloadsDir.canonicalPath
-        val f = File(downloadsDir, name).canonicalFile
-        if (!f.canonicalPath.startsWith(base + File.separator)) return null
-        return f.takeIf { it.isFile && it.exists() }
-    }
-
-    fun deleteCacheFile(name: String): Boolean = cacheFile(name)?.delete() == true
-
     fun shutdown() {
         runCatching { scope.let { } }
         runCatching { bootstrap.shutdown() }
@@ -270,7 +263,7 @@ class DownloadService(dataDir: File) {
     private suspend fun onCompleted(id: Long, file: File, totalBytes: Long) {
         val task = tasks[id] ?: return
         try {
-            val dest = uniqueFile(downloadsDir, task.fileName)
+            val dest = uniqueFile(resolvedDownloadsDir(), task.fileName)
             // 同线程内移动/复制
             if (!file.renameTo(dest)) {
                 file.copyTo(dest, overwrite = true)

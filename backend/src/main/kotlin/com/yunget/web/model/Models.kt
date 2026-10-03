@@ -74,20 +74,9 @@ data class SettingsData(
     val maxConnections: Int = 16,
     val maxConcurrentTasks: Int = 3,
     val speedLimitBps: Long = 0,
-    val maxRetries: Int = 3
-)
-
-@Serializable
-data class CacheFileInfo(
-    val name: String,
-    val size: Long,
-    val modifiedAt: Long
-)
-
-@Serializable
-data class CacheListResponse(
-    val dir: String,
-    val files: List<CacheFileInfo>
+    val maxRetries: Int = 3,
+    // 服务器上的下载目录；留空则用默认目录（dataDir/downloads）
+    val downloadDir: String = ""
 )
 
 @Serializable

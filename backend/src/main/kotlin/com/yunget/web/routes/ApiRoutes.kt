@@ -3,7 +3,6 @@ package com.yunget.web.routes
 import com.yunget.app.data.network.model.ShareFile
 import com.yunget.web.model.ApiResult
 import com.yunget.web.model.BatchDeleteRequest
-import com.yunget.web.model.CacheListResponse
 import com.yunget.web.model.CookieLoginRequest
 import com.yunget.web.model.QrStatusResponse
 import com.yunget.web.model.DirectDownloadRequest
@@ -270,65 +269,9 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService) {
             call.respond(ok(mapOf("deleted" to n)))
         }
 
-        get("/tasks/{id}/file") {
-            val id = call.parameters["id"]?.toLongOrNull()
-            val file = if (id != null) downloads.fileForDownload(id) else null
-            if (file == null) {
-                call.respond(HttpStatusCode.NotFound, fail("文件不存在或任务未完成"))
-                return@get
-            }
-            // filename* 按 RFC 5987 编码：直接传原始文件名，由 Ktor 负责
-            // 百分号编码。注意不能自己先 URLEncoder.encode，否则 Ktor 会
-            // 对 % 再编码一次（%25），导致中文文件名下载时显示为乱码。
-            call.response.header(
-                HttpHeaders.ContentDisposition,
-                ContentDisposition.Attachment.withParameter(
-                    ContentDisposition.Parameters.FileNameAsterisk, file.name
-                ).toString()
-            )
-            call.respond(LocalFileContent(file, ContentType.Application.OctetStream))
-        }
-
-        // ---------- 服务器缓存目录 ----------
-        get("/cache") {
-            call.respond(
-                ok(
-                    CacheListResponse(
-                        dir = downloads.cacheDir().absolutePath,
-                        files = downloads.listCacheFiles()
-                    )
-                )
-            )
-        }
-
-        get("/cache/file") {
-            val name = call.request.queryParameters["name"]
-            val file = name?.let { downloads.cacheFile(it) }
-            if (file == null) {
-                call.respond(HttpStatusCode.NotFound, fail("文件不存在"))
-                return@get
-            }
-            call.response.header(
-                HttpHeaders.ContentDisposition,
-                ContentDisposition.Attachment.withParameter(
-                    ContentDisposition.Parameters.FileNameAsterisk, file.name
-                ).toString()
-            )
-            call.respond(LocalFileContent(file, ContentType.Application.OctetStream))
-        }
-
-        delete("/cache/file") {
-            val name = call.request.queryParameters["name"]
-            if (name.isNullOrBlank() || !downloads.deleteCacheFile(name)) {
-                call.respond(fail("删除失败，文件不存在"))
-                return@delete
-            }
-            call.respond(ok(mapOf("done" to true)))
-        }
-
         // ---------- 设置 ----------
         get("/settings") {
-            call.respond(ok(downloads.settings))
+            call.respond(ok(downloads.settingsForDisplay()))
         }
 
         put("/settings") {

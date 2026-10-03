@@ -34,11 +34,11 @@ fun main() {
 
     log.info("数据目录: ${dataDir.absolutePath}")
 
-    // 中文文件名依赖 JVM 的文件名编码；POSIX/C locale 下缓存目录会列不出中文文件
+    // 中文文件名依赖 JVM 的文件名编码；POSIX/C locale 下下载的中文文件名会异常
     val jnu = System.getProperty("sun.jnu.encoding", "")
     if (!jnu.equals("UTF-8", ignoreCase = true)) {
         log.warn(
-            "当前文件名编码为 {}，中文文件名可能无法正常列出；" +
+            "当前文件名编码为 {}，下载的中文文件名可能异常；" +
                 "建议使用 UTF-8 locale 启动，例如：LANG=C.UTF-8 LC_ALL=C.UTF-8 java -jar yunget-web.jar",
             jnu
         )

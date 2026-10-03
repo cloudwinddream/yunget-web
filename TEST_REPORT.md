@@ -41,9 +41,9 @@
 | 26 | 前端 `qrcode.js` 二维码生成（node） | ✅ 正常输出 SVG |
 | 27 | 前端 `app.js` / `qrcode.js` 语法 | ✅ `node --check` 通过 |
 | 28 | 静态资源 `/qrcode.js`、首页含扫码弹窗/全选（自动下载开关已移除） | ✅ 均为 200，元素存在 |
-| 29 | `GET /api/cache`（v1.0.1 新增：服务器缓存目录浏览） | ✅ 返回 dir + files 列表 |
-| 30 | `GET /api/cache/file?name=`（v1.0.1 新增：缓存文件取回） | ✅ 存在文件返回附件，不存在返回 404 |
-| 31 | `DELETE /api/cache/file?name=`（v1.0.1 新增：删除缓存文件） | ✅ 删除成功返回 done，路径穿越被拒绝 |
+| 29 | `GET /api/settings` 含 `downloadDir`（v1.0.2 新增，显示当前生效目录） | ✅ 默认目录与自定义目录均正确返回 |
+| 30 | `PUT /api/settings` 持久化 `downloadDir`，无效目录拒绝保存 | ✅ 持久化一致；不可写目录返回失败信息 |
+| 31 | 批量清理两种模式（v1.0.2） | ✅ `deleteFile=false` 仅删记录文件保留；`deleteFile=true` 记录与文件均删除 |
 
 ## 已知限制（非代码问题）
 
