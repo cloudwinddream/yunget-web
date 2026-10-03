@@ -77,3 +77,7 @@ table.files tr.dir:hover td { background: #f6f9ff; }
 .diritem:last-child { border-bottom: none; }
 .diritem:hover { background: #f0f6ff; }
 .dirempty { padding: 16px 12px; font-size: 13px; color: #999; text-align: center; }
+.batch { border: 1px solid #e5e7eb; border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; background: #fbfcfe; }
+.batch .kids { margin: 8px 0 0 16px; border-left: 2px solid #eef1f5; padding-left: 10px; }
+.batch .kids .task { padding: 8px 0; border-bottom: 1px dashed #eef1f5; }
+.batch .kids .task:last-child { border-bottom: none; }

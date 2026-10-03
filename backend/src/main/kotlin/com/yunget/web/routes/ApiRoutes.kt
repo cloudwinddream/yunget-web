@@ -2,12 +2,14 @@ package com.yunget.web.routes
 
 import com.yunget.app.data.network.model.ShareFile
 import com.yunget.web.model.ApiResult
+import com.yunget.web.model.BatchActionRequest
 import com.yunget.web.model.BatchDeleteRequest
 import com.yunget.web.model.CookieLoginRequest
 import com.yunget.web.model.DirListResponse
 import com.yunget.web.model.QrStatusResponse
 import com.yunget.web.model.DirectDownloadRequest
 import com.yunget.web.model.DownloadSubmitRequest
+import com.yunget.web.model.ExpandRequest
 import com.yunget.web.model.FileItem
 import com.yunget.web.model.ParseRequest
 import com.yunget.web.model.ParseResponse
@@ -202,14 +204,28 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService) {
         }
 
         // ---------- 下载 ----------
+        post("/downloads/expand") {
+            try {
+                val req = call.receive<ExpandRequest>()
+                val r = netdisk.expandSelection(req.sessionId, req.files)
+                call.respond(ok(r))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "展开文件夹失败"))
+            }
+        }
+
         post("/downloads") {
             try {
                 val req = call.receive<DownloadSubmitRequest>()
-                if (req.files.isEmpty()) {
-                    call.respond(fail("请选择要下载的文件"))
-                    return@post
+                val ids = if (req.expandId.isNotBlank()) {
+                    netdisk.resolveAndEnqueueExpanded(req.expandId)
+                } else {
+                    if (req.files.isEmpty()) {
+                        call.respond(fail("请选择要下载的文件"))
+                        return@post
+                    }
+                    netdisk.resolveAndEnqueue(req.sessionId, req.files)
                 }
-                val ids = netdisk.resolveAndEnqueue(req.sessionId, req.files)
                 call.respond(ok(mapOf("taskIds" to ids)))
             } catch (e: Exception) {
                 call.respond(fail(e.message ?: "提交下载失败"))
@@ -268,6 +284,18 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService) {
                 runCatching { downloads.delete(id, req.deleteFile); n++ }
             }
             call.respond(ok(mapOf("deleted" to n)))
+        }
+
+        post("/tasks/batch-pause") {
+            val req = call.receive<BatchActionRequest>()
+            req.ids.forEach { id -> runCatching { downloads.pause(id) } }
+            call.respond(ok(mapOf("done" to true)))
+        }
+
+        post("/tasks/batch-resume") {
+            val req = call.receive<BatchActionRequest>()
+            req.ids.forEach { id -> runCatching { downloads.resume(id) } }
+            call.respond(ok(mapOf("done" to true)))
         }
 
         // ---------- 服务器目录浏览（供设置页选择下载目录） ----------

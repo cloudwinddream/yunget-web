@@ -32,7 +32,11 @@ data class TaskRecord(
     val status: String = "downloading",
     val error: String = "",
     val savePath: String = "",
-    val createdAt: Long = System.currentTimeMillis()
+    val createdAt: Long = System.currentTimeMillis(),
+    // 文件夹下载批次（普通单文件下载为空）
+    val batchId: String = "",
+    val batchName: String = "",
+    val relPath: String = ""
 )
 
 /**
@@ -139,6 +143,9 @@ class DownloadService(dataDir: File) {
         fileName: String,
         headers: Map<String, String>,
         size: Long,
+        batchId: String = "",
+        batchName: String = "",
+        relPath: String = "",
         onComplete: (suspend () -> Unit)? = null
     ): Long {
         val safeName = sanitizeFileName(
@@ -148,7 +155,10 @@ class DownloadService(dataDir: File) {
             }
         )
         val id = idGen.getAndIncrement()
-        tasks[id] = TaskRecord(id = id, fileName = safeName, url = url, headers = headers, total = size)
+        tasks[id] = TaskRecord(
+            id = id, fileName = safeName, url = url, headers = headers, total = size,
+            batchId = batchId, batchName = batchName, relPath = relPath
+        )
         if (headers.isNotEmpty()) headersCache[id] = headers
         if (onComplete != null) callbacks[id] = onComplete
         persistTasks()
@@ -204,7 +214,10 @@ class DownloadService(dataDir: File) {
             if (turboId != null) runCatching { client.cancel(turboId, deleteOutput = true) }
             File(tmpDir, "task_${id}.part").delete()
             if (deleteFile) {
-                tasks[id]?.savePath?.takeIf { it.isNotBlank() }?.let { File(it).delete() }
+                tasks[id]?.savePath?.takeIf { it.isNotBlank() }?.let {
+                    val f = File(it)
+                    if (f.delete()) cleanupEmptyParents(f)
+                }
             }
             tasks.remove(id)
             persistTasks()
@@ -216,7 +229,8 @@ class DownloadService(dataDir: File) {
             id = t.id, fileName = t.fileName, status = t.status,
             downloaded = t.downloaded, total = t.total,
             speed = speeds[t.id] ?: 0L, etaMillis = etas[t.id] ?: -1L,
-            error = t.error, createdAt = t.createdAt
+            error = t.error, createdAt = t.createdAt,
+            batchId = t.batchId, batchName = t.batchName, relPath = t.relPath
         )
     }
 
@@ -265,10 +279,26 @@ class DownloadService(dataDir: File) {
         }
     }
 
+    /** 删文件后顺带清掉变空的父目录（只清下载目录内、且确实空了的目录，不越出下载目录） */
+    private fun cleanupEmptyParents(file: File) {
+        runCatching {
+            val root = resolvedDownloadsDir().canonicalFile
+            var dir = file.parentFile?.canonicalFile
+            while (dir != null && dir != root && dir.path.startsWith(root.path + File.separator)) {
+                if (!dir.delete()) break
+                dir = dir.parentFile?.canonicalFile
+            }
+        }
+    }
+
     private suspend fun onCompleted(id: Long, file: File, totalBytes: Long) {
         val task = tasks[id] ?: return
         try {
-            val dest = uniqueFile(resolvedDownloadsDir(), task.fileName)
+            val base = resolvedDownloadsDir()
+            val destDir = if (task.relPath.isBlank()) base
+            else File(base, task.relPath).apply { mkdirs() }
+                    .takeIf { it.canonicalPath.startsWith(base.canonicalPath) } ?: base
+            val dest = uniqueFile(destDir, task.fileName)
             // 同线程内移动/复制
             if (!file.renameTo(dest)) {
                 file.copyTo(dest, overwrite = true)

@@ -240,7 +240,7 @@ function renderFiles() {
   const sorted = [...dirs, ...files];
   let html = '<table class="files"><tr><th style="width:34px"></th><th>文件名</th><th style="width:90px">大小</th><th style="width:130px">修改时间</th></tr>';
   sorted.forEach((f, i) => {
-    const cb = f.isdir ? '' : `<input type="checkbox" data-i="${curFiles.indexOf(f)}" onchange="updateSel()">`;
+    const cb = `<input type="checkbox" data-i="${curFiles.indexOf(f)}" onchange="updateSel()">`;
     const name = f.isdir
       ? `<a href="javascript:void(0)" onclick="enterDir(${curFiles.indexOf(f)})" style="color:#1a73e8">📁 ${escapeHtml(f.fname)}</a>`
       : `📄 ${escapeHtml(f.fname)}`;
@@ -259,20 +259,37 @@ function toggleAll(on) {
   updateSel();
 }
 function updateSel() {
-  const n = document.querySelectorAll('#fileList input[type=checkbox]:checked').length;
-  document.getElementById('selInfo').textContent = n ? `已选 ${n} 个文件` : '';
+  const cbs = [...document.querySelectorAll('#fileList input[type=checkbox]:checked')];
+  const n = cbs.length;
+  const hasDir = cbs.some(c => curFiles[+c.dataset.i] && curFiles[+c.dataset.i].isdir);
+  document.getElementById('selInfo').textContent = n ? `已选 ${n} 项${hasDir ? '（含文件夹，将下载其全部内容）' : ''}` : '';
 }
 async function downloadSelected() {
   const idx = [...document.querySelectorAll('#fileList input[type=checkbox]:checked')].map(c => +c.dataset.i);
   hideMsg('dlMsg');
   if (!idx.length) { showMsg('dlMsg', '请先勾选要下载的文件', false); return; }
+  const items = idx.map(i => curFiles[i]);
   const btn = document.getElementById('dlBtn');
-  btn.disabled = true; btn.textContent = '取链中…（每个文件需转存+取直链）';
+  btn.disabled = true;
   try {
-    const files = idx.map(i => curFiles[i]);
-    const r = await api('/api/downloads', 'POST', { sessionId: curSession, files });
-    if (!r.ok) { showMsg('dlMsg', r.message || '提交失败', false); return; }
-    showMsg('dlMsg', `已加入 ${r.data.taskIds.length} 个下载任务，可到「下载任务」页查看进度`, true);
+    if (items.some(f => f.isdir)) {
+      // 含文件夹：先展开预览（文件数/总大小），确认后再提交
+      btn.textContent = '正在扫描文件夹…';
+      const ex = await api('/api/downloads/expand', 'POST', { sessionId: curSession, files: items });
+      if (!ex.ok) { showMsg('dlMsg', ex.message || '展开文件夹失败', false); return; }
+      const tip = ex.data.truncated ? '\n（文件数超过上限 5000，已截断）' : '';
+      const okGo = confirm(`将下载 ${ex.data.fileCount} 个文件（共 ${fmtSize(ex.data.totalSize)}），保存到下载目录的「${ex.data.batchName}」文件夹。继续吗？${tip}`);
+      if (!okGo) return;
+      btn.textContent = '取链中…（每个文件需转存+取直链，请耐心等）';
+      const r = await api('/api/downloads', 'POST', { sessionId: curSession, expandId: ex.data.expandId });
+      if (!r.ok) { showMsg('dlMsg', r.message || '提交失败', false); return; }
+      showMsg('dlMsg', `已加入 ${r.data.taskIds.length} 个下载任务，可到「下载任务」页查看进度`, true);
+    } else {
+      btn.textContent = '取链中…（每个文件需转存+取直链）';
+      const r = await api('/api/downloads', 'POST', { sessionId: curSession, files: items });
+      if (!r.ok) { showMsg('dlMsg', r.message || '提交失败', false); return; }
+      showMsg('dlMsg', `已加入 ${r.data.taskIds.length} 个下载任务，可到「下载任务」页查看进度`, true);
+    }
   } finally { btn.disabled = false; btn.textContent = '下载选中'; }
 }
 async function directDownload() {
@@ -292,6 +309,93 @@ function stopTaskPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer =
 const STATUS_TXT = { downloading: '下载中', paused: '已暂停', completed: '已完成', failed: '失败' };
 let taskMap = {};               // id -> task
 const selectedTasks = new Set();
+const expandedBatches = new Set();
+function renderTask(t) {
+  const d = document.createElement('div');
+  d.className = 'task';
+  const pct = t.total > 0 ? Math.min(100, Math.round(t.downloaded * 100 / t.total)) : 0;
+  const bar = t.status === 'completed' ? 'done' : (t.status === 'failed' ? 'fail' : '');
+  let actions = '';
+  if (t.status === 'downloading') actions += `<button class="ghost small" onclick="taskOp(${t.id},'pause')">暂停</button>`;
+  if (t.status === 'paused' || t.status === 'failed') actions += `<button class="ghost small" onclick="taskOp(${t.id},'resume')">继续</button>`;
+  actions += `<button class="danger small" onclick="taskDel(${t.id})">删除</button>`;
+  d.innerHTML = `
+      <div class="trow">
+        <input type="checkbox" class="taskCk" data-id="${t.id}" ${selectedTasks.has(t.id) ? 'checked' : ''} onchange="taskCkChanged(this)">
+        <div class="tbody">
+          <div class="name">${escapeHtml(t.fileName)}</div>
+          <div class="pbar ${bar}"><div style="width:${t.status === 'completed' ? 100 : pct}%"></div></div>
+          <div class="meta">
+            <span class="status ${t.status}">${STATUS_TXT[t.status] || t.status}</span>
+            <span>${fmtSize(t.downloaded)} / ${fmtSize(t.total)}${t.total > 0 && t.status !== 'completed' ? ' · ' + pct + '%' : ''}</span>
+            ${t.status === 'downloading' && t.speed > 0 ? `<span>${fmtSpeed(t.speed)}</span>` : ''}
+            ${t.relPath ? `<span style="color:#999">${escapeHtml(t.relPath)}</span>` : ''}
+          </div>
+          ${t.error ? `<div class="err-text">${escapeHtml(t.error)}</div>` : ''}
+          <div class="actions">${actions}</div>
+        </div>
+      </div>`;
+  return d;
+}
+function renderBatch(batchId, batchName, kids) {
+  const wrap = document.createElement('div');
+  wrap.className = 'batch';
+  const done = kids.filter(t => t.status === 'completed').length;
+  const failed = kids.filter(t => t.status === 'failed').length;
+  const downloading = kids.filter(t => t.status === 'downloading').length;
+  const totalBytes = kids.reduce((a, t) => a + (t.total || 0), 0);
+  const downBytes = kids.reduce((a, t) => a + Math.min(t.downloaded || 0, t.total || (t.downloaded || 0)), 0);
+  const speed = kids.reduce((a, t) => a + (t.speed || 0), 0);
+  const pct = totalBytes > 0 ? Math.min(100, Math.round(downBytes * 100 / totalBytes)) : (kids.length && done === kids.length ? 100 : 0);
+  let stat;
+  if (downloading > 0) stat = `下载中 ${done}/${kids.length}`;
+  else if (done === kids.length) stat = '已完成';
+  else if (failed > 0 && done + failed === kids.length) stat = `完成（${failed} 个失败）`;
+  else stat = `已暂停 ${done}/${kids.length}${failed ? ` · ${failed} 失败` : ''}`;
+  const open = expandedBatches.has(batchId);
+  let acts = `<button class="ghost small" onclick="toggleBatch('${batchId}')">${open ? '收起' : '展开'}</button>`;
+  if (downloading > 0) acts += `<button class="ghost small" onclick="batchOp('${batchId}','pause')">暂停全部</button>`;
+  if (kids.some(t => t.status === 'paused' || t.status === 'failed')) acts += `<button class="ghost small" onclick="batchOp('${batchId}','resume')">继续全部</button>`;
+  acts += `<button class="danger small" onclick="batchDelete('${batchId}', false, this)">删批次（仅任务）</button>`;
+  acts += `<button class="danger small" onclick="batchDelete('${batchId}', true, this)">删批次（任务+文件）</button>`;
+  const head = document.createElement('div');
+  head.innerHTML = `
+      <div class="trow"><div class="tbody">
+        <div class="name">📁 ${escapeHtml(batchName || '文件夹下载')}</div>
+        <div class="pbar ${done === kids.length ? 'done' : (failed && !downloading ? 'fail' : '')}"><div style="width:${pct}%"></div></div>
+        <div class="meta"><span>${stat}</span><span>${fmtSize(downBytes)} / ${fmtSize(totalBytes)}${totalBytes > 0 ? ' · ' + pct + '%' : ''}</span>${speed > 0 ? `<span>${fmtSpeed(speed)}</span>` : ''}</div>
+        <div class="actions">${acts}</div>
+      </div></div>`;
+  wrap.appendChild(head);
+  if (open) {
+    const box = document.createElement('div');
+    box.className = 'kids';
+    kids.forEach(t => box.appendChild(renderTask(t)));
+    wrap.appendChild(box);
+  }
+  return wrap;
+}
+function toggleBatch(batchId) {
+  if (expandedBatches.has(batchId)) expandedBatches.delete(batchId); else expandedBatches.add(batchId);
+  loadTasks();
+}
+async function batchOp(batchId, op) {
+  const kids = Object.values(taskMap).filter(t => t.batchId === batchId);
+  const ids = kids.filter(t => op === 'pause' ? t.status === 'downloading' : (t.status === 'paused' || t.status === 'failed')).map(t => t.id);
+  if (ids.length) await api(`/api/tasks/batch-${op}`, 'POST', { ids });
+  loadTasks();
+}
+async function batchDelete(batchId, withFile, btn) {
+  const kids = Object.values(taskMap).filter(t => t.batchId === batchId);
+  const ids = kids.map(t => t.id);
+  if (!ids.length) return;
+  const name = (kids[0] && kids[0].batchName) || '该批次';
+  if (withFile && !confirm(`删除「${name}」的 ${ids.length} 个任务记录，并同时删除已下载的文件？`)) return;
+  if (!withFile && !confirm(`仅删除「${name}」的 ${ids.length} 个任务记录（文件保留）？`)) return;
+  await api('/api/tasks/batch-delete', 'POST', { ids, deleteFile: !!withFile });
+  expandedBatches.delete(batchId);
+  loadTasks();
+}
 async function loadTasks() {
   const r = await api('/api/tasks');
   if (!r.ok) return;
@@ -307,31 +411,15 @@ async function loadTasks() {
   const el = document.getElementById('taskList');
   if (!list.length) { el.innerHTML = '<div class="empty">暂无下载任务</div>'; updateSelCount(); return; }
   el.innerHTML = '';
+  const seenBatch = new Set();
   list.forEach(t => {
-    const d = document.createElement('div');
-    d.className = 'task';
-    const pct = t.total > 0 ? Math.min(100, Math.round(t.downloaded * 100 / t.total)) : 0;
-    const bar = t.status === 'completed' ? 'done' : (t.status === 'failed' ? 'fail' : '');
-    let actions = '';
-    if (t.status === 'downloading') actions += `<button class="ghost small" onclick="taskOp(${t.id},'pause')">暂停</button>`;
-    if (t.status === 'paused' || t.status === 'failed') actions += `<button class="ghost small" onclick="taskOp(${t.id},'resume')">继续</button>`;
-    actions += `<button class="danger small" onclick="taskDel(${t.id})">删除</button>`;
-    d.innerHTML = `
-      <div class="trow">
-        <input type="checkbox" class="taskCk" data-id="${t.id}" ${selectedTasks.has(t.id) ? 'checked' : ''} onchange="taskCkChanged(this)">
-        <div class="tbody">
-          <div class="name">${escapeHtml(t.fileName)}</div>
-          <div class="pbar ${bar}"><div style="width:${t.status === 'completed' ? 100 : pct}%"></div></div>
-          <div class="meta">
-            <span class="status ${t.status}">${STATUS_TXT[t.status] || t.status}</span>
-            <span>${fmtSize(t.downloaded)} / ${fmtSize(t.total)}${t.total > 0 && t.status !== 'completed' ? ' · ' + pct + '%' : ''}</span>
-            ${t.status === 'downloading' && t.speed > 0 ? `<span>${fmtSpeed(t.speed)}</span>` : ''}
-          </div>
-          ${t.error ? `<div class="err-text">${escapeHtml(t.error)}</div>` : ''}
-          <div class="actions">${actions}</div>
-        </div>
-      </div>`;
-    el.appendChild(d);
+    if (t.batchId) {
+      if (seenBatch.has(t.batchId)) return;
+      seenBatch.add(t.batchId);
+      el.appendChild(renderBatch(t.batchId, t.batchName, list.filter(x => x.batchId === t.batchId)));
+    } else {
+      el.appendChild(renderTask(t));
+    }
   });
   updateSelCount();
   const all = document.querySelectorAll('.taskCk');

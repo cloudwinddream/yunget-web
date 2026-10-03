@@ -40,14 +40,36 @@ data class FileItem(
     val isdir: Boolean,
     val pdirFid: String = "",
     val fidToken: String = "",
-    val modifyTime: String = ""
+    val modifyTime: String = "",
+    // 相对下载目录的子路径（文件夹下载展开时由后端填充，普通文件下载为空）
+    val relPath: String = ""
 )
 
 @Serializable
 data class FileListRequest(val dirFid: String = "0")
 
 @Serializable
-data class DownloadSubmitRequest(val sessionId: String, val files: List<FileItem>)
+data class DownloadSubmitRequest(
+    val sessionId: String,
+    val files: List<FileItem> = emptyList(),
+    // 文件夹展开下载时传此 ID（由 /api/downloads/expand 返回）
+    val expandId: String = ""
+)
+
+@Serializable
+data class ExpandRequest(val sessionId: String, val files: List<FileItem>)
+
+@Serializable
+data class ExpandResponse(
+    val expandId: String,
+    val batchName: String,
+    val fileCount: Int,
+    val totalSize: Long,
+    val truncated: Boolean = false
+)
+
+@Serializable
+data class BatchActionRequest(val ids: List<Long>)
 
 @Serializable
 data class DirectDownloadRequest(
@@ -66,7 +88,11 @@ data class TaskInfo(
     val speed: Long,
     val etaMillis: Long = -1,
     val error: String = "",
-    val createdAt: Long
+    val createdAt: Long,
+    // 文件夹下载批次（普通单文件下载为空）
+    val batchId: String = "",
+    val batchName: String = "",
+    val relPath: String = ""
 )
 
 @Serializable

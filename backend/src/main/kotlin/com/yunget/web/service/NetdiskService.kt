@@ -25,6 +25,7 @@ import com.yunget.app.data.repository.QuarkResolveRepository
 import com.yunget.app.data.repository.ShareResolveRepository
 import com.yunget.app.data.repository.UCResolveRepository
 import com.yunget.app.data.repository.XunleiResolveRepository
+import com.yunget.web.model.ExpandResponse
 import com.yunget.web.model.FileItem
 import com.yunget.web.model.PlatformInfo
 import com.yunget.web.model.XunleiLoginResponse
@@ -58,6 +59,7 @@ enum class Platform(val id: String, val displayName: String, val loginType: Stri
 }
 
 private const val SESSION_TTL_MS = 30L * 60 * 1000
+private const val MAX_FOLDER_FILES = 5000
 
 data class ResolveSession(
     val id: String,
@@ -320,7 +322,114 @@ class NetdiskService(
      * 批量取直链并提交下载。转存+取链是串行的（网盘接口有节奏要求），
      * 每个文件取到直链后立即入队，不阻塞等待全部完成。
      */
-    suspend fun resolveAndEnqueue(sessionId: String, files: List<FileItem>): List<Long> {
+    suspend fun resolveAndEnqueue(sessionId: String, files: List<FileItem>): List<Long> =
+        enqueueFiles(sessionId, files, batchId = "", batchName = "")
+
+    // ---------- 文件夹下载：递归展开 ----------
+
+    private data class Expansion(
+        val id: String,
+        val sessionId: String,
+        val batchName: String,
+        val files: List<FileItem>,
+        val dirs: List<String>,
+        val createdAt: Long = System.currentTimeMillis()
+    )
+
+    private val expansions = ConcurrentHashMap<String, Expansion>()
+
+    /**
+     * 把用户勾选的文件/文件夹递归展开成完整文件清单（先预览数量与总大小，
+     * 确认后用 expandId 正式提交，避免重复遍历）。
+     * - 只选一个文件夹：批次名取文件夹名，文件落到「下载目录/文件夹名/…」
+     * - 只选文件：批次名取分享标题，文件仍落在下载目录根下（兼容旧行为）
+     * - 混合选择：批次名取分享标题，文件夹在其下按原名建目录
+     */
+    suspend fun expandSelection(sessionId: String, items: List<FileItem>): ExpandResponse {
+        val s = sessions[sessionId] ?: throw IllegalStateException("解析会话已过期，请重新解析")
+        require(items.isNotEmpty()) { "请选择要下载的文件" }
+        val now = System.currentTimeMillis()
+        expansions.entries.removeIf { now - it.value.createdAt > SESSION_TTL_MS }
+
+        val singleFolder = items.size == 1 && items[0].isdir
+        val hasFolder = items.any { it.isdir }
+        val batchName = sanitizeSegment(
+            if (singleFolder) items[0].fname else s.session.title.ifBlank { "批量下载" }
+        )
+        val rootPrefix = when {
+            singleFolder -> batchName
+            hasFolder -> batchName
+            else -> ""
+        }
+
+        val outFiles = mutableListOf<FileItem>()
+        val outDirs = mutableListOf<String>()
+        var truncated = false
+
+        suspend fun walk(dirFid: String, relDir: String, depth: Int) {
+            if (depth > 32) { truncated = true; return }
+            val children = listFiles(sessionId, dirFid)
+            for (c in children) {
+                if (c.isdir) {
+                    val childRel = joinRel(relDir, sanitizeSegment(c.fname))
+                    outDirs.add(childRel)
+                    walk(c.fid, childRel, depth + 1)
+                    if (outFiles.size > MAX_FOLDER_FILES) return
+                } else {
+                    if (outFiles.size >= MAX_FOLDER_FILES) { truncated = true; return }
+                    outFiles.add(
+                        FileItem(
+                            fid = c.fid, fname = c.fname, fsize = c.fsize, isdir = false,
+                            pdirFid = c.pdirFid, fidToken = c.fidToken,
+                            modifyTime = c.modifyTime, relPath = relDir
+                        )
+                    )
+                }
+            }
+        }
+
+        for (item in items) {
+            if (item.isdir) {
+                val base = when {
+                    singleFolder -> rootPrefix
+                    else -> joinRel(rootPrefix, sanitizeSegment(item.fname))
+                }
+                if (base.isNotBlank()) outDirs.add(base)
+                walk(item.fid, base, 0)
+            } else {
+                if (outFiles.size >= MAX_FOLDER_FILES) { truncated = true; break }
+                outFiles.add(item.copy(relPath = rootPrefix))
+            }
+            if (outFiles.size > MAX_FOLDER_FILES) { truncated = true; break }
+        }
+
+        require(outFiles.isNotEmpty()) { "所选文件夹里没有可下载的文件" }
+        val id = UUID.randomUUID().toString()
+        expansions[id] = Expansion(id, sessionId, batchName, outFiles, outDirs.distinct())
+        return ExpandResponse(
+            expandId = id,
+            batchName = batchName,
+            fileCount = outFiles.size,
+            totalSize = outFiles.sumOf { it.fsize },
+            truncated = truncated
+        )
+    }
+
+    /** 用展开结果正式提交下载（预建目录含空目录，再逐个取链入队）。 */
+    suspend fun resolveAndEnqueueExpanded(expandId: String): List<Long> {
+        val exp = expansions.remove(expandId)
+            ?: throw IllegalStateException("展开结果已过期，请重新选择")
+        val base = downloadService.resolvedDownloadsDir()
+        exp.dirs.forEach { d -> runCatching { java.io.File(base, d).mkdirs() } }
+        return enqueueFiles(exp.sessionId, exp.files, batchId = exp.id, batchName = exp.batchName)
+    }
+
+    private suspend fun enqueueFiles(
+        sessionId: String,
+        files: List<FileItem>,
+        batchId: String,
+        batchName: String
+    ): List<Long> {
         val s = sessions[sessionId] ?: throw IllegalStateException("解析会话已过期，请重新解析")
         val repo = repos[s.platform]!!
         val ids = mutableListOf<Long>()
@@ -341,6 +450,9 @@ class NetdiskService(
                 fileName = link.filename.ifBlank { f.fname },
                 headers = headers,
                 size = link.size,
+                batchId = batchId,
+                batchName = batchName,
+                relPath = f.relPath,
                 onComplete = {
                     // 夸克：下载完成后清理临时转存目录
                     val dirFid = link.cleanupDirFid
@@ -358,6 +470,15 @@ class NetdiskService(
             ids.add(id)
         }
         return ids
+    }
+
+    private fun joinRel(a: String, b: String): String = if (a.isBlank()) b else "$a/$b"
+
+    private fun sanitizeSegment(name: String): String {
+        var n = name.trim().ifBlank { "download" }
+        n = n.replace(Regex("[/\\\\:*?\"<>|]"), "_")
+        if (n.length > 100) n = n.take(100)
+        return n
     }
 
     /** 各平台下载请求头（与 Android 版完全一致的配方） */
