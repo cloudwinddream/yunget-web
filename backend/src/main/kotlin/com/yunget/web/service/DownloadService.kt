@@ -106,8 +106,10 @@ class DownloadService(dataDir: File) {
         dynamicSegmentation = true,
         segmentsPerConnection = 4,
         forceHttp1 = true,
-        // 429/503 背压保护：连续失败达阈值时乘性下调并发（0 为关闭）。迅雷等易限流的网盘必须开着
-        backpressureConsecutiveFailures = 4,
+        // 关闭背压降并发（与上游原版一致）：网盘 CDN 频繁 502/503，开启后线程只降难升，
+        // 是“下到后面速度暴跌”的主因；暂时错误靠分片重试处理，不动并发。
+        // 注：v1.0.11 曾误开为 4 导致速度明显变慢，v1.0.14 恢复原值。
+        backpressureConsecutiveFailures = 0,
         maxConnectionsPerHost = 0,
         workDir = chunkDir,
         proxy = ProxyMode.System,
