@@ -485,11 +485,19 @@ async function taskDel(id) {
 }
 
 // ---------- 设置 ----------
+const PLATFORMS_CONN = [
+  ['quark', '夸克'], ['uc', 'UC'], ['xunlei', '迅雷'],
+  ['baidu', '百度'], ['pan123', '123'], ['c139', '139']
+];
 async function loadSettings() {
   const r = await api('/api/settings');
   if (!r.ok) return;
   const s = r.data;
   document.getElementById('setConn').value = s.maxConnections;
+  const pc = s.platformConnections || {};
+  document.getElementById('platformConnInputs').innerHTML = PLATFORMS_CONN.map(([id, name]) =>
+    `<span style="margin-right:10px">${name} <input type="text" id="pc-${id}" inputmode="numeric" style="width:52px" value="${pc[id] || ''}" placeholder="全局"></span>`
+  ).join('');
   document.getElementById('setConc').value = s.maxConcurrentTasks;
   document.getElementById('setLimit').value = (s.speedLimitBps / 1048576).toFixed(1);
   document.getElementById('setRetry').value = s.maxRetries;
@@ -497,8 +505,14 @@ async function loadSettings() {
 }
 async function saveSettings() {
   hideMsg('setMsg');
+  const platformConnections = {};
+  PLATFORMS_CONN.forEach(([id]) => {
+    const v = parseInt(document.getElementById('pc-' + id).value);
+    if (v > 0) platformConnections[id] = Math.min(128, v);
+  });
   const s = {
     maxConnections: Math.max(1, parseInt(document.getElementById('setConn').value) || 16),
+    platformConnections,
     maxConcurrentTasks: Math.max(1, parseInt(document.getElementById('setConc').value) || 3),
     speedLimitBps: Math.round((parseFloat(document.getElementById('setLimit').value) || 0) * 1048576),
     maxRetries: Math.max(0, parseInt(document.getElementById('setRetry').value) || 0),

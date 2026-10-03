@@ -102,7 +102,9 @@ data class SettingsData(
     val speedLimitBps: Long = 0,
     val maxRetries: Int = 3,
     // 服务器上的下载目录；留空则用当前用户的下载目录（如 ~/Downloads）
-    val downloadDir: String = ""
+    val downloadDir: String = "",
+    // 分网盘连接数覆盖（键：quark/uc/xunlei/baidu/pan123/c139）；缺省或 <=0 表示跟随全局连接数
+    val platformConnections: Map<String, Int> = emptyMap()
 )
 
 @Serializable

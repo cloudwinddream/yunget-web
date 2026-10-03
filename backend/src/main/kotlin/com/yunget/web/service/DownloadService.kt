@@ -33,6 +33,8 @@ data class TaskRecord(
     val error: String = "",
     val savePath: String = "",
     val createdAt: Long = System.currentTimeMillis(),
+    // 来源网盘 id（quark/uc/xunlei/baidu/pan123/c139），用于分网盘连接数；空=全局设置
+    val platform: String = "",
     // 文件夹下载批次（普通单文件下载为空）
     val batchId: String = "",
     val batchName: String = "",
@@ -143,6 +145,7 @@ class DownloadService(dataDir: File) {
         fileName: String,
         headers: Map<String, String>,
         size: Long,
+        platform: String = "",
         batchId: String = "",
         batchName: String = "",
         relPath: String = "",
@@ -157,6 +160,7 @@ class DownloadService(dataDir: File) {
         val id = idGen.getAndIncrement()
         tasks[id] = TaskRecord(
             id = id, fileName = safeName, url = url, headers = headers, total = size,
+            platform = platform,
             batchId = batchId, batchName = batchName, relPath = relPath
         )
         if (headers.isNotEmpty()) headersCache[id] = headers
@@ -173,12 +177,14 @@ class DownloadService(dataDir: File) {
             tasks[id] = task.copy(status = "downloading", error = "")
             val out = File(tmpDir, "task_${id}.part")
             val headers = headersCache[id] ?: task.headers
+            // 分网盘连接数：任务所属网盘有单独设置则用其值，否则用全局
+            val platformConn = settings.platformConnections[task.platform]?.takeIf { it > 0 }
             val request = DownloadRequest(
                 url = task.url,
                 destination = out,
                 headers = headers,
                 knownSize = if (task.total > 0) task.total else -1,
-                connectionsOverride = settings.maxConnections.coerceIn(1, 128),
+                connectionsOverride = (platformConn ?: settings.maxConnections).coerceIn(1, 128),
                 stableKey = "web-$id"
             )
             persistTasks()

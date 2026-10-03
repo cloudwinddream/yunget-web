@@ -94,7 +94,8 @@
   <section class="tab" id="tab-settings">
     <div class="card">
       <h2>下载设置</h2>
-      <div class="setrow"><label>每任务连接数</label><input type="text" id="setConn" inputmode="numeric"><span class="hint">1–128，默认 16</span></div>
+      <div class="setrow"><label>每任务连接数</label><input type="text" id="setConn" inputmode="numeric"><span class="hint">1–128，默认 16（全局）</span></div>
+      <div class="setrow"><label>分网盘连接数</label><span id="platformConnInputs"></span><span class="hint">留空 = 跟随全局；如迅雷易被限流可单独调低</span></div>
       <div class="setrow"><label>同时下载任务数</label><input type="text" id="setConc" inputmode="numeric"><span class="hint">1–64，默认 3</span></div>
       <div class="setrow"><label>全局限速（MB/s）</label><input type="text" id="setLimit" inputmode="decimal"><span class="hint">0 = 不限速</span></div>
       <div class="setrow"><label>失败重试次数</label><input type="text" id="setRetry" inputmode="numeric"><span class="hint">0–50，默认 3</span></div>

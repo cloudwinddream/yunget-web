@@ -468,6 +468,7 @@ class NetdiskService(
                 fileName = link.filename.ifBlank { f.fname },
                 headers = headers,
                 size = link.size,
+                platform = s.platform.id,
                 batchId = batchId,
                 batchName = batchName,
                 relPath = f.relPath,
