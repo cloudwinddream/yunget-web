@@ -332,7 +332,7 @@ async function directDownload() {
 let pollTimer = null;
 function startTaskPoll() { stopTaskPoll(); pollTimer = setInterval(loadTasks, 2000); }
 function stopTaskPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
-const STATUS_TXT = { downloading: '下载中', paused: '已暂停', completed: '已完成', failed: '失败' };
+const STATUS_TXT = { downloading: '下载中', merging: '合并中', paused: '已暂停', completed: '已完成', failed: '失败' };
 let taskMap = {};               // id -> task
 const selectedTasks = new Set();
 const expandedBatches = new Set();
@@ -368,7 +368,7 @@ function renderBatch(batchId, batchName, kids) {
   wrap.className = 'batch';
   const done = kids.filter(t => t.status === 'completed').length;
   const failed = kids.filter(t => t.status === 'failed').length;
-  const downloading = kids.filter(t => t.status === 'downloading').length;
+  const downloading = kids.filter(t => t.status === 'downloading' || t.status === 'merging').length;
   const totalBytes = kids.reduce((a, t) => a + (t.total || 0), 0);
   const downBytes = kids.reduce((a, t) => a + Math.min(t.downloaded || 0, t.total || (t.downloaded || 0)), 0);
   const speed = kids.reduce((a, t) => a + (t.speed || 0), 0);

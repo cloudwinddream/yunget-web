@@ -96,7 +96,8 @@ class DownloadService(dataDir: File) {
         dynamicSegmentation = true,
         segmentsPerConnection = 4,
         forceHttp1 = true,
-        backpressureConsecutiveFailures = 0,
+        // 429/503 背压保护：连续失败达阈值时乘性下调并发（0 为关闭）。迅雷等易限流的网盘必须开着
+        backpressureConsecutiveFailures = 4,
         maxConnectionsPerHost = 0,
         workDir = chunkDir,
         proxy = ProxyMode.System,
@@ -260,15 +261,24 @@ class DownloadService(dataDir: File) {
                 speeds[id] = p.speedBytesPerSec
                 etas[id] = p.etaMillis
                 val t = tasks[id]
-                if (t != null && (p.downloadedBytes != t.downloaded ||
-                            (p.totalBytes > 0 && p.totalBytes != t.total))
-                ) {
-                    tasks[id] = t.copy(
-                        downloaded = p.downloadedBytes,
-                        total = if (p.totalBytes > 0) p.totalBytes else t.total
-                    )
-                    // 进度落盘节流：不做高频写
-                    if (System.currentTimeMillis() - lastPersistTs > 5000) persistTasks()
+                if (t != null) {
+                    // 状态同步：尤其 MERGING（100% 后合并分片），否则界面一直显示"下载中"像卡死
+                    val st = when (p.state) {
+                        TaskState.MERGING -> "merging"
+                        TaskState.DOWNLOADING, TaskState.PROBING, TaskState.QUEUED -> "downloading"
+                        else -> t.status
+                    }
+                    if (p.downloadedBytes != t.downloaded ||
+                        (p.totalBytes > 0 && p.totalBytes != t.total) || st != t.status
+                    ) {
+                        tasks[id] = t.copy(
+                            downloaded = p.downloadedBytes,
+                            total = if (p.totalBytes > 0) p.totalBytes else t.total,
+                            status = st
+                        )
+                        // 进度落盘节流：不做高频写
+                        if (System.currentTimeMillis() - lastPersistTs > 5000) persistTasks()
+                    }
                 }
             }
             is TurboEvent.Completed -> scope.launch { onCompleted(id, ev.file, ev.totalBytes) }
@@ -358,8 +368,8 @@ class DownloadService(dataDir: File) {
             val list: List<TaskRecord> = json.decodeFromString(tasksFile.readText())
             var maxId = 0L
             for (t in list) {
-                // 上次未完成的任务标记为已暂停（进程重启/崩溃恢复）
-                val fixed = if (t.status == "downloading") t.copy(status = "paused") else t
+                // 上次未完成的任务标记为已暂停（进程重启/崩溃恢复；含合并中，分片还在，可继续）
+                val fixed = if (t.status == "downloading" || t.status == "merging") t.copy(status = "paused") else t
                 tasks[t.id] = fixed
                 if (t.headers.isNotEmpty()) headersCache[t.id] = t.headers
                 if (t.id > maxId) maxId = t.id
