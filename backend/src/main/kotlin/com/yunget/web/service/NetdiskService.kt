@@ -469,6 +469,7 @@ class NetdiskService(
                 headers = headers,
                 size = link.size,
                 platform = s.platform.id,
+                resumeKey = "src-${s.platform.id}-${f.fid}-${link.size}",
                 batchId = batchId,
                 batchName = batchName,
                 relPath = f.relPath,

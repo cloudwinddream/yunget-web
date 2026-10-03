@@ -35,6 +35,8 @@ data class TaskRecord(
     val createdAt: Long = System.currentTimeMillis(),
     // 来源网盘 id（quark/uc/xunlei/baidu/pan123/c139），用于分网盘连接数；空=全局设置
     val platform: String = "",
+    // 来源文件稳定键（platform+fid+size）：分片目录按它命名，删任务重下同文件也能续传；空=按任务 id
+    val resumeKey: String = "",
     // 文件夹下载批次（普通单文件下载为空）
     val batchId: String = "",
     val batchName: String = "",
@@ -146,6 +148,7 @@ class DownloadService(dataDir: File) {
         headers: Map<String, String>,
         size: Long,
         platform: String = "",
+        resumeKey: String = "",
         batchId: String = "",
         batchName: String = "",
         relPath: String = "",
@@ -160,7 +163,7 @@ class DownloadService(dataDir: File) {
         val id = idGen.getAndIncrement()
         tasks[id] = TaskRecord(
             id = id, fileName = safeName, url = url, headers = headers, total = size,
-            platform = platform,
+            platform = platform, resumeKey = resumeKey,
             batchId = batchId, batchName = batchName, relPath = relPath
         )
         if (headers.isNotEmpty()) headersCache[id] = headers
@@ -185,7 +188,7 @@ class DownloadService(dataDir: File) {
                 headers = headers,
                 knownSize = if (task.total > 0) task.total else -1,
                 connectionsOverride = (platformConn ?: settings.maxConnections).coerceIn(1, 128),
-                stableKey = "web-$id"
+                stableKey = task.resumeKey.ifBlank { "web-$id" }
             )
             persistTasks()
             val turboId = client.submit(request)
@@ -279,6 +282,12 @@ class DownloadService(dataDir: File) {
             is TurboEvent.StateChanged -> {
                 if (ev.state == TaskState.PAUSED || ev.state == TaskState.CANCELED) {
                     speeds.remove(id); etas.remove(id)
+                }
+            }
+            is TurboEvent.Metadata -> {
+                // 引擎的续传判定（是否复用旧分片/为何丢弃），打到服务日志便于排查"为什么从头下"
+                if (ev.resumeNote.isNotBlank()) {
+                    System.out.println("[download] task=$id resume: ${ev.resumeNote}")
                 }
             }
             else -> {}
