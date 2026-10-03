@@ -141,5 +141,7 @@ data class XunleiLoginResponse(
     val message: String = "",
     val nickname: String = "",
     val creditKey: String = "",
-    val smsToken: String = ""
+    val smsToken: String = "",
+    // 迅雷风控的验证页面（如有），可在浏览器打开完成验证
+    val reviewUrl: String = ""
 )

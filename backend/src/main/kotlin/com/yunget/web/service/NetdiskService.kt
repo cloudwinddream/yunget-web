@@ -189,9 +189,27 @@ class NetdiskService(
             val deviceId = XunleiApi.newDeviceId()
             val step = xunleiApi.loginWithPassword(username.trim(), password, deviceId)
             when {
-                step.needSms -> XunleiLoginResponse(needSms = true, message = "需要短信验证")
-                step.sessionId.isBlank() ->
-                    XunleiLoginResponse(needSms = false, message = step.message.ifBlank { "登录失败，请检查账号密码" })
+                step.needSms -> XunleiLoginResponse(
+                    needSms = true,
+                    message = "迅雷要求短信安全验证",
+                    reviewUrl = step.reviewUrl
+                )
+                step.sessionId.isBlank() -> {
+                    // 身份信息已失效[13]：密码已通过，但设备未过迅雷风控 → 引导改走短信验证
+                    if (step.message.contains("身份信息已失效")) {
+                        XunleiLoginResponse(
+                            needSms = true,
+                            message = "迅雷风控拦截：这台设备未通过身份验证。请改用下方短信验证码登录（用绑定的手机号），或先在官方迅雷 App 登录一次再回来。",
+                            reviewUrl = step.reviewUrl
+                        )
+                    } else {
+                        XunleiLoginResponse(
+                            needSms = false,
+                            message = step.message.ifBlank { "登录失败，请检查账号密码" },
+                            reviewUrl = step.reviewUrl
+                        )
+                    }
+                }
                 else -> {
                     val captchaToken = xunleiApi.initCaptcha(deviceId, username.trim()) ?: ""
                     val tokens = xunleiApi.exchangeToken(step.sessionId, deviceId, captchaToken)

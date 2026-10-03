@@ -70,14 +70,19 @@ async function loadPlatforms() {
         <label>账号（手机号）</label><input type="text" id="u-xunlei">
         <label>密码</label><input type="password" id="p-xunlei">
         <div class="row" style="margin-top:10px">
-          <button class="btn small" onclick="xunleiLogin()">登录</button>
+          <button class="btn small" onclick="xunleiLogin()">密码登录</button>
           ${p.loggedIn ? `<button class="danger small" onclick="logout('xunlei')">退出</button>` : ''}
         </div>
-        <div id="sms-xunlei" style="display:none">
-          <label>短信验证码（已发送到手机）</label>
-          <div class="row"><input type="text" id="smscode-xunlei" style="max-width:160px" placeholder="6位验证码">
-          <button class="btn small" onclick="xunleiSmsLogin()">验证并登录</button></div>
-        </div>`;
+        <div style="margin-top:14px;border-top:1px dashed #e5e7eb;padding-top:10px">
+          <label>短信验证码登录（被风控拦时用这个）</label>
+          <div class="row" style="margin-top:6px">
+            <button class="ghost small" onclick="xunleiSendSms()">发送验证码</button>
+            <input type="text" id="smscode-xunlei" style="max-width:160px" placeholder="6 位验证码">
+            <button class="btn small" onclick="xunleiSmsLogin()">验证并登录</button>
+          </div>
+          <div class="hint" style="margin-top:6px">短信登录时账号框填绑定的手机号，验证码发到该手机</div>
+        </div>
+        <div id="review-xunlei" style="display:none;margin-top:8px"></div>`;
     }
     d.innerHTML = `
       <h3>${p.name} <span class="badge ${p.loggedIn ? 'on' : ''}">${p.loggedIn ? '已登录' : '未登录'}</span></h3>
@@ -108,6 +113,12 @@ async function pwdLogin(pid) {
   else showMsg('msg-' + pid, r.message || '登录失败', false);
 }
 let xunleiSmsState = null;
+function showXunleiReview(url) {
+  const el = document.getElementById('review-xunlei');
+  if (!url) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = 'block';
+  el.innerHTML = `短信收不到？可先在浏览器打开<a href="${url}" target="_blank" rel="noopener">迅雷验证页面</a>完成验证再回来登录`;
+}
 async function xunleiLogin() {
   const u = document.getElementById('u-xunlei').value.trim();
   const p = document.getElementById('p-xunlei').value;
@@ -117,19 +128,34 @@ async function xunleiLogin() {
   const r = await api('/api/accounts/xunlei', 'POST', { username: u, password: p });
   if (!r.ok) { showMsg('msg-xunlei', r.message || '登录失败', false); return; }
   const d = r.data;
+  if (d.reviewUrl) showXunleiReview(d.reviewUrl);
   if (d.needSms) {
-    // 新设备需短信验证：自动发送短信
-    const s = await api('/api/accounts/xunlei/sms', 'POST', { mobile: u });
-    if (!s.ok) { showMsg('msg-xunlei', s.message || '短信发送失败', false); return; }
-    xunleiSmsState = { mobile: u, creditKey: s.data.creditKey, smsToken: s.data.smsToken };
-    document.getElementById('sms-xunlei').style.display = 'block';
-    showMsg('msg-xunlei', '已发送短信验证码，请输入后验证', true);
+    if (/^1\d{10}$/.test(u)) {
+      const s = await api('/api/accounts/xunlei/sms', 'POST', { mobile: u });
+      if (s.ok) {
+        xunleiSmsState = { mobile: u, creditKey: s.data.creditKey, smsToken: s.data.smsToken };
+        showMsg('msg-xunlei', '已发送短信验证码，请输入后点「验证并登录」', true);
+      } else {
+        showMsg('msg-xunlei', (s.message || '短信发送失败') + '，可点「发送验证码」重试', false);
+      }
+    } else {
+      showMsg('msg-xunlei', (d.message || '需要短信验证') + '：账号框改填绑定手机号后点「发送验证码」', false);
+    }
   } else if (d.nickname) {
     showMsg('msg-xunlei', '登录成功：' + d.nickname, true);
     setTimeout(loadPlatforms, 800);
   } else {
     showMsg('msg-xunlei', d.message || '登录失败', false);
   }
+}
+async function xunleiSendSms() {
+  const mobile = document.getElementById('u-xunlei').value.trim();
+  hideMsg('msg-xunlei');
+  if (!/^1\d{10}$/.test(mobile)) { showMsg('msg-xunlei', '短信登录请在账号框填绑定的手机号', false); return; }
+  const s = await api('/api/accounts/xunlei/sms', 'POST', { mobile });
+  if (!s.ok) { showMsg('msg-xunlei', s.message || '短信发送失败', false); return; }
+  xunleiSmsState = { mobile, creditKey: s.data.creditKey, smsToken: s.data.smsToken };
+  showMsg('msg-xunlei', '验证码已发送，请输入后点「验证并登录」', true);
 }
 async function xunleiSmsLogin() {
   const code = document.getElementById('smscode-xunlei').value.trim();
