@@ -577,3 +577,11 @@ async function dirUseDefault() {
   // 保存后重新加载，输入框会显示默认目录的实际路径
   loadSettings();
 }
+
+// ---- 更新日志弹窗 ----
+function showChangelog() {
+  document.getElementById('logModal').style.display = 'flex';
+}
+function hideChangelog() {
+  document.getElementById('logModal').style.display = 'none';
+}
