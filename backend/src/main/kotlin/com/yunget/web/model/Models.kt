@@ -107,7 +107,9 @@ data class SettingsData(
     val platformConnections: Map<String, Int> = emptyMap(),
     // 失败后自动重试（退避 1→2→4→8→10 分钟），适合被限流后隔一阵自动续传
     val autoRetry: Boolean = true,
-    val autoRetryMax: Int = 10
+    val autoRetryMax: Int = 10,
+    // 夸克免转存下载（登录态）：优先拿分享凭证直取直链，不占本账号空间；失败自动回退转存
+    val quarkNoSave: Boolean = true
 )
 
 @Serializable

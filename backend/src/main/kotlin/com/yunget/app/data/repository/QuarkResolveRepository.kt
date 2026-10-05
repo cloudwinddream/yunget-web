@@ -127,6 +127,7 @@ class QuarkResolveRepository(private val api: QuarkApi) : ShareResolveRepository
         file: ShareFile,
         cookie: String
     ): Result<DownloadLink> = runCatching {
+        checkSpace(file, cookie)
         val baseDir = ensureTempDir(cookie).getOrThrow()
 
         // 唯一临时子目录：to_pdir_fid 每次不同 → 绕开夸克去重
@@ -145,6 +146,50 @@ class QuarkResolveRepository(private val api: QuarkApi) : ShareResolveRepository
         onFailure = { Result.failure(it) }
     )
 
+    /**
+     * 免转存取链（登录态）：不建临时目录、不转存，直接把分享凭证（pwd_id / stoken / fids /
+     * share_fid_token）交给 file/download 换直链。省掉整条「建目录 → 转存 → 轮询 → 下载完再删」
+     * 链路，也就不存在转存去重与临时目录残留问题。
+     *
+     * 注意：个别分享类型服务端仍要求「先转存再取链」，此时本方法会失败，由调用方
+     * （NetdiskService）回退到 [getShareDownloadLink]。
+     */
+    override suspend fun getShareDownloadLinkWithoutSave(
+        session: ShareSession,
+        file: ShareFile,
+        cookie: String
+    ): Result<DownloadLink> = runCatching {
+        api.getShareDownloadLinkWithoutSave(
+            fid = file.fid,
+            fidToken = file.fidToken,
+            shareId = session.shareId,
+            stoken = session.stoken,
+            cookie = cookie
+        ) ?: throw IllegalStateException("获取下载链接失败")
+    }.fold(
+        onSuccess = { Result.success(it) },
+        onFailure = { Result.failure(it) }
+    )
+
+    /**
+     * 游客取链（未登录）：不碰用户网盘 —— 不建临时目录、不转存，直接按分享参数打 download 接口，
+     * 带回服务端随响应下发的游客态 __pugs。夸克只放行约 50MB 以内的小文件（超出报 23018）。
+     */
+    override suspend fun getGuestShareDownloadLink(
+        session: ShareSession,
+        file: ShareFile
+    ): Result<DownloadLink> = runCatching {
+        api.getGuestShareDownloadLink(
+            fid = file.fid,
+            fidToken = file.fidToken,
+            shareId = session.shareId,
+            stoken = session.stoken
+        ) ?: throw IllegalStateException("获取下载链接失败")
+    }.fold(
+        onSuccess = { Result.success(it) },
+        onFailure = { Result.failure(it) }
+    )
+
     /** 转存分享文件到用户网盘指定目录（转存功能：不删除，长期保存） */
     suspend fun saveToCloud(
         session: ShareSession,
@@ -152,6 +197,25 @@ class QuarkResolveRepository(private val api: QuarkApi) : ShareResolveRepository
         toDirFid: String,
         cookie: String
     ): Result<String> = transferFileTo(session, file, toDirFid, cookie)
+
+    /** 转存前置空间校验：空间不足直接抛出，不再走后面的转存与轮询（避免被误报「转存超时」） */
+    private suspend fun checkSpace(file: ShareFile, cookie: String) {
+        val size = file.fsize.takeIf { it > 0 } ?: return
+        val quota = runCatching { api.getQuota(cookie) }.getOrNull() ?: return
+        val free = quota.total - quota.used
+        if (free < size) {
+            throw IllegalStateException(
+                "夸克网盘空间不足：需要 ${formatSize(size)}，当前可用 ${formatSize(free.coerceAtLeast(0))}"
+            )
+        }
+    }
+
+    private fun formatSize(bytes: Long): String = when {
+        bytes >= 1L shl 30 -> String.format("%.1f GB", bytes.toDouble() / (1L shl 30))
+        bytes >= 1L shl 20 -> String.format("%.1f MB", bytes.toDouble() / (1L shl 20))
+        bytes >= 1L shl 10 -> String.format("%.1f KB", bytes.toDouble() / (1L shl 10))
+        else -> "$bytes B"
+    }
 
     /** 转存到指定目录并轮询拿到新 fid（toPdirFid 由调用方指定） */
     private suspend fun transferFileTo(

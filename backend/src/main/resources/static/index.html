@@ -10,7 +10,7 @@
 <header>
   <h1>☁️ YunGet 网页版</h1>
   <span class="sub">网盘分享解析 · 高速下载 · 夸克 / UC / 迅雷 / 百度 / 123 / 139</span>
-  <button class="ver" onclick="showChangelog()" title="查看更新日志">v1.0.15</button>
+  <button class="ver" onclick="showChangelog()" title="查看更新日志">v1.0.16</button>
 </header>
 <nav class="tabs">
   <button class="active" data-tab="parse">解析下载</button>
@@ -29,7 +29,7 @@
       <input type="text" id="sharePwd" placeholder="4 位提取码，可留空（链接里自带的可自动识别）" style="max-width:300px">
       <div class="row" style="margin-top:12px">
         <button class="btn" id="parseBtn" onclick="parseShare()">解析</button>
-        <span class="hint">解析前请先到「账号」页登录对应网盘</span>
+        <span class="hint">夸克 / UC 可免登录解析，小文件免登录直接下载（夸克约 50MB 内）；其余情况请先到「账号」页登录</span>
       </div>
       <div class="msg" id="parseMsg"></div>
     </div>
@@ -101,6 +101,7 @@
       <div class="setrow"><label>全局限速（MB/s）</label><input type="text" id="setLimit" inputmode="decimal"><span class="hint">0 = 不限速</span></div>
       <div class="setrow"><label>失败重试次数</label><input type="text" id="setRetry" inputmode="numeric"><span class="hint">0–50，默认 3（单个分片的重试）</span></div>
       <div class="setrow"><label>失败自动续传</label><input type="checkbox" id="setAutoRetry"><span>开启，最多</span><input type="text" id="setAutoRetryMax" inputmode="numeric" style="width:52px"><span>次</span><span class="hint">任务失败后隔 1→2→4→8→10 分钟自动继续，被限流时不用手动守着点</span></div>
+      <div class="setrow"><label>夸克免转存</label><input type="checkbox" id="setQuarkNoSave"><span class="hint">登录夸克时优先免转存取链（不占自己网盘空间、不留临时目录），失败自动回退转存；关闭则始终走转存</span></div>
       <div class="setrow"><label>下载目录</label><input type="text" id="setDir" style="min-width:320px"><button type="button" class="ghost small" onclick="openDirPicker()">选择…</button><span class="hint">文件直接下载到服务器上的这个目录，留空则用当前用户的下载目录（如 ~/Downloads）</span></div>
       <div class="row" style="margin-top:14px"><button class="btn" onclick="saveSettings()">保存设置</button></div>
       <div class="msg" id="setMsg"></div>
@@ -141,8 +142,9 @@
   <!-- 更新日志弹窗 -->
   <div class="modal" id="logModal" style="display:none">
     <div class="modal-box log-box">
-      <h3>📋 更新日志 <span class="hint">当前版本 v1.0.15</span></h3>
+      <h3>📋 更新日志 <span class="hint">当前版本 v1.0.16</span></h3>
       <div class="changelog">
+        <div class="cl-item"><span class="cl-ver">v1.0.16</span><span class="cl-txt">夸克下载免转存（不占自己网盘空间，失败自动回退转存，设置可关）；夸克 / UC 免登录解析与小文件直接下载（夸克约 50MB 内）；转存前先查剩余空间，不够直接提示</span></div>
         <div class="cl-item"><span class="cl-ver">v1.0.15</span><span class="cl-txt">右上角新增版本号展示，点开可查看更新日志</span></div>
         <div class="cl-item"><span class="cl-ver">v1.0.14</span><span class="cl-txt">恢复原版下载参数，解决下载越下越慢的问题</span></div>
         <div class="cl-item"><span class="cl-ver">v1.0.13</span><span class="cl-txt">修复「下载中但 0 速度」：开始下载前先探测拿到最终直链</span></div>

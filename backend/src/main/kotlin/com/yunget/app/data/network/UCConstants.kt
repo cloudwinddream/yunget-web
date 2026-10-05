@@ -12,6 +12,17 @@ object UCConstants {
     const val WEB_ORIGIN = "https://drive.uc.cn"
     /** 下载 OSS 直链必须携带的 Referer（缺它被 Callback 限速 ~100KB/s） */
     const val DOWNLOAD_REFERER = "$WEB_ORIGIN/"
+
+    /**
+     * 游客（未登录）链路专用 UA：uc-cloud-drive Electron 客户端。
+     * 取链与下字节都用它 —— 游客链路的风控比登录态严。登录态仍用 [USER_AGENT]，不动既有链路。
+     */
+    const val GUEST_UA =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
+            "uc-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch"
+
+    /** 与 [GUEST_UA] 配套的 Sec-Ch-Ua（游客链路同款头） */
+    const val GUEST_SEC_CH_UA = "\"Not=A?Brand\";v=\"99\", \"Chromium\";v=\"100\", \"Google Chrome\";v=\"100\""
     /** WebView 登录页 */
     const val LOGIN_URL = "https://drive.uc.cn/"
 

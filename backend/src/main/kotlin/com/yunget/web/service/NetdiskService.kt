@@ -315,11 +315,20 @@ class NetdiskService(
         } else acc.cookie
     }
 
+    /**
+     * 夸克/UC 的凭证：已登录返回新鲜 Cookie；未登录返回空串走游客链路
+     * （解析/列表免登录，下载小文件免登录，大文件再提示登录）。
+     */
+    suspend fun cookieOrEmptyAsync(p: Platform): String {
+        val acc = accounts.get(p.id)
+        return if (acc == null || acc.cookie.isBlank()) "" else freshCookieAsync(p)
+    }
+
     suspend fun parse(link: String, pwd: String?): ParseResult {
         val parsed = ShareLinkParser.parse(link) ?: throw IllegalArgumentException("无法识别分享链接")
         val platform = Platform.fromSharePlatform(parsed.platform)
         val cred = if (platform == Platform.QUARK || platform == Platform.UC) {
-            freshCookieAsync(platform)
+            cookieOrEmptyAsync(platform)
         } else credentialOf(platform)
         val repo = repos[platform]!!
         val sess = repo.createSession(link, pwd?.takeIf { it.isNotBlank() }, cred).getOrThrow()
@@ -331,7 +340,7 @@ class NetdiskService(
     suspend fun listFiles(sessionId: String, dirFid: String): List<ShareFile> {
         val s = sessions[sessionId] ?: throw IllegalStateException("解析会话已过期，请重新解析")
         val cred = if (s.platform == Platform.QUARK || s.platform == Platform.UC) {
-            freshCookieAsync(s.platform)
+            cookieOrEmptyAsync(s.platform)
         } else credentialOf(s.platform)
         return repos[s.platform]!!.listFiles(s.session, dirFid.ifBlank { "0" }, cred).getOrThrow()
     }
@@ -454,14 +463,23 @@ class NetdiskService(
         for (f in files) {
             if (f.isdir) continue
             val cred = if (s.platform == Platform.QUARK || s.platform == Platform.UC) {
-                freshCookieAsync(s.platform)
+                cookieOrEmptyAsync(s.platform)
             } else credentialOf(s.platform)
             val shareFile = ShareFile(
                 fid = f.fid, fname = f.fname, fsize = f.fsize,
                 isdir = false, pdirFid = f.pdirFid, fidToken = f.fidToken,
                 modifyTime = f.modifyTime
             )
-            val link = repo.getShareDownloadLink(s.session, shareFile, cred).getOrThrow()
+            val link = when {
+                // 未登录（夸克/UC）：游客取链，夸克约 50MB 内、UC 实测不限；超限会给出登录提示
+                (s.platform == Platform.QUARK || s.platform == Platform.UC) && cred.isBlank() ->
+                    repo.getGuestShareDownloadLink(s.session, shareFile).getOrThrow()
+                // 夸克登录态：优先免转存直取链（不占本账号空间），个别分享失败后自动回退转存
+                s.platform == Platform.QUARK && downloadService.settings.quarkNoSave ->
+                    repo.getShareDownloadLinkWithoutSave(s.session, shareFile, cred)
+                        .getOrElse { repo.getShareDownloadLink(s.session, shareFile, cred).getOrThrow() }
+                else -> repo.getShareDownloadLink(s.session, shareFile, cred).getOrThrow()
+            }
             val headers = downloadHeaders(s.platform, link, cred)
             val id = downloadService.enqueue(
                 url = link.downloadUrl,
@@ -517,14 +535,26 @@ class NetdiskService(
                 "Referer" to Pan123Constants.DOWNLOAD_REFERER
             )
             // UC：OSS 直链按 Referer 档位限速，补官方 Referer/Origin 满速
-            Platform.UC -> mapOf(
+            Platform.UC -> if (link.guestCookie.isNotBlank()) mapOf(
+                // 游客链路：只有服务端下发的 __pugs，UA/Sec-Ch-Ua 用 uc-cloud-drive 客户端同款头
+                "Cookie" to link.guestCookie,
+                "User-Agent" to UCConstants.GUEST_UA,
+                "Sec-Ch-Ua" to UCConstants.GUEST_SEC_CH_UA,
+                "Referer" to UCConstants.DOWNLOAD_REFERER,
+                "Origin" to UCConstants.WEB_ORIGIN
+            ) else mapOf(
                 "Cookie" to credential,
                 "User-Agent" to UCConstants.USER_AGENT,
                 "Referer" to UCConstants.DOWNLOAD_REFERER,
                 "Origin" to UCConstants.WEB_ORIGIN
             )
             // 夸克：防盗链固定 Referer
-            Platform.QUARK -> mapOf(
+            Platform.QUARK -> if (link.guestCookie.isNotBlank()) mapOf(
+                // 游客链路：缺 __pugs 则 CDN 直接 412
+                "Cookie" to link.guestCookie,
+                "User-Agent" to QuarkConstants.API_USER_AGENT,
+                "Referer" to QuarkConstants.DOWNLOAD_REFERER
+            ) else mapOf(
                 "Cookie" to credential,
                 "User-Agent" to QuarkConstants.API_USER_AGENT,
                 "Referer" to QuarkConstants.DOWNLOAD_REFERER

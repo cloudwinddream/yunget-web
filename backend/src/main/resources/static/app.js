@@ -503,6 +503,7 @@ async function loadSettings() {
   document.getElementById('setRetry').value = s.maxRetries;
   document.getElementById('setAutoRetry').checked = s.autoRetry !== false;
   document.getElementById('setAutoRetryMax').value = s.autoRetryMax ?? 10;
+  document.getElementById('setQuarkNoSave').checked = s.quarkNoSave !== false;
   document.getElementById('setDir').value = s.downloadDir || '';
 }
 async function saveSettings() {
@@ -520,6 +521,7 @@ async function saveSettings() {
     maxRetries: Math.max(0, parseInt(document.getElementById('setRetry').value) || 0),
     autoRetry: document.getElementById('setAutoRetry').checked,
     autoRetryMax: Math.max(0, parseInt(document.getElementById('setAutoRetryMax').value) || 0),
+    quarkNoSave: document.getElementById('setQuarkNoSave').checked,
     downloadDir: document.getElementById('setDir').value.trim()
   };
   const r = await api('/api/settings', 'PUT', s);

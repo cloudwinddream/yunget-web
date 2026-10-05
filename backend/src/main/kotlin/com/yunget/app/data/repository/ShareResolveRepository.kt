@@ -49,6 +49,29 @@ interface ShareResolveRepository {
     ): Result<DownloadLink>
 
     /**
+     * 免转存取链（登录态）：把分享凭证（pwd_id / stoken / fids / share_fid_token）直接交
+     * file/download 换直链，不转存、不占本账号空间（个别分享服务端仍要求先转存，
+     * 此时本方法失败，由调用方回退 [getShareDownloadLink]）。默认不支持，夸克实现。
+     */
+    suspend fun getShareDownloadLinkWithoutSave(
+        session: ShareSession,
+        file: ShareFile,
+        cookie: String
+    ): Result<DownloadLink> =
+        Result.failure(UnsupportedOperationException("当前平台不支持免转存下载"))
+
+    /**
+     * 游客取链（未登录）：不带账号 Cookie 直接按分享参数取链。
+     * 夸克仅放行约 50MB 以内的小文件（超出报 23018）；UC 实测大文件也放行。
+     * 返回的 [DownloadLink.guestCookie] 是服务端下发的游客态 __pugs，下载时必须回带。
+     */
+    suspend fun getGuestShareDownloadLink(
+        session: ShareSession,
+        file: ShareFile
+    ): Result<DownloadLink> =
+        Result.failure(UnsupportedOperationException("当前平台不支持免登录下载"))
+
+    /**
      * 下载完成后清理临时转存目录（夸克实现删除 tr_* 子目录；其它平台默认空实现）。
      * @param dirFid DownloadLink.cleanupDirFid 带回的临时目录 fid
      */
