@@ -78,7 +78,8 @@ data class ResolveSession(
  */
 class NetdiskService(
     private val accounts: AccountStore,
-    private val downloadService: DownloadService
+    private val downloadService: DownloadService,
+    private val history: HistoryStore
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -362,8 +363,24 @@ class NetdiskService(
         val sess = repo.createSession(effectiveLink, pwd?.takeIf { it.isNotBlank() }, cred).getOrThrow()
         val id = UUID.randomUUID().toString()
         sessions[id] = ResolveSession(id, platform, sess)
-        return ParseResult(id, platform, sess.title)
+        // 记入解析历史（带分享主名称，历史页/收藏区一眼能认出是什么）
+        val entry = history.record(
+            effectiveLink, pwd?.takeIf { it.isNotBlank() } ?: "",
+            platform.id, platform.displayName, sess.title
+        )
+        return ParseResult(id, platform, sess.title, entry.id, entry.favorite)
     }
+
+    // ---------- 解析历史 / 收藏 ----------
+
+    fun historyList(): List<HistoryEntry> = history.list()
+
+    fun historySetFavorite(id: String, fav: Boolean): HistoryEntry =
+        history.setFavorite(id, fav) ?: throw IllegalArgumentException("历史记录不存在")
+
+    fun historyDelete(id: String) = history.delete(id)
+
+    fun historyClear() = history.clearNonFavorites()
 
     suspend fun listFiles(sessionId: String, dirFid: String): List<ShareFile> {
         val s = sessions[sessionId] ?: throw IllegalStateException("解析会话已过期，请重新解析")
@@ -590,5 +607,11 @@ class NetdiskService(
         }
     }
 
-    data class ParseResult(val sessionId: String, val platform: Platform, val title: String)
+    data class ParseResult(
+        val sessionId: String,
+        val platform: Platform,
+        val title: String,
+        val historyId: String = "",
+        val favorite: Boolean = false
+    )
 }

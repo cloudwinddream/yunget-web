@@ -30,6 +30,7 @@ document.querySelectorAll('nav.tabs button').forEach(b => {
     tab.classList.add('active');
     stopTaskPoll();
     if (b.dataset.tab === 'accounts') loadPlatforms();
+    if (b.dataset.tab === 'history') loadHistory();
     if (b.dataset.tab === 'tasks') { loadTasks(); startTaskPoll(); }
     if (b.dataset.tab === 'settings') loadSettings();
   });
@@ -231,6 +232,7 @@ async function qrCancel() {
 
 // ---------- 解析 ----------
 let curSession = null, curDirFid = '0', dirStack = [], curFiles = [];
+let curHistoryId = '', curHistoryFav = false;
 async function parseShare() {
   const link = document.getElementById('shareLink').value.trim();
   const pwd = document.getElementById('sharePwd').value.trim();
@@ -242,6 +244,10 @@ async function parseShare() {
     const r = await api('/api/parse', 'POST', { link, pwd });
     if (!r.ok) { showMsg('parseMsg', r.message || '解析失败', false); return; }
     curSession = r.data.sessionId;
+    curHistoryId = r.data.historyId || '';
+    curHistoryFav = !!r.data.favorite;
+    updateFavBtn();
+    loadFavorites();
     curDirFid = '0'; dirStack = [];
     document.getElementById('fileCard').style.display = 'block';
     document.getElementById('parseTitle').textContent = r.data.title || '分享文件';
@@ -602,3 +608,80 @@ function showChangelog() {
 function hideChangelog() {
   document.getElementById('logModal').style.display = 'none';
 }
+
+// ---------- 解析历史 / 收藏 ----------
+let histById = {};
+function fmtTime(ts) {
+  const d = new Date(ts);
+  return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+function updateFavBtn() {
+  const b = document.getElementById('favBtn');
+  if (!curHistoryId) { b.style.display = 'none'; return; }
+  b.style.display = '';
+  b.textContent = curHistoryFav ? '⭐ 已收藏' : '☆ 收藏';
+}
+async function toggleFavCurrent() {
+  if (!curHistoryId) return;
+  const r = await api('/api/history/' + curHistoryId + '/favorite', 'POST', { favorite: !curHistoryFav });
+  if (r.ok) { curHistoryFav = r.data.favorite; updateFavBtn(); loadFavorites(); }
+}
+async function loadFavorites() {
+  const r = await api('/api/history');
+  if (!r.ok) return;
+  r.data.forEach(e => { histById[e.id] = e; });
+  const favs = r.data.filter(e => e.favorite);
+  const card = document.getElementById('favCard');
+  if (!favs.length) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+  document.getElementById('favChips').innerHTML = favs.map(e =>
+    `<button class="favchip" title="${escapeHtml(e.link)}" onclick="reparseHist('${e.id}')">⭐ ${escapeHtml(e.title || e.link)}</button>`
+  ).join('');
+}
+async function loadHistory() {
+  const r = await api('/api/history');
+  const body = document.getElementById('histBody');
+  if (!r.ok) { body.innerHTML = '<div class="empty">加载失败</div>'; return; }
+  r.data.forEach(e => { histById[e.id] = e; });
+  if (!r.data.length) { body.innerHTML = '<div class="empty">暂无解析记录，解析过的分享会自动出现在这里</div>'; return; }
+  const item = e => `
+    <div class="hist">
+      <div class="hmain">
+        <div class="htitle">${e.favorite ? '⭐ ' : ''}${escapeHtml(e.title || '(无标题)')}</div>
+        <div class="hmeta">${escapeHtml(e.platformName)} · ${fmtTime(e.createdAt)} · ${escapeHtml(e.link)}</div>
+      </div>
+      <div class="hacts">
+        <button class="btn small" onclick="reparseHist('${e.id}')">解析</button>
+        <button class="ghost small" onclick="toggleFavHist('${e.id}', ${!e.favorite})">${e.favorite ? '取消收藏' : '收藏'}</button>
+        <button class="danger small" onclick="delHist('${e.id}')">删除</button>
+      </div>
+    </div>`;
+  const favs = r.data.filter(e => e.favorite);
+  const rest = r.data.filter(e => !e.favorite);
+  let html = '';
+  if (favs.length) html += '<div class="histsec">⭐ 收藏</div>' + favs.map(item).join('');
+  if (rest.length) html += '<div class="histsec">🕘 最近解析</div>' + rest.map(item).join('');
+  body.innerHTML = html;
+}
+function reparseHist(id) {
+  const e = histById[id];
+  if (!e) return;
+  document.getElementById('shareLink').value = e.link;
+  document.getElementById('sharePwd').value = e.pwd || '';
+  document.querySelector('nav.tabs button[data-tab="parse"]').click();
+  parseShare();
+}
+async function toggleFavHist(id, fav) {
+  const r = await api('/api/history/' + id + '/favorite', 'POST', { favorite: fav });
+  if (r.ok) { loadHistory(); loadFavorites(); }
+}
+async function delHist(id) {
+  const r = await api('/api/history/' + id, 'DELETE');
+  if (r.ok) { delete histById[id]; loadHistory(); loadFavorites(); }
+}
+async function clearHistory() {
+  if (!confirm('清空全部非收藏的解析历史？')) return;
+  const r = await api('/api/history/clear', 'POST', {});
+  if (r.ok) { loadHistory(); }
+}
+loadFavorites();

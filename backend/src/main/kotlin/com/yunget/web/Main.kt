@@ -5,6 +5,7 @@ import com.yunget.web.model.ApiResult
 import com.yunget.web.routes.apiRoutes
 import com.yunget.web.service.AccountStore
 import com.yunget.web.service.DownloadService
+import com.yunget.web.service.HistoryStore
 import com.yunget.web.service.NetdiskService
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
@@ -49,7 +50,7 @@ fun main() {
 
     val accounts = AccountStore(dataDir)
     val downloads = DownloadService(dataDir)
-    val netdisk = NetdiskService(accounts, downloads)
+    val netdisk = NetdiskService(accounts, downloads, HistoryStore(dataDir))
 
     Runtime.getRuntime().addShutdownHook(Thread {
         runCatching { downloads.shutdown() }

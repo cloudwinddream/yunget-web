@@ -10,6 +10,7 @@ import com.yunget.web.model.QrStatusResponse
 import com.yunget.web.model.DirectDownloadRequest
 import com.yunget.web.model.DownloadSubmitRequest
 import com.yunget.web.model.ExpandRequest
+import com.yunget.web.model.FavoriteRequest
 import com.yunget.web.model.FileItem
 import com.yunget.web.model.ParseRequest
 import com.yunget.web.model.ParseResponse
@@ -184,13 +185,41 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService) {
                             sessionId = r.sessionId,
                             platform = r.platform.id,
                             platformName = r.platform.displayName,
-                            title = r.title
+                            title = r.title,
+                            historyId = r.historyId,
+                            favorite = r.favorite
                         )
                     )
                 )
             } catch (e: Exception) {
                 call.respond(fail(e.message ?: "解析失败"))
             }
+        }
+
+        // ---------- 解析历史 / 收藏 ----------
+        get("/history") {
+            call.respond(ok(netdisk.historyList()))
+        }
+
+        post("/history/{id}/favorite") {
+            val id = call.parameters["id"] ?: return@post call.respond(fail("缺少记录"))
+            try {
+                val req = call.receive<FavoriteRequest>()
+                call.respond(ok(netdisk.historySetFavorite(id, req.favorite)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "操作失败"))
+            }
+        }
+
+        post("/history/clear") {
+            netdisk.historyClear()
+            call.respond(ok(mapOf("cleared" to true)))
+        }
+
+        delete("/history/{id}") {
+            val id = call.parameters["id"] ?: return@delete call.respond(fail("缺少记录"))
+            netdisk.historyDelete(id)
+            call.respond(ok(mapOf("deleted" to true)))
         }
 
         get("/sessions/{id}/files") {

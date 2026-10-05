@@ -118,3 +118,16 @@ table.files tr.dir:hover td { background: #f6f9ff; }
 .batch .kids { margin: 8px 0 0 16px; border-left: 2px solid #eef1f5; padding-left: 10px; }
 .batch .kids .task { padding: 8px 0; border-bottom: 1px dashed #eef1f5; }
 .batch .kids .task:last-child { border-bottom: none; }
+/* 解析历史 / 收藏（v1.0.19） */
+.favchips { display: flex; flex-wrap: wrap; gap: 8px; }
+.favchip { border: 1px solid #f0c75e; background: #fffaf0; color: #7a5b00; border-radius: 999px; padding: 6px 12px; font-size: 13px; cursor: pointer; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.favchip:hover { background: #fff3d6; }
+.hist { display: flex; gap: 12px; align-items: center; padding: 11px 2px; border-bottom: 1px solid #f0f0f0; }
+.hist:last-child { border-bottom: none; }
+.hmain { flex: 1; min-width: 0; }
+.htitle { font-size: 14px; font-weight: 500; word-break: break-all; }
+.hmeta { font-size: 12px; color: #888; margin-top: 3px; word-break: break-all; }
+.hacts { display: flex; gap: 6px; flex-shrink: 0; flex-wrap: wrap; }
+.histsec { font-size: 13px; color: #666; margin: 16px 0 2px; font-weight: 600; }
+.histsec:first-child { margin-top: 4px; }
+@media (max-width: 560px) { .hist { flex-direction: column; align-items: stretch; gap: 8px; } .hacts { justify-content: flex-end; } }

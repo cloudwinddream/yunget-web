@@ -25,11 +25,16 @@ data class PlatformInfo(
 data class ParseRequest(val link: String, val pwd: String = "")
 
 @Serializable
+data class FavoriteRequest(val favorite: Boolean)
+
+@Serializable
 data class ParseResponse(
     val sessionId: String,
     val platform: String,
     val platformName: String,
-    val title: String
+    val title: String,
+    val historyId: String = "",
+    val favorite: Boolean = false
 )
 
 @Serializable
