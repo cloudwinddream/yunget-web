@@ -848,6 +848,32 @@ class XunleiApi(
         return digest.joinToString("") { "%02x".format(it) }
     }
 
+    /**
+     * 中文口令 → 分享链接（免登录：shoulei 跳转接口不校验账号）。
+     * 命中时返回 `https://pan.xunlei.com/s/<id>?pwd=<提取码>`；未命中抛明确文案。
+     */
+    suspend fun parseKouling(keyword: String): String = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url(XunleiKouling.buildJumpUrl(keyword))
+            .header("User-Agent", XunleiKouling.USER_AGENT)
+            .header("Accept", "*/*")
+            .header("Origin", XunleiKouling.ORIGIN)
+            .header("Referer", XunleiKouling.REFERER)
+            .header("Accept-Language", "zh-CN")
+            .get()
+            .build()
+        client.newCall(request).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw IllegalStateException("口令解析失败（HTTP ${resp.code}）")
+            val json = runCatching { JSONObject(body) }.getOrNull()
+                ?: throw IllegalStateException("口令解析失败：响应格式异常")
+            val type = json.optJSONObject("ext")?.optString("kouling_type").orEmpty()
+            if (type != "share_page") throw IllegalStateException("口令「$keyword」没有对应的网盘分享")
+            XunleiKouling.shareUrlFromLocation(json.optString("location"))
+                ?: throw IllegalStateException("口令「$keyword」没有对应的网盘分享")
+        }
+    }
+
     companion object {
         /** 设备 ID：动态生成的设备指纹（进程启动时由 Application 初始化并持久化） */
         fun newDeviceId(): String = XunleiDeviceFingerprint.deviceId()

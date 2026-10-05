@@ -15,6 +15,7 @@ import com.yunget.app.data.network.UCConstants
 import com.yunget.app.data.network.XunleiApi
 import com.yunget.app.data.network.XunleiConstants
 import com.yunget.app.data.network.XunleiDeviceFingerprint
+import com.yunget.app.data.network.XunleiKouling
 import com.yunget.app.data.network.model.DownloadLink
 import com.yunget.app.data.network.model.ShareFile
 import com.yunget.app.data.network.model.ShareSession
@@ -325,13 +326,17 @@ class NetdiskService(
     }
 
     suspend fun parse(link: String, pwd: String?): ParseResult {
-        val parsed = ShareLinkParser.parse(link) ?: throw IllegalArgumentException("无法识别分享链接")
+        // 迅雷中文口令：不是链接、且长得像口令时，先换成分享链接（免登录，口令自带提取码）
+        val effectiveLink = if (ShareLinkParser.parse(link) == null && XunleiKouling.looksLikeKouling(link)) {
+            xunleiApi.parseKouling(XunleiKouling.normalize(link))
+        } else link
+        val parsed = ShareLinkParser.parse(effectiveLink) ?: throw IllegalArgumentException("无法识别分享链接")
         val platform = Platform.fromSharePlatform(parsed.platform)
         val cred = if (platform == Platform.QUARK || platform == Platform.UC) {
             cookieOrEmptyAsync(platform)
         } else credentialOf(platform)
         val repo = repos[platform]!!
-        val sess = repo.createSession(link, pwd?.takeIf { it.isNotBlank() }, cred).getOrThrow()
+        val sess = repo.createSession(effectiveLink, pwd?.takeIf { it.isNotBlank() }, cred).getOrThrow()
         val id = UUID.randomUUID().toString()
         sessions[id] = ResolveSession(id, platform, sess)
         return ParseResult(id, platform, sess.title)
