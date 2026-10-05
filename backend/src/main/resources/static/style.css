@@ -56,12 +56,40 @@ table.files tr.dir:hover td { background: #f6f9ff; }
 .status.completed { background: #e8f5e9; color: #2e7d32; }
 .status.failed { background: #fdecea; color: #c62828; }
 .err-text { color: #c62828; font-size: 12px; margin-top: 6px; }
-.setrow { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-.setrow label { margin: 0; width: 170px; flex-shrink: 0; }
-.setrow input { max-width: 220px; }
+/* 设置页（v1.0.18 重排：分组卡片 + 说明左置 + 控件右置 + 开关样式） */
+.setrow { display: flex; align-items: center; gap: 16px; padding: 11px 0; border-bottom: 1px dashed #eef1f5; }
+.setrow:last-child { border-bottom: none; }
+.setlab { flex: 1; min-width: 0; }
+.setlab label { display: block; margin: 0 0 2px; font-size: 14px; color: #333; }
+.setctl { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.setctl input[type=text] { width: 96px; text-align: center; }
+.setctl.grow { flex: 1; }
+.setctl.grow input[type=text] { flex: 1; width: auto; text-align: left; }
+.unit { font-size: 12.5px; color: #888; white-space: nowrap; }
+.pconn-grid { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+.pconn { display: inline-flex; align-items: center; gap: 6px; background: #f5f7fa; border: 1px solid #e3e8ef; border-radius: 999px; padding: 4px 5px 4px 12px; font-size: 13px; color: #444; }
+.pconn i { font-style: normal; }
+.pconn input[type=text] { width: 58px; text-align: center; border-radius: 999px; padding: 5px 4px; }
+/* 开关 */
+.switch { position: relative; display: inline-block; width: 46px; height: 26px; flex-shrink: 0; margin: 0; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch .sl { position: absolute; inset: 0; background: #cfd6df; border-radius: 999px; transition: .2s; cursor: pointer; }
+.switch .sl:before { content: ""; position: absolute; width: 20px; height: 20px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: .2s; box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+.switch input:checked + .sl { background: #1a73e8; }
+.switch input:checked + .sl:before { transform: translateX(20px); }
+/* 账号容量条（v1.0.18） */
+.quota { margin: 10px 0 4px; }
+.qmeta { display: flex; justify-content: space-between; font-size: 12px; color: #666; margin-bottom: 5px; }
+.pbar.warn > div { background: #fb8c00; }
+.pbar.hot > div { background: #e53935; }
+@media (max-width: 560px) {
+  .setrow { flex-direction: column; align-items: stretch; gap: 8px; }
+  .setctl { justify-content: flex-end; }
+  .pconn-grid { justify-content: flex-start; }
+}
 .empty { text-align: center; color: #aaa; padding: 30px 0; font-size: 14px; }
 .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
-@media (max-width: 640px) { .setrow label { width: 120px; } header h1 { font-size: 16px; } }
+@media (max-width: 640px) { header h1 { font-size: 16px; } }
 .modal { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 100; }
 .modal-box { background: #fff; border-radius: 12px; padding: 24px; width: 320px; max-width: 90vw; text-align: center; }
 .modal-box h3 { margin: 0 0 14px; font-size: 16px; }

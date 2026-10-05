@@ -87,10 +87,25 @@ async function loadPlatforms() {
     d.innerHTML = `
       <h3>${p.name} <span class="badge ${p.loggedIn ? 'on' : ''}">${p.loggedIn ? '已登录' : '未登录'}</span></h3>
       <div class="nick">${p.loggedIn && p.nickname ? '昵称：' + escapeHtml(p.nickname) : ''}</div>
+      ${p.loggedIn ? `<div class="quota" id="quota-${p.id}"></div>` : ''}
       ${body}
       <div class="msg" id="msg-${p.id}"></div>`;
     grid.appendChild(d);
+    if (p.loggedIn) loadQuota(p.id);
   });
+}
+
+async function loadQuota(id) {
+  const el = document.getElementById('quota-' + id);
+  if (!el) return;
+  el.innerHTML = '<span class="hint">容量加载中…</span>';
+  const r = await api('/api/accounts/' + id + '/quota');
+  if (!r.ok || !r.data || !r.data.total) { el.innerHTML = '<span class="hint">容量获取失败</span>'; return; }
+  const used = r.data.used, total = r.data.total;
+  const pct = Math.min(100, total > 0 ? used / total * 100 : 0);
+  const cls = pct >= 95 ? 'hot' : pct >= 80 ? 'warn' : '';
+  el.innerHTML = `<div class="qmeta"><span>已用 ${fmtSize(used)} / ${fmtSize(total)}</span><span>${pct.toFixed(1)}%</span></div>` +
+    `<div class="pbar ${cls}"><div style="width:${pct}%"></div></div>`;
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
@@ -496,7 +511,7 @@ async function loadSettings() {
   document.getElementById('setConn').value = s.maxConnections;
   const pc = s.platformConnections || {};
   document.getElementById('platformConnInputs').innerHTML = PLATFORMS_CONN.map(([id, name]) =>
-    `<span style="margin-right:10px">${name} <input type="text" id="pc-${id}" inputmode="numeric" style="width:52px" value="${pc[id] || ''}" placeholder="全局"></span>`
+    `<span class="pconn"><i>${name}</i><input type="text" id="pc-${id}" inputmode="numeric" placeholder="全局" value="${pc[id] || ''}"></span>`
   ).join('');
   document.getElementById('setConc').value = s.maxConcurrentTasks;
   document.getElementById('setLimit').value = (s.speedLimitBps / 1048576).toFixed(1);

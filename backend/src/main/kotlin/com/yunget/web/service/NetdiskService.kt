@@ -155,6 +155,29 @@ class NetdiskService(
         PlatformInfo(p.id, p.displayName, p.loginType, loggedIn, acc?.nickname ?: "")
     }
 
+    /** 网盘容量（字节）：原版登录后有容量显示，网页版账号页同样展示。未登录/取失败抛异常供前端提示 */
+    suspend fun quota(platformId: String): Map<String, Long> {
+        val p = Platform.fromId(platformId) ?: throw IllegalArgumentException("未知平台")
+        val acc = accounts.get(p.id)
+        fun cookie(): String = acc?.cookie?.takeIf { it.isNotBlank() }
+            ?: throw IllegalStateException("未登录")
+        val q = when (p) {
+            Platform.QUARK -> quarkApi.getQuota(cookie())
+            Platform.UC -> ucApi.getQuota(cookie())
+            Platform.BAIDU -> baiduApi.getQuota(cookie())
+            Platform.C139 -> c139Api.getQuota(cookie())
+            Platform.PAN123 -> pan123Api.getQuota(
+                acc?.token?.takeIf { it.isNotBlank() } ?: throw IllegalStateException("未登录")
+            )
+            Platform.XUNLEI -> xunleiApi.getQuota(
+                acc?.xunleiAccessToken?.takeIf { it.isNotBlank() }
+                    ?: throw IllegalStateException("未登录"),
+                XunleiDeviceFingerprint.deviceId(), ""
+            )
+        } ?: throw IllegalStateException("获取容量失败，请稍后重试")
+        return mapOf("used" to q.used, "total" to q.total, "usedInTrash" to q.usedInTrash)
+    }
+
     suspend fun saveCookie(platformId: String, cookie: String): Result<String> {
         val p = Platform.fromId(platformId) ?: return Result.failure(IllegalArgumentException("未知平台"))
         val nickname = when (p) {

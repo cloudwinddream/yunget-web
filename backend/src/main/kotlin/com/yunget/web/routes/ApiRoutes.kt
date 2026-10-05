@@ -47,6 +47,15 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService) {
             call.respond(ok(netdisk.platforms()))
         }
 
+        get("/accounts/{platform}/quota") {
+            val platform = call.parameters["platform"] ?: return@get call.respond(fail("缺少平台参数"))
+            try {
+                call.respond(ok(netdisk.quota(platform)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "获取容量失败"))
+            }
+        }
+
         post("/accounts/{platform}") {
             val platform = call.parameters["platform"] ?: return@post call.respond(fail("缺少平台参数"))
             val p = Platform.fromId(platform) ?: return@post call.respond(fail("未知平台"))
