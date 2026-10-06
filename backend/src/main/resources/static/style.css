@@ -133,3 +133,9 @@ table.files tr.dir:hover td { background: #f6f9ff; }
 @media (max-width: 560px) { .hist { flex-direction: column; align-items: stretch; gap: 8px; } .hacts { justify-content: flex-end; } }
 /* 排队中（v1.0.20 分网盘并发） */
 .status.queued { background: #e8eaf6; color: #5c6bc0; }
+/* 分网盘连接数行（v1.0.21，照搬原版：按网盘单独设置） */
+.connrow { display: flex; align-items: center; gap: 10px; padding: 9px 2px; border-bottom: 1px dashed #eef1f5; }
+.connrow:last-child { border-bottom: none; }
+.connname { flex: 1; font-size: 14px; color: #333; }
+.connrow select { border: 1px solid #d5dae2; border-radius: 6px; padding: 7px 10px; font-size: 14px; background: #fff; }
+.connrow select:focus { outline: none; border-color: #1a73e8; }

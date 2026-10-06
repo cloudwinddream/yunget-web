@@ -514,12 +514,15 @@ async function loadSettings() {
   const r = await api('/api/settings');
   if (!r.ok) return;
   const s = r.data;
-  document.getElementById('setConn').value = s.maxConnections;
   const pc = s.platformConnections || {};
-  const phConn = id => id === 'xunlei' ? '8' : '全局';
-  document.getElementById('platformConnInputs').innerHTML = PLATFORMS_CONN.map(([id, name]) =>
-    `<span class="pconn"><i>${name}</i><input type="text" id="pc-${id}" inputmode="numeric" placeholder="${phConn(id)}" value="${pc[id] || ''}"></span>`
-  ).join('');
+  const THREAD_OPTS = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+  document.getElementById('platformConnRows').innerHTML = PLATFORMS_CONN.map(([id, name]) => {
+    if (id === 'xunlei') return `<div class="connrow"><span class="connname">${name}网盘</span><span class="unit">固定 8 线程（原版设定，不可改）</span></div>`;
+    const v = pc[id] || 32;
+    return `<div class="connrow"><span class="connname">${name}网盘</span><div class="setctl"><select id="pc-${id}">` +
+      THREAD_OPTS.map(o => `<option value="${o}"${o === v ? ' selected' : ''}>${o}</option>`).join('') +
+      `</select><span class="unit">线程</span></div></div>`;
+  }).join('');
   const pt = s.platformConcurrentTasks || {};
   document.getElementById('platformConcInputs').innerHTML = PLATFORMS_CONN.map(([id, name]) =>
     `<span class="pconn"><i>${name}</i><input type="text" id="pt-${id}" inputmode="numeric" placeholder="全局" value="${pt[id] || ''}"></span>`
@@ -536,8 +539,9 @@ async function saveSettings() {
   hideMsg('setMsg');
   const platformConnections = {};
   PLATFORMS_CONN.forEach(([id]) => {
-    const v = parseInt(document.getElementById('pc-' + id).value);
-    if (v > 0) platformConnections[id] = Math.min(128, v);
+    if (id === 'xunlei') return; // 迅雷固定 8，后端强制
+    const el = document.getElementById('pc-' + id);
+    if (el) platformConnections[id] = parseInt(el.value) || 32;
   });
   const platformConcurrentTasks = {};
   PLATFORMS_CONN.forEach(([id]) => {
@@ -545,7 +549,6 @@ async function saveSettings() {
     if (v > 0) platformConcurrentTasks[id] = Math.min(64, v);
   });
   const s = {
-    maxConnections: Math.max(1, parseInt(document.getElementById('setConn').value) || 16),
     platformConnections,
     platformConcurrentTasks,
     maxConcurrentTasks: Math.max(1, parseInt(document.getElementById('setConc').value) || 3),

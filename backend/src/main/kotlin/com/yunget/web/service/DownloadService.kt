@@ -99,7 +99,8 @@ class DownloadService(dataDir: File) {
     // ---------- 配置 ----------
 
     private fun buildConfig(s: SettingsData) = TurboConfig(
-        maxConnectionsPerTask = s.maxConnections.coerceIn(1, 128),
+        // 引擎单任务硬上限 256（原版安卓引擎为 512）；各网盘的实际值走 connectionsOverride
+        maxConnectionsPerTask = 256,
         // 引擎全局闸门只做总天花板：各网盘限流之和（引擎要求 1..64）。
         // 真正的分网盘限流由 DownloadService 的 platformRunning 闸门在提交前执行。
         maxConcurrentTasks = totalConcurrentLimit(s).coerceIn(1, 64),
@@ -149,6 +150,12 @@ class DownloadService(dataDir: File) {
 
     // ---------- 分网盘并发 ----------
 
+    /** 某网盘的分片连接数（照搬原版模型）：每个网盘单独设置，默认 32，迅雷固定 8 不可改 */
+    fun connectionsFor(platform: String): Int = when (platform) {
+        "xunlei" -> XUNLEI_CONNECTIONS
+        else -> settings.platformConnections[platform]?.takeIf { it in 1..512 } ?: DEFAULT_CONNECTIONS
+    }
+
     /** 某网盘的同时任务数：单独设置 >0 则用它，否则跟随全局（设置改动对等待中的任务即时生效） */
     fun concurrentLimit(platform: String): Int =
         settings.platformConcurrentTasks[platform]?.takeIf { it > 0 }
@@ -193,8 +200,10 @@ class DownloadService(dataDir: File) {
     }
 
     companion object {
-        /** 迅雷默认连接数（上游原版写死 8：迅雷 CDN 限流最凶；此处仍允许用户单独改） */
-        const val DEFAULT_XUNLEI_CONNECTIONS = 8
+        /** 各网盘默认连接数（原版默认值） */
+        const val DEFAULT_CONNECTIONS = 32
+        /** 迅雷固定连接数（原版写死 8：迅雷 CDN 限流最凶，不可改） */
+        const val XUNLEI_CONNECTIONS = 8
         /** 参与并发统计的网盘 id（含 "" = 普通直链下载） */
         val PLATFORM_IDS = listOf("quark", "uc", "xunlei", "baidu", "pan123", "c139", "")
     }
@@ -263,16 +272,13 @@ class DownloadService(dataDir: File) {
             tasks[id] = cur.copy(status = "downloading", error = "")
             val out = File(tmpDir, "task_${id}.part")
             val headers = headersCache[id] ?: task.headers
-            // 分网盘连接数：任务所属网盘有单独设置则用其值；
-            // 迅雷默认 8（上游原版写死 8，迅雷 CDN 限流最凶），其余留空跟随全局
-            val platformConn = settings.platformConnections[task.platform]?.takeIf { it > 0 }
-                ?: if (task.platform == "xunlei") DEFAULT_XUNLEI_CONNECTIONS else null
+            // 分网盘连接数（照搬原版）：每个网盘单独设置，默认 32，迅雷固定 8
             val request = DownloadRequest(
                 url = task.url,
                 destination = out,
                 headers = headers,
                 knownSize = if (task.total > 0) task.total else -1,
-                connectionsOverride = (platformConn ?: settings.maxConnections).coerceIn(1, 128),
+                connectionsOverride = connectionsFor(task.platform).coerceIn(1, 256),
                 stableKey = task.resumeKey.ifBlank { "web-$id" }
             )
             persistTasks()
