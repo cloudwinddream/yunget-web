@@ -517,9 +517,9 @@ async function loadSettings() {
   const pc = s.platformConnections || {};
   const THREAD_OPTS = [1, 2, 4, 8, 16, 32, 64, 128, 256];
   document.getElementById('platformConnRows').innerHTML = PLATFORMS_CONN.map(([id, name]) => {
-    if (id === 'xunlei') return `<div class="connrow"><span class="connname">${name}网盘</span><span class="unit">固定 8 线程（原版设定，不可改）</span></div>`;
-    const v = pc[id] || 32;
-    return `<div class="connrow"><span class="connname">${name}网盘</span><div class="setctl"><select id="pc-${id}">` +
+    const v = pc[id] || (id === 'xunlei' ? 8 : 32);
+    const note = id === 'xunlei' ? ' <span class="hint">默认 8，可调</span>' : '';
+    return `<div class="connrow"><span class="connname">${name}网盘${note}</span><div class="setctl"><select id="pc-${id}">` +
       THREAD_OPTS.map(o => `<option value="${o}"${o === v ? ' selected' : ''}>${o}</option>`).join('') +
       `</select><span class="unit">线程</span></div></div>`;
   }).join('');
@@ -539,9 +539,8 @@ async function saveSettings() {
   hideMsg('setMsg');
   const platformConnections = {};
   PLATFORMS_CONN.forEach(([id]) => {
-    if (id === 'xunlei') return; // 迅雷固定 8，后端强制
     const el = document.getElementById('pc-' + id);
-    if (el) platformConnections[id] = parseInt(el.value) || 32;
+    if (el) platformConnections[id] = parseInt(el.value) || (id === 'xunlei' ? 8 : 32);
   });
   const platformConcurrentTasks = {};
   PLATFORMS_CONN.forEach(([id]) => {

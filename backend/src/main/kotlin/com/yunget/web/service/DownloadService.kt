@@ -150,10 +150,12 @@ class DownloadService(dataDir: File) {
 
     // ---------- 分网盘并发 ----------
 
-    /** 某网盘的分片连接数（照搬原版模型）：每个网盘单独设置，默认 32，迅雷固定 8 不可改 */
-    fun connectionsFor(platform: String): Int = when (platform) {
-        "xunlei" -> XUNLEI_CONNECTIONS
-        else -> settings.platformConnections[platform]?.takeIf { it in 1..512 } ?: DEFAULT_CONNECTIONS
+    /** 某网盘的分片连接数（照搬原版模型）：每个网盘单独设置，默认 32，迅雷默认 8；
+     *  注意：原版把迅雷写死 8 不可改，但实测部分用户的迅雷链路吃得消更多连接，
+     *  锁死会导致这部分用户降速，故本项目改为"默认 8、可调"。 */
+    fun connectionsFor(platform: String): Int {
+        val v = settings.platformConnections[platform]?.takeIf { it in 1..512 }
+        return v ?: if (platform == "xunlei") XUNLEI_CONNECTIONS else DEFAULT_CONNECTIONS
     }
 
     /** 某网盘的同时任务数：单独设置 >0 则用它，否则跟随全局（设置改动对等待中的任务即时生效） */
@@ -202,7 +204,7 @@ class DownloadService(dataDir: File) {
     companion object {
         /** 各网盘默认连接数（原版默认值） */
         const val DEFAULT_CONNECTIONS = 32
-        /** 迅雷固定连接数（原版写死 8：迅雷 CDN 限流最凶，不可改） */
+        /** 迅雷默认连接数（原版为固定值；本项目改为默认 8、可调，避免锁死导致部分用户降速） */
         const val XUNLEI_CONNECTIONS = 8
         /** 参与并发统计的网盘 id（含 "" = 普通直链下载） */
         val PLATFORM_IDS = listOf("quark", "uc", "xunlei", "baidu", "pan123", "c139", "")
