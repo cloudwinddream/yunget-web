@@ -131,3 +131,5 @@ table.files tr.dir:hover td { background: #f6f9ff; }
 .histsec { font-size: 13px; color: #666; margin: 16px 0 2px; font-weight: 600; }
 .histsec:first-child { margin-top: 4px; }
 @media (max-width: 560px) { .hist { flex-direction: column; align-items: stretch; gap: 8px; } .hacts { justify-content: flex-end; } }
+/* 排队中（v1.0.20 分网盘并发） */
+.status.queued { background: #e8eaf6; color: #5c6bc0; }

@@ -353,7 +353,7 @@ async function directDownload() {
 let pollTimer = null;
 function startTaskPoll() { stopTaskPoll(); pollTimer = setInterval(loadTasks, 2000); }
 function stopTaskPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
-const STATUS_TXT = { downloading: '下载中', merging: '合并中', retry_wait: '等待重试', paused: '已暂停', completed: '已完成', failed: '失败' };
+const STATUS_TXT = { downloading: '下载中', queued: '排队中', merging: '合并中', retry_wait: '等待重试', paused: '已暂停', completed: '已完成', failed: '失败' };
 let taskMap = {};               // id -> task
 const selectedTasks = new Set();
 const expandedBatches = new Set();
@@ -363,7 +363,7 @@ function renderTask(t) {
   const pct = t.total > 0 ? Math.min(100, Math.round(t.downloaded * 100 / t.total)) : 0;
   const bar = t.status === 'completed' ? 'done' : (t.status === 'failed' ? 'fail' : '');
   let actions = '';
-  if (t.status === 'downloading' || t.status === 'retry_wait') actions += `<button class="ghost small" onclick="taskOp(${t.id},'pause')">暂停</button>`;
+  if (t.status === 'downloading' || t.status === 'queued' || t.status === 'retry_wait') actions += `<button class="ghost small" onclick="taskOp(${t.id},'pause')">暂停</button>`;
   if (t.status === 'paused' || t.status === 'failed' || t.status === 'retry_wait') actions += `<button class="ghost small" onclick="taskOp(${t.id},'resume')">继续</button>`;
   actions += `<button class="danger small" onclick="taskDel(${t.id})">删除</button>`;
   d.innerHTML = `
@@ -389,7 +389,7 @@ function renderBatch(batchId, batchName, kids) {
   wrap.className = 'batch';
   const done = kids.filter(t => t.status === 'completed').length;
   const failed = kids.filter(t => t.status === 'failed').length;
-  const downloading = kids.filter(t => t.status === 'downloading' || t.status === 'merging' || t.status === 'retry_wait').length;
+  const downloading = kids.filter(t => t.status === 'downloading' || t.status === 'queued' || t.status === 'merging' || t.status === 'retry_wait').length;
   const totalBytes = kids.reduce((a, t) => a + (t.total || 0), 0);
   const downBytes = kids.reduce((a, t) => a + Math.min(t.downloaded || 0, t.total || (t.downloaded || 0)), 0);
   const speed = kids.reduce((a, t) => a + (t.speed || 0), 0);
@@ -428,7 +428,7 @@ function toggleBatch(batchId) {
 }
 async function batchOp(batchId, op) {
   const kids = Object.values(taskMap).filter(t => t.batchId === batchId);
-  const ids = kids.filter(t => op === 'pause' ? t.status === 'downloading' : (t.status === 'paused' || t.status === 'failed')).map(t => t.id);
+  const ids = kids.filter(t => op === 'pause' ? (t.status === 'downloading' || t.status === 'queued') : (t.status === 'paused' || t.status === 'failed')).map(t => t.id);
   if (ids.length) await api(`/api/tasks/batch-${op}`, 'POST', { ids });
   loadTasks();
 }
@@ -516,8 +516,13 @@ async function loadSettings() {
   const s = r.data;
   document.getElementById('setConn').value = s.maxConnections;
   const pc = s.platformConnections || {};
+  const phConn = id => id === 'xunlei' ? '8' : '全局';
   document.getElementById('platformConnInputs').innerHTML = PLATFORMS_CONN.map(([id, name]) =>
-    `<span class="pconn"><i>${name}</i><input type="text" id="pc-${id}" inputmode="numeric" placeholder="全局" value="${pc[id] || ''}"></span>`
+    `<span class="pconn"><i>${name}</i><input type="text" id="pc-${id}" inputmode="numeric" placeholder="${phConn(id)}" value="${pc[id] || ''}"></span>`
+  ).join('');
+  const pt = s.platformConcurrentTasks || {};
+  document.getElementById('platformConcInputs').innerHTML = PLATFORMS_CONN.map(([id, name]) =>
+    `<span class="pconn"><i>${name}</i><input type="text" id="pt-${id}" inputmode="numeric" placeholder="全局" value="${pt[id] || ''}"></span>`
   ).join('');
   document.getElementById('setConc').value = s.maxConcurrentTasks;
   document.getElementById('setLimit').value = (s.speedLimitBps / 1048576).toFixed(1);
@@ -534,9 +539,15 @@ async function saveSettings() {
     const v = parseInt(document.getElementById('pc-' + id).value);
     if (v > 0) platformConnections[id] = Math.min(128, v);
   });
+  const platformConcurrentTasks = {};
+  PLATFORMS_CONN.forEach(([id]) => {
+    const v = parseInt(document.getElementById('pt-' + id).value);
+    if (v > 0) platformConcurrentTasks[id] = Math.min(64, v);
+  });
   const s = {
     maxConnections: Math.max(1, parseInt(document.getElementById('setConn').value) || 16),
     platformConnections,
+    platformConcurrentTasks,
     maxConcurrentTasks: Math.max(1, parseInt(document.getElementById('setConc').value) || 3),
     speedLimitBps: Math.round((parseFloat(document.getElementById('setLimit').value) || 0) * 1048576),
     maxRetries: Math.max(0, parseInt(document.getElementById('setRetry').value) || 0),

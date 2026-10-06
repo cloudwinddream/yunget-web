@@ -110,6 +110,9 @@ data class SettingsData(
     val downloadDir: String = "",
     // 分网盘连接数覆盖（键：quark/uc/xunlei/baidu/pan123/c139）；缺省或 <=0 表示跟随全局连接数
     val platformConnections: Map<String, Int> = emptyMap(),
+    // 分网盘同时下载任务数覆盖（键同上）；缺省或 <=0 表示跟随全局同时任务数。
+    // 限流是分网盘的（迅雷被限流不影响夸克），各网盘单独限流比全局一个闸门更合理。
+    val platformConcurrentTasks: Map<String, Int> = emptyMap(),
     // 失败后自动重试（退避 1→2→4→8→10 分钟），适合被限流后隔一阵自动续传
     val autoRetry: Boolean = true,
     val autoRetryMax: Int = 10,

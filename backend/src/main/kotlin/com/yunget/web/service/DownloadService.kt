@@ -13,7 +13,10 @@ import dev.turbodl.plugin.hls.HlsPlugin
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -97,7 +100,9 @@ class DownloadService(dataDir: File) {
 
     private fun buildConfig(s: SettingsData) = TurboConfig(
         maxConnectionsPerTask = s.maxConnections.coerceIn(1, 128),
-        maxConcurrentTasks = s.maxConcurrentTasks.coerceIn(1, 64),
+        // 引擎全局闸门只做总天花板：各网盘限流之和（引擎要求 1..64）。
+        // 真正的分网盘限流由 DownloadService 的 platformRunning 闸门在提交前执行。
+        maxConcurrentTasks = totalConcurrentLimit(s).coerceIn(1, 64),
         globalSpeedLimitBytesPerSec = s.speedLimitBps.coerceAtLeast(0),
         maxRetries = s.maxRetries.coerceIn(0, 50),
         // 网盘直链必探测：先跟随 302 拿到最终 CDN 地址再分片，否则每个分片重走重定向、
@@ -140,6 +145,58 @@ class DownloadService(dataDir: File) {
             settingsFile.writeText(json.encodeToString(settings))
         } catch (e: Exception) { e.printStackTrace() }
         client.updateConfig(buildConfig(s))
+    }
+
+    // ---------- 分网盘并发 ----------
+
+    /** 某网盘的同时任务数：单独设置 >0 则用它，否则跟随全局（设置改动对等待中的任务即时生效） */
+    fun concurrentLimit(platform: String): Int =
+        settings.platformConcurrentTasks[platform]?.takeIf { it > 0 }
+            ?: settings.maxConcurrentTasks.coerceIn(1, 64)
+
+    private fun totalConcurrentLimit(s: SettingsData): Int =
+        PLATFORM_IDS.sumOf { id ->
+            s.platformConcurrentTasks[id]?.takeIf { it > 0 } ?: s.maxConcurrentTasks.coerceIn(1, 64)
+        }
+
+    // 分网盘并发闸门：platform -> 正在占用槽位的任务数；等待者轮询（设置变更即时生效）。
+    // 槽位从 startInternal 持有到任务真正结束（完成/失败/暂停/删除），而不是提交即释放，
+    // 否则引擎内部排队的任务会绕过网盘限流。
+    private val platformGateMutex = Mutex()
+    private val platformRunning = mutableMapOf<String, Int>()
+    // 持有槽位的任务（taskId -> platform）：release 按任务幂等，暂停/删除与启动竞态时不漏放
+    private val platformHeld = ConcurrentHashMap<Long, String>()
+
+    private suspend fun acquirePlatformSlot(taskId: Long, platform: String): Boolean {
+        // 等槽位期间被暂停/删除则直接退出（由调用方释放逻辑兜底，不占槽位）
+        while (true) {
+            val cur = tasks[taskId]
+            if (cur == null || cur.status == "paused") return false
+            val ok = platformGateMutex.withLock {
+                val n = platformRunning.getOrDefault(platform, 0)
+                if (n < concurrentLimit(platform).coerceAtLeast(1)) {
+                    platformRunning[platform] = n + 1
+                    platformHeld[taskId] = platform
+                    true
+                } else false
+            }
+            if (ok) return true
+            delay(400)
+        }
+    }
+
+    private suspend fun releasePlatformSlot(taskId: Long) {
+        val p = platformHeld.remove(taskId) ?: return
+        platformGateMutex.withLock {
+            platformRunning[p] = (platformRunning.getOrDefault(p, 0) - 1).coerceAtLeast(0)
+        }
+    }
+
+    companion object {
+        /** 迅雷默认连接数（上游原版写死 8：迅雷 CDN 限流最凶；此处仍允许用户单独改） */
+        const val DEFAULT_XUNLEI_CONNECTIONS = 8
+        /** 参与并发统计的网盘 id（含 "" = 普通直链下载） */
+        val PLATFORM_IDS = listOf("quark", "uc", "xunlei", "baidu", "pan123", "c139", "")
     }
 
     /** 实际生效的下载目录（设置留空时用默认目录） */
@@ -193,11 +250,23 @@ class DownloadService(dataDir: File) {
         if (turboIds.containsKey(id)) return
         val task = tasks[id] ?: return
         scope.launch {
-            tasks[id] = task.copy(status = "downloading", error = "")
+            // 先标排队：分网盘并发闸门按网盘各自限流，拿到槽位才真正提交
+            tasks[id] = task.copy(status = "queued", error = "")
+            persistTasks()
+            if (!acquirePlatformSlot(id, task.platform)) return@launch
+            // 等槽位期间可能被暂停/删除：以最新状态为准，避免漏放槽位
+            val cur = tasks[id]
+            if (cur == null || cur.status == "paused") {
+                releasePlatformSlot(id)
+                return@launch
+            }
+            tasks[id] = cur.copy(status = "downloading", error = "")
             val out = File(tmpDir, "task_${id}.part")
             val headers = headersCache[id] ?: task.headers
-            // 分网盘连接数：任务所属网盘有单独设置则用其值，否则用全局
+            // 分网盘连接数：任务所属网盘有单独设置则用其值；
+            // 迅雷默认 8（上游原版写死 8，迅雷 CDN 限流最凶），其余留空跟随全局
             val platformConn = settings.platformConnections[task.platform]?.takeIf { it > 0 }
+                ?: if (task.platform == "xunlei") DEFAULT_XUNLEI_CONNECTIONS else null
             val request = DownloadRequest(
                 url = task.url,
                 destination = out,
@@ -221,6 +290,8 @@ class DownloadService(dataDir: File) {
         scope.launch {
             if (turboId != null) runCatching { client.pause(turboId) }
             tasks[id]?.let { tasks[id] = it.copy(status = "paused", autoRetry = 0) }
+            // 已提交到引擎才占着网盘槽位；仍在排队等的由 startInternal 的检查自行退出
+            if (turboId != null) releasePlatformSlot(id)
             persistTasks()
         }
     }
@@ -260,9 +331,10 @@ class DownloadService(dataDir: File) {
         val turboId = turboIds.remove(id)
         if (turboId != null) turboToTask.remove(turboId)
         speeds.remove(id); etas.remove(id)
-        callbacks.remove(id)
+        callbacks.remove(id); retryBaseline.remove(id)
         scope.launch {
             if (turboId != null) runCatching { client.cancel(turboId, deleteOutput = true) }
+            releasePlatformSlot(id)
             File(tmpDir, "task_${id}.part").delete()
             if (deleteFile) {
                 tasks[id]?.savePath?.takeIf { it.isNotBlank() }?.let {
@@ -334,6 +406,7 @@ class DownloadService(dataDir: File) {
             is TurboEvent.Failed -> scope.launch {
                 turboIds.remove(id)?.let { turboToTask.remove(it) }
                 speeds.remove(id); etas.remove(id)
+                releasePlatformSlot(id)
                 File(tmpDir, "task_${id}.part").delete()
                 val t = tasks[id] ?: return@launch
                 val maxAuto = if (settings.autoRetry) settings.autoRetryMax.coerceIn(0, 50) else 0
@@ -399,6 +472,7 @@ class DownloadService(dataDir: File) {
             )
             turboIds.remove(id)?.let { turboToTask.remove(it) }
             speeds.remove(id); etas.remove(id)
+            releasePlatformSlot(id)
             persistTasks()
             // 清理回调（如夸克临时转存目录）
             callbacks.remove(id)?.let { cb -> runCatching { cb() } }
