@@ -372,6 +372,15 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService) {
             }
         }
 
+        post("/settings/reset") {
+            try {
+                downloads.resetSettings()
+                call.respond(ok(downloads.settingsForDisplay()))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "恢复默认设置失败"))
+            }
+        }
+
         get("/health") {
             call.respond(ok(mapOf("status" to "ok")))
         }

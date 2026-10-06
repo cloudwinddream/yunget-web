@@ -208,6 +208,18 @@ class DownloadService(dataDir: File) {
         val PLATFORM_IDS = listOf("quark", "uc", "xunlei", "baidu", "pan123", "c139", "")
     }
 
+    /** 恢复默认设置：回到 SettingsData() 初始值（各网盘连接数 32、迅雷固定 8 等）；
+     *  唯独下载目录保留——那是位置不是调参，重置会让人找不到文件 */
+    fun resetSettings(): SettingsData {
+        val dir = settings.downloadDir
+        settings = SettingsData().copy(downloadDir = dir)
+        try {
+            settingsFile.writeText(json.encodeToString(settings))
+        } catch (e: Exception) { e.printStackTrace() }
+        client.updateConfig(buildConfig(settings))
+        return settings
+    }
+
     /** 实际生效的下载目录（设置留空时用默认目录） */
     fun resolvedDownloadsDir(): File {
         val custom = settings.downloadDir.trim()

@@ -10,7 +10,7 @@
 <header>
   <h1>☁️ YunGet 网页版</h1>
   <span class="sub">网盘分享解析 · 高速下载 · 夸克 / UC / 迅雷 / 百度 / 123 / 139</span>
-  <button class="ver" onclick="showChangelog()" title="查看更新日志">v1.0.21</button>
+  <button class="ver" onclick="showChangelog()" title="查看更新日志">v1.0.22</button>
 </header>
 <nav class="tabs">
   <button class="active" data-tab="parse">解析下载</button>
@@ -156,7 +156,7 @@
         <div class="setlab"><label for="setDir">下载目录</label><span class="hint">文件直接下载到服务器上的这个目录，留空则用当前用户的下载目录（如 ~/Downloads）</span></div>
         <div class="setctl grow"><input type="text" id="setDir"><button type="button" class="ghost small" onclick="openDirPicker()">选择…</button></div>
       </div>
-      <div class="row" style="margin-top:16px"><button class="btn" onclick="saveSettings()">保存设置</button></div>
+      <div class="row" style="margin-top:16px"><button class="btn" onclick="saveSettings()">保存设置</button><button class="ghost" onclick="resetSettings()">恢复默认设置</button></div>
       <div class="msg" id="setMsg"></div>
     </div>
     <div class="card">
@@ -195,8 +195,9 @@
   <!-- 更新日志弹窗 -->
   <div class="modal" id="logModal" style="display:none">
     <div class="modal-box log-box">
-      <h3>📋 更新日志 <span class="hint">当前版本 v1.0.21</span></h3>
+      <h3>📋 更新日志 <span class="hint">当前版本 v1.0.22</span></h3>
       <div class="changelog">
+        <div class="cl-item"><span class="cl-ver">v1.0.22</span><span class="cl-txt">设置页新增「恢复默认设置」：一键回到初始值（各网盘连接数 32、迅雷固定 8 等），下载目录保留不动</span></div>
         <div class="cl-item"><span class="cl-ver">v1.0.21</span><span class="cl-txt">连接数照搬原版模型：每个网盘单独设置（默认 32，档位 1–256），迅雷固定 8 不可改；去掉全局连接数。旧设置里的分网盘值会自动沿用</span></div>
         <div class="cl-item"><span class="cl-ver">v1.0.20</span><span class="cl-txt">迅雷连接数默认改为 8（跟原版一致，迅雷 CDN 限流最凶）；同时下载任务数改为分网盘限流（迅雷设 1、夸克设 4，各跑各的互不拖累），留空=跟随全局；排队中的任务显示「排队中」</span></div>
         <div class="cl-item"><span class="cl-ver">v1.0.19</span><span class="cl-txt">新增「历史」页：解析过的分享自动记录并显示主名称，一眼认出是什么；可收藏到解析页快捷区，点一下重新解析，不用再粘贴链接</span></div>

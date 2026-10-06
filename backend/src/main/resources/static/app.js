@@ -564,6 +564,15 @@ async function saveSettings() {
 }
 
 
+async function resetSettings() {
+  if (!confirm('把所有设置恢复为默认值？（下载目录保留不动）')) return;
+  hideMsg('setMsg');
+  const r = await api('/api/settings/reset', 'POST', {});
+  if (r.ok) { await loadSettings(); showMsg('setMsg', '已恢复默认设置', true); }
+  else showMsg('setMsg', r.message || '恢复失败', false);
+}
+
+
 // ---------- 下载目录选择（服务器目录浏览） ----------
 let pickerPath = '', pickerParent = '';
 async function openDirPicker() {
