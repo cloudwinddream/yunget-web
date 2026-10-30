@@ -81,6 +81,7 @@ private data class YtJson(
  * 下载仍走自家 DownloadService；DASH 分轨复用 v1.0.29 的 ffmpeg 合轨模式。
  *
  * - 单视频：`-J --no-warnings --no-playlist`，后端按目标高度挑格式（见 [pick]）；
+ *   解析带 player_client 兜底链（默认 → android_vr → tv → web_safari），见 [runParseJson]；
  * - 播放列表（URL 含 list= 或 /playlist）：`-J --flat-playlist` 只列条目，
  *   下载时逐条再取完整 -J（顺序执行、逐条失败不中断）；
  * - 字幕：从 -J 的 subtitles / automatic_captions 里取 vtt 直链当普通文件下载，
@@ -111,6 +112,24 @@ class YouTubeService(
             YouTubeQualityDto(360, "360p"),
             YouTubeQualityDto(-1, "仅音频")
         )
+
+        /** 播放器客户端兜底链的一档：label 仅打日志，args 为空 = yt-dlp 默认客户端 */
+        private data class ClientAttempt(val label: String, val args: List<String>)
+
+        /**
+         * 兜底链尝试序：默认 → android_vr → tv → web_safari。
+         * 不同 player_client 在 YouTube 的格式门控下可用格式不同，一个拿不到时换下一个。
+         */
+        private val PLAYER_CLIENT_ATTEMPTS = listOf(
+            ClientAttempt("default", emptyList()),
+            ClientAttempt("android_vr", listOf("--extractor-args", "youtube:player_client=android_vr")),
+            ClientAttempt("tv", listOf("--extractor-args", "youtube:player_client=tv")),
+            ClientAttempt("web_safari", listOf("--extractor-args", "youtube:player_client=web_safari"))
+        )
+
+        /** 兜底链全部失败时追加在错误主文案后的自救指引 */
+        private const val RETRY_GUIDE =
+            "（可尝试：到账号页保存 YouTube Cookie 后重试；在设置页更新 yt-dlp 到最新版；或检查工具代理是否可用）"
     }
 
     private val ytdlp = YtDlpSupport(dataDir)
@@ -188,9 +207,9 @@ class YouTubeService(
 
     fun ytdlpStatus(): YtDlpStatusResponse = ytdlp.status(settings.ytdlpPath)
 
-    /** 同步阻塞（下载二进制），路由层需包 Dispatchers.IO。安装下载走工具安装代理，ytdlpProxy 兜底 */
-    fun installYtdlp(): YtDlpStatusResponse =
-        ytdlp.install(settings.ytdlpPath, settings.toolProxy, settings.ytdlpProxy)
+    /** 同步阻塞（下载二进制），路由层需包 Dispatchers.IO。安装下载走工具安装代理，ytdlpProxy 兜底；force=true 为「更新」（强制重下最新版） */
+    fun installYtdlp(force: Boolean = false): YtDlpStatusResponse =
+        ytdlp.install(settings.ytdlpPath, settings.toolProxy, settings.ytdlpProxy, force)
 
     // ------------------------------------------------------------------
     // 解析
@@ -246,20 +265,52 @@ class YouTubeService(
         }
     }
 
-    /** 跑 yt-dlp -J 取 JSON（子进程阻塞，包 IO；Cookie/代理由 YtDlpSupport 按设置拼参数） */
+    /**
+     * 跑 yt-dlp -J 取 JSON，带播放器客户端兜底链（子进程阻塞，包 IO；
+     * Cookie/代理由 YtDlpSupport 按设置拼参数）。
+     *
+     * 背景：YouTube 近年按 player_client 门控格式——默认客户端（含未登录、
+     * 旧版 yt-dlp）常报「Requested format is not available」或只剩故事板
+     * （mhtml）格式。兜底链依次尝试 [默认 → android_vr → tv → web_safari]：
+     * 进程非 0 退出、输出解析失败、或（仅单视频模式）剔除 mhtml 后无可用
+     * 格式，都算本次失败、换下一个客户端；首个成功即停并打日志。
+     * flat 播放列表模式只在进程/解析失败时重试（列表没有 formats 可查）。
+     * 全部失败时以最后一次的错误为主文案并追加自救指引。
+     * 单视频与播放列表逐条下载都经此函数，兜底链天然全覆盖。
+     */
     private suspend fun runParseJson(url: String, flatPlaylist: Boolean): YtJson {
-        val args = mutableListOf("-J", "--no-warnings")
-        if (flatPlaylist) args += "--flat-playlist" else args += "--no-playlist"
-        args += url
         val cookie = accounts.get(YOUTUBE_KEY)?.cookie?.takeIf { it.isNotBlank() }
-        val text = withContext(Dispatchers.IO) {
-            ytdlp.run(settings.ytdlpPath, settings.ytdlpProxy, cookie, args, PARSE_TIMEOUT_SEC)
+        var lastError: Exception? = null
+        for ((i, attempt) in PLAYER_CLIENT_ATTEMPTS.withIndex()) {
+            val args = mutableListOf("-J", "--no-warnings")
+            if (flatPlaylist) args += "--flat-playlist" else args += "--no-playlist"
+            args += attempt.args
+            args += url
+            val n = i + 1
+            val total = PLAYER_CLIENT_ATTEMPTS.size
+            try {
+                val text = withContext(Dispatchers.IO) {
+                    ytdlp.run(settings.ytdlpPath, settings.ytdlpProxy, cookie, args, PARSE_TIMEOUT_SEC)
+                }
+                val j = try {
+                    json.decodeFromString(YtJson.serializer(), text)
+                } catch (e: Exception) {
+                    throw IllegalStateException("yt-dlp 输出解析失败（可能版本过旧或被平台拦截）：${e.message}", e)
+                }
+                if (!flatPlaylist && j.formats.none { it.url.isNotBlank() && it.protocol != "mhtml" }) {
+                    println("[youtube] 解析尝试 $n/$total（client=${attempt.label}）：进程成功但无可用格式（仅故事板或空），换下一客户端")
+                    lastError = IllegalStateException("没有解析到可用格式（默认客户端只返回了故事板等不可用格式）")
+                    continue
+                }
+                println("[youtube] 解析尝试 $n/$total（client=${attempt.label}）：成功")
+                return j
+            } catch (e: Exception) {
+                println("[youtube] 解析尝试 $n/$total（client=${attempt.label}）：失败：${e.message}")
+                lastError = e
+            }
         }
-        return try {
-            json.decodeFromString(YtJson.serializer(), text)
-        } catch (e: Exception) {
-            throw IllegalStateException("yt-dlp 输出解析失败（可能版本过旧或被平台拦截）：${e.message}", e)
-        }
+        val base = lastError?.message ?: "yt-dlp 解析失败"
+        throw IllegalStateException(base + RETRY_GUIDE)
     }
 
     private fun toVideoInfo(j: YtJson): YtVideoInfo {

@@ -94,17 +94,28 @@ class YtDlpSupport(private val dataDir: File) {
     // ------------------------------------------------------------------
 
     /**
-     * 一键安装（同步阻塞，调用方需切到 IO 线程）：已检测到任意来源直接返回现状；
+     * 一键安装（同步阻塞，调用方需切到 IO 线程）：默认已检测到任意来源直接返回现状；
      * 否则清理托管目录残留后下载官方单文件二进制，跑 --version 验证后写入 version.txt。
+     * force=true 时跳过早退、强制重下最新版（「更新」按钮）。
      * 失败抛 IllegalStateException，文案注明步骤（下载/验证）。
      */
     /**
      * @param toolProxy 工具安装代理（设置项 toolProxy，三家安装共用，优先）
      * @param fallbackProxy 兜底代理（设置项 ytdlpProxy——用户可能早先在 yt-dlp 卡里填过）；
      *   toolProxy 为空时才用它，避免用户填过一处却对安装不生效。
+     * @param force true = 强制更新：跳过「已检测到就返回现状」的早退，清托管目录
+     *   重下官方最新版（即使命中的是手动路径/PATH 也照下，装到托管目录；
+     *   定位顺序不变，装完状态可能仍显示手动/PATH 来源）。注意托管目录里的
+     *   cookies.txt 会随目录清理被删，但源 Cookie 在账号存储里，下次解析自动重建。
      */
-    fun install(customPath: String, toolProxy: String = "", fallbackProxy: String = ""): YtDlpStatusResponse {
-        status(customPath).let { if (it.available) return it }
+    fun install(
+        customPath: String,
+        toolProxy: String = "",
+        fallbackProxy: String = "",
+        force: Boolean = false
+    ): YtDlpStatusResponse {
+        if (!force) status(customPath).let { if (it.available) return it }
+        if (force) println("[yt-dlp] 强制更新：跳过现状早退，清托管目录重下最新版")
 
         val pkg = packageFor() ?: throw IllegalStateException(
             "暂不支持在当前系统（${System.getProperty("os.name")} / ${System.getProperty("os.arch")}）自动安装 yt-dlp，请到 github.com/yt-dlp/yt-dlp 手动下载后在上方填写路径"
@@ -213,7 +224,14 @@ class YtDlpSupport(private val dataDir: File) {
         }
         val text = String(outFuture.get(5, TimeUnit.SECONDS), Charsets.UTF_8)
         if (proc.exitValue() != 0) {
-            val tail = text.trim().lines().filter { it.isNotBlank() }.takeLast(3).joinToString("；")
+            // 失败文案取输出尾部：yt-dlp 失败时 stdout 会打一个 JSON 字面量 "null"
+            // （-J 无结果时的占位），混在合并输出里会变成「…；null」的怪尾巴，先滤掉；
+            // 有 ERROR 行时优先只取 ERROR 行（真正的失败原因在那里）。
+            val lines = text.trim().lines()
+                .map { it.trim() }
+                .filter { it.isNotBlank() && it != "null" }
+            val errLines = lines.filter { it.startsWith("ERROR") }
+            val tail = (errLines.ifEmpty { lines }).takeLast(3).joinToString("；")
             throw IllegalStateException(
                 "yt-dlp 解析失败：${tail.ifBlank { "退出码 ${proc.exitValue()}" }}".take(600)
             )

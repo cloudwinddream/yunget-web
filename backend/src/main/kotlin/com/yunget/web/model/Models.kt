@@ -371,6 +371,12 @@ data class GitHubDownloadRequest(
 // ---------- YouTube 解析（yt-dlp 托管工具，v1.0.30） ----------
 
 @Serializable
+data class YtDlpInstallRequest(
+    /** true = 强制更新：跳过「已检测到就返回现状」的早退，重下官方最新版到托管目录 */
+    val force: Boolean = false
+)
+
+@Serializable
 data class YtDlpStatusResponse(
     val available: Boolean,
     /** yt-dlp 版本（如 2025.10.14）；不可用时为空 */

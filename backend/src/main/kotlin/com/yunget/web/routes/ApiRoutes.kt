@@ -29,6 +29,7 @@ import com.yunget.web.model.VideoListDownloadRequest
 import com.yunget.web.model.VideoParseRequest
 import com.yunget.web.model.YouTubeDownloadRequest
 import com.yunget.web.model.YouTubePlaylistDownloadRequest
+import com.yunget.web.model.YtDlpInstallRequest
 import com.yunget.web.model.XunleiSmsLoginRequest
 import com.yunget.web.model.XunleiSmsRequest
 import com.yunget.web.model.fail
@@ -808,8 +809,11 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
 
         post("/youtube/ytdlp/install") {
             try {
+                // 请求体可带 {"force":true}（「更新」按钮：强制重下最新版）；缺省/无体按普通安装
+                val req = runCatching { call.receive<YtDlpInstallRequest>() }
+                    .getOrDefault(YtDlpInstallRequest())
                 // 同步阻塞（下载二进制），包 Dispatchers.IO
-                val st = withContext(Dispatchers.IO) { youtube.installYtdlp() }
+                val st = withContext(Dispatchers.IO) { youtube.installYtdlp(req.force) }
                 call.respond(ok(st))
             } catch (e: Exception) {
                 call.respond(fail(e.message ?: "yt-dlp 安装失败"))

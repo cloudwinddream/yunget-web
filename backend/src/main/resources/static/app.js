@@ -1529,30 +1529,39 @@ async function refreshYtdlpCard() {
   const st = await fetchYtdlpState(true);
   const box = document.getElementById('ytdlpInstallBox');
   const manual = document.getElementById('ytdlpManualHint');
+  const updBox = document.getElementById('ytdlpUpdateBox');
+  const updHint = document.getElementById('ytdlpUpdateHint');
   if (st.available) {
     stEl.textContent = `已检测到 yt-dlp ${st.version || ''}（来源：${YTD_SOURCE_TEXT[st.source] || st.source || '未知'}）· ${st.path}`;
     box.style.display = 'none';
     manual.style.display = 'none';
+    if (updBox) updBox.style.display = '';
+    if (updHint) updHint.style.display = '';
   } else {
     stEl.textContent = '未检测到 yt-dlp';
     box.style.display = '';
     manual.style.display = '';
+    if (updBox) updBox.style.display = 'none';
+    if (updHint) updHint.style.display = 'none';
   }
 }
-async function ytdlpInstall() {
-  const btn = document.getElementById('ytdlpInstallBtn');
+async function ytdlpInstall() { await ytdlpDoInstall(false); }
+async function ytdlpUpdate() { await ytdlpDoInstall(true); }
+/** force=false：一键安装（已装则后端直接返回现状）；force=true：更新（强制重下最新版到托管目录） */
+async function ytdlpDoInstall(force) {
+  const btn = document.getElementById(force ? 'ytdlpUpdateBtn' : 'ytdlpInstallBtn');
   btn.disabled = true;
   const oldText = btn.textContent;
-  btn.textContent = '正在下载安装…';
+  btn.textContent = force ? '正在更新…' : '正在下载安装…';
   hideMsg('ytdlpMsg');
   try {
     await saveSettings(); // 先把本页设置（含工具安装代理）落盘再安装，避免填了代理没保存就点安装
-    const r = await api('/api/youtube/ytdlp/install', 'POST', {});
+    const r = await api('/api/youtube/ytdlp/install', 'POST', force ? { force: true } : {});
     if (r.ok) {
       ytdlpState = r.data;
-      showMsg('ytdlpMsg', 'yt-dlp 安装完成：' + (r.data.version || '') + '（' + (r.data.path || '') + '）', true);
+      showMsg('ytdlpMsg', (force ? 'yt-dlp 更新完成：' : 'yt-dlp 安装完成：') + (r.data.version || '') + '（' + (r.data.path || '') + '）', true);
     } else {
-      showMsg('ytdlpMsg', r.message || '安装失败', false);
+      showMsg('ytdlpMsg', r.message || (force ? '更新失败' : '安装失败'), false);
     }
   } finally {
     btn.disabled = false;
