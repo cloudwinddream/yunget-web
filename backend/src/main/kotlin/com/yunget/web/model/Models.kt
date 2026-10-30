@@ -338,7 +338,9 @@ data class FfmpegStatusResponse(
     /** 实际命中的可执行文件路径；不可用时为空 */
     val path: String = "",
     /** 命中来源：manual（设置项路径）| app（应用托管安装）| path（系统 PATH）| system（常见安装路径）；不可用时为空 */
-    val source: String = ""
+    val source: String = "",
+    /** 手动路径无效原因（仅当设置了手动路径且该候选探测失败时非空）：路径不存在/目录下无可执行文件/文件无法运行/运行超时；未设置或手动路径有效时为 null */
+    val manualHint: String? = null
 )
 
 @Serializable
@@ -383,8 +385,10 @@ data class YtDlpStatusResponse(
     val version: String = "",
     /** 实际命中的可执行文件路径；不可用时为空 */
     val path: String = "",
-    /** 命中来源：manual（设置项路径）| app（应用托管安装）| path（系统 PATH）；不可用时为空 */
-    val source: String = ""
+    /** 命中来源：manual（设置项路径）| app（应用托管安装）| path（系统 PATH）| system（常见安装路径）；不可用时为空 */
+    val source: String = "",
+    /** 手动路径无效原因（仅当设置了手动路径且该候选探测失败时非空）：路径不存在/目录下无可执行文件/文件无法运行/运行超时；未设置或手动路径有效时为 null */
+    val manualHint: String? = null
 )
 
 @Serializable

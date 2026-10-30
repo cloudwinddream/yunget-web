@@ -18,7 +18,13 @@ import java.util.zip.ZipInputStream
  * ④ 常见安装路径（source=system）。每个候选都实际跑一次 `ffmpeg -version`
  * （3 秒超时）确认可执行并取版本号，第一个通过的胜出。
  *
- * 探测结果按「当时生效的 ffmpegPath 设置值」缓存：设置一变，下次查询自动重新探测。
+ * 结果按「当时生效的 ffmpegPath 设置值」缓存，但仅限不含任何失败成分的
+ * 成功结果；未命中、或手动路径候选失败（hint 非空）时不缓存、每次重新
+ * 探测，避免一过性失败被钉死（与 YtDlpSupport 一致）。
+ *
+ * 手动路径容错：设置值指向一个**目录**时（用户常把下载目录整个填进来），
+ * 在该目录内按 ffmpeg / ffmpeg.exe 找可执行文件作为候选，status 返回的
+ * path 为最终文件路径（见 resolveManualCandidate）。
  *
  * 辅助安装（[install]）：任意来源已检测到就直接返回现状、不打扰；否则按平台下载
  * 官方静态构建（Windows=gyan.dev / macOS=evermeet.cx / Linux=johnvansickle.com）
@@ -37,19 +43,26 @@ class FfmpegSupport(private val dataDir: File) {
     fun status(customPath: String): FfmpegStatusResponse {
         val key = customPath.trim()
         cached?.let { if (cachedFor == key) return it }
-        val found = locate(key)
+        val (found, hint) = locate(key)
         val result = if (found != null) {
             FfmpegStatusResponse(
                 available = true,
                 version = found.version,
                 path = found.file.absolutePath,
-                source = found.source
+                source = found.source,
+                manualHint = hint
             )
         } else {
-            FfmpegStatusResponse(available = false)
+            FfmpegStatusResponse(available = false, manualHint = hint)
         }
-        cachedFor = key
-        cached = result
+        // 只缓存「干净的成功」：整体未命中、或命中但结果里带着手动路径的
+        // 失败原因（hint 非空）时都不缓存。失败可能只是一过性状态（冷启动
+        // 超时、首次运行被系统扫描等），钉死会让同一路径永远显示旧结论，
+        // 直到改路径或重启。未缓存时每次 status 重新探测——与 YtDlpSupport 一致。
+        if (found != null && hint == null) {
+            cachedFor = key
+            cached = result
+        }
         return result
     }
 
@@ -66,27 +79,79 @@ class FfmpegSupport(private val dataDir: File) {
 
     private data class Found(val file: File, val version: String, val source: String)
 
-    private fun locate(customPath: String): Found? {
-        // ① 设置项路径
+    /**
+     * 定位主流程，返回 (命中项, 手动路径无效原因)。
+     * hint 仅在「手动路径已设置但该候选探测失败」时非空——即使最终靠其它层
+     * 命中，也把用户填错的路径原因透出去；定位顺序与胜负判定不因 hint 变化。
+     */
+    private fun locate(customPath: String): Pair<Found?, String?> {
+        var hint: String? = null
+        // ① 设置项路径（文件或其所在目录，见 probeManual/resolveManualCandidate）
         if (customPath.isNotBlank()) {
-            val f = File(customPath)
-            probeVersion(f)?.let { return Found(f, it, "manual") }
+            val (found, h) = probeManual(customPath)
+            if (found != null) return found to null
+            hint = h
         }
         // ② 应用托管安装
         findManagedExe()?.let { f ->
-            probeVersion(f)?.let { return Found(f, it, "app") }
+            probeVersion(f)?.let { return Found(f, it, "app") to hint }
         }
         // ③ PATH 上的 ffmpeg：相对名交给 ProcessBuilder 走 PATH 解析；
         //    探通后用 which 解析回绝对路径方便日志/展示（解析失败则退回相对名本身）
         probeVersion(null)?.let { version ->
             val resolved = whichFfmpeg() ?: File("ffmpeg")
-            return Found(resolved, version, "path")
+            return Found(resolved, version, "path") to hint
         }
         // ④ 常见安装路径
         for (p in COMMON_PATHS) {
             val f = File(p)
             if (!f.isFile) continue
-            probeVersion(f)?.let { return Found(f, it, "system") }
+            probeVersion(f)?.let { return Found(f, it, "system") to hint }
+        }
+        return null to hint
+    }
+
+    /**
+     * 手动路径候选探测 + 失败原因分类，返回 (命中项, 原因)。
+     * 原因按形态区分：路径不存在 / 是目录但目录内未找到二进制 /
+     * 文件存在但运行失败（权限被拒、退出码非 0、输出不符）/ 运行超时。
+     */
+    private fun probeManual(raw: String): Pair<Found?, String?> {
+        val value = raw.trim()
+        val f = File(value)
+        if (!f.exists()) return null to "路径不存在：$value"
+        if (f.isDirectory) {
+            val cand = resolveManualCandidate(value)
+                ?: return null to "该目录下未找到 ffmpeg 可执行文件：$value"
+            val o = probe(cand)
+            return if (o.version != null) Found(cand, o.version, "manual") to null
+            else null to manualRunHint(o.fail, cand)
+        }
+        val o = probe(f)
+        return if (o.version != null) Found(f, o.version, "manual") to null
+        else null to manualRunHint(o.fail, f)
+    }
+
+    /** 探测已执行但失败时的文案：超时单独一类，其余（启动被拒/非 0 退出/输出不符）归「无法运行」 */
+    private fun manualRunHint(fail: ProbeFail?, file: File): String = when (fail) {
+        ProbeFail.TIMEOUT -> "运行超时：${file.absolutePath}"
+        else -> "文件无法运行（可能缺少执行权限或被系统拦截）：${file.absolutePath}"
+    }
+
+    /**
+     * 手动路径候选解析：设置值指向文件 → 就是它；指向**目录** → 在目录内
+     * 找 ffmpeg / ffmpeg.exe（Windows 优先 .exe）；都找不到返回 null
+     * （该层判无效、继续往下找，不误报）。
+     */
+    private fun resolveManualCandidate(raw: String): File? {
+        val f = File(raw.trim())
+        if (f.isFile) return f
+        if (f.isDirectory) {
+            val names = if (isWindows()) listOf("ffmpeg.exe", "ffmpeg") else listOf("ffmpeg", "ffmpeg.exe")
+            for (name in names) {
+                val child = File(f, name)
+                if (child.isFile) return child
+            }
         }
         return null
     }
@@ -339,26 +404,40 @@ class FfmpegSupport(private val dataDir: File) {
         if (line.isBlank()) null else File(line)
     }.getOrNull()
 
+    /** 探测失败分类（仅供手动路径的原因透出；定位胜负只看 version 是否为空，语义与旧版一致） */
+    private enum class ProbeFail { TIMEOUT, NOT_RUNNABLE, BAD_OUTPUT }
+
+    private data class ProbeOutcome(val version: String?, val fail: ProbeFail?)
+
     /**
      * 对候选跑 `ffmpeg -version` 取版本号。
      * @param file 候选文件；null 表示用 PATH 相对名 "ffmpeg"。
      * @return 版本号（如 "6.1.1"）；不可执行/超时/输出不符返回 null。
      */
-    private fun probeVersion(file: File?): String? = runCatching {
+    private fun probeVersion(file: File?): String? = probe(file).version
+
+    private fun probe(file: File?): ProbeOutcome {
         val cmd = file?.absolutePath ?: "ffmpeg"
-        if (file != null && !file.isFile) return null
-        val proc = ProcessBuilder(cmd, "-version")
-            .redirectErrorStream(true)
-            .start()
+        if (file != null && !file.isFile) return ProbeOutcome(null, ProbeFail.NOT_RUNNABLE)
+        val proc = try {
+            ProcessBuilder(cmd, "-version")
+                .redirectErrorStream(true)
+                .start()
+        } catch (e: Exception) {
+            // 无执行权限/不可执行格式等都在进程启动期抛 IOException
+            return ProbeOutcome(null, ProbeFail.NOT_RUNNABLE)
+        }
         if (!proc.waitFor(3, TimeUnit.SECONDS)) {
             proc.destroyForcibly()
-            return null
+            return ProbeOutcome(null, ProbeFail.TIMEOUT)
         }
-        if (proc.exitValue() != 0) return null
-        val firstLine = proc.inputStream.bufferedReader().readLine().orEmpty()
+        if (proc.exitValue() != 0) return ProbeOutcome(null, ProbeFail.NOT_RUNNABLE)
+        val firstLine = runCatching { proc.inputStream.bufferedReader().readLine() }.getOrNull().orEmpty()
         val m = Regex("""ffmpeg version\s+(\S+)""").find(firstLine)
-        m?.groupValues?.get(1)
-    }.getOrNull()
+        val version = m?.groupValues?.get(1)
+        return if (version != null) ProbeOutcome(version, null)
+        else ProbeOutcome(null, ProbeFail.BAD_OUTPUT)
+    }
 
     companion object {
         private val COMMON_PATHS = listOf(

@@ -13,9 +13,19 @@ import java.util.concurrent.TimeUnit
  * yt-dlp 定位、探测、一键安装与进程执行（YouTube 解析用；模式仿 [FfmpegSupport]）。
  *
  * 定位顺序：① 设置项 ytdlpPath（source=manual）→ ② 应用托管安装
- * （{dataDir}/tools/yt-dlp/，source=app）→ ③ PATH 上的 yt-dlp（source=path）。
- * 每个候选实际跑一次 `yt-dlp --version`（3 秒超时）确认可执行并取版本号。
- * 探测结果按「当时生效的 ytdlpPath 设置值」缓存，设置一变自动重探。
+ * （{dataDir}/tools/yt-dlp/，source=app）→ ③ PATH 上的 yt-dlp（source=path）→
+ * ④ 常见安装路径（source=system，与 [FfmpegSupport] 同名同义；Windows 无对应
+ * 约定俗成位置，跳过该层）。应用进程继承的 PATH 常缺 Homebrew 的
+ * /opt/homebrew/bin，第 ④ 层就是为 brew/manual 安装兜的底。
+ * 每个候选实际跑一次 `yt-dlp --version`（10 秒超时——官方单文件为 PyInstaller
+ * 打包、冷启动解压慢，3 秒会误杀真机可用的二进制）确认可执行并取版本号。
+ * 结果按「当时生效的 ytdlpPath 设置值」缓存，但仅限不含任何失败成分的
+ * 成功结果；未命中、或手动路径候选失败（hint 非空）时不缓存、每次重新
+ * 探测，避免冷启动超时等一过性失败被钉死。
+ *
+ * 手动路径容错：设置值指向一个**目录**时（用户常把下载目录整个填进来），
+ * 在该目录内按 yt-dlp / yt-dlp_macos / yt-dlp.exe 找可执行文件作为候选，
+ * status 返回的 path 为最终文件路径（见 [resolveManualCandidate]）。
  *
  * 一键安装（[install]）：任意来源已检测到就直接返回现状、不打扰；否则从
  * yt-dlp 官方 GitHub Release 下载单文件二进制（Win=yt-dlp.exe / mac=yt-dlp_macos /
@@ -38,19 +48,27 @@ class YtDlpSupport(private val dataDir: File) {
     fun status(customPath: String): YtDlpStatusResponse {
         val key = customPath.trim()
         cached?.let { if (cachedFor == key) return it }
-        val found = locate(key)
+        val (found, hint) = locate(key)
         val result = if (found != null) {
             YtDlpStatusResponse(
                 available = true,
                 version = found.version,
                 path = found.file.absolutePath,
-                source = found.source
+                source = found.source,
+                manualHint = hint
             )
         } else {
-            YtDlpStatusResponse(available = false)
+            YtDlpStatusResponse(available = false, manualHint = hint)
         }
-        cachedFor = key
-        cached = result
+        // 只缓存「干净的成功」：整体未命中、或命中但结果里带着手动路径的
+        // 失败原因（hint 非空）时都不缓存。失败可能只是一过性状态（冷启动
+        // 超时、首次运行被系统扫描拦截等），钉死会让同一路径永远显示旧结论
+        // （未检测到、或错的来源+过时原因），直到改路径或重启。未缓存时每次
+        // status 重新探测——二进制不存在时各层都是毫秒级落空，代价可忽略。
+        if (found != null && hint == null) {
+            cachedFor = key
+            cached = result
+        }
         return result
     }
 
@@ -67,17 +85,80 @@ class YtDlpSupport(private val dataDir: File) {
 
     private data class Found(val file: File, val version: String, val source: String)
 
-    private fun locate(customPath: String): Found? {
+    /**
+     * 定位主流程，返回 (命中项, 手动路径无效原因)。
+     * hint 仅在「手动路径已设置但该候选探测失败」时非空——即使最终靠其它层
+     * 命中，也把用户填错的路径原因透出去，省得对着「未检测到」无线索；
+     * 定位顺序与胜负判定不因 hint 有任何变化。
+     */
+    private fun locate(customPath: String): Pair<Found?, String?> {
+        var hint: String? = null
         if (customPath.isNotBlank()) {
-            val f = File(customPath)
-            probeVersion(f)?.let { return Found(f, it, "manual") }
+            val (found, h) = probeManual(customPath)
+            if (found != null) return found to null
+            hint = h
         }
         findManagedExe()?.let { f ->
-            probeVersion(f)?.let { return Found(f, it, "app") }
+            probeVersion(f)?.let { return Found(f, it, "app") to hint }
         }
         probeVersion(null)?.let { version ->
             val resolved = whichYtDlp() ?: File(if (isWindows()) "yt-dlp.exe" else "yt-dlp")
-            return Found(resolved, version, "path")
+            return Found(resolved, version, "path") to hint
+        }
+        // ④ 常见安装路径（与 FfmpegSupport 的 system 层同名同义）：
+        //    brew 装的 yt-dlp 落 /opt/homebrew/bin，而双击/服务方式启动的应用
+        //    继承的 PATH 经常不含该目录。Windows 无对应约定位置，跳过该层。
+        if (!isWindows()) {
+            for (p in COMMON_PATHS) {
+                val f = File(p)
+                if (!f.isFile) continue
+                probeVersion(f)?.let { return Found(f, it, "system") to hint }
+            }
+        }
+        return null to hint
+    }
+
+    /**
+     * 手动路径候选探测 + 失败原因分类，返回 (命中项, 原因)。
+     * 原因按形态区分：路径不存在 / 是目录但目录内未找到二进制 /
+     * 文件存在但运行失败（权限被拒、退出码非 0、输出不符）/ 运行超时。
+     */
+    private fun probeManual(raw: String): Pair<Found?, String?> {
+        val value = raw.trim()
+        val f = File(value)
+        if (!f.exists()) return null to "路径不存在：$value"
+        if (f.isDirectory) {
+            val cand = resolveManualCandidate(value)
+                ?: return null to "该目录下未找到 yt-dlp 可执行文件：$value"
+            val o = probe(cand)
+            return if (o.version != null) Found(cand, o.version, "manual") to null
+            else null to manualRunHint(o.fail, cand)
+        }
+        val o = probe(f)
+        return if (o.version != null) Found(f, o.version, "manual") to null
+        else null to manualRunHint(o.fail, f)
+    }
+
+    /** 探测已执行但失败时的文案：超时单独一类，其余（启动被拒/非 0 退出/输出不符）归「无法运行」 */
+    private fun manualRunHint(fail: ProbeFail?, file: File): String = when (fail) {
+        ProbeFail.TIMEOUT -> "运行超时：${file.absolutePath}"
+        else -> "文件无法运行（可能缺少执行权限或被系统拦截）：${file.absolutePath}"
+    }
+
+    /**
+     * 手动路径候选解析：设置值指向文件 → 就是它；指向**目录** → 在目录内
+     * 按 yt-dlp → yt-dlp_macos → yt-dlp.exe 依次找（用户从 GitHub 下载的
+     * Mac 二进制名叫 yt-dlp_macos，常把所在目录整个填进路径框）；
+     * 都找不到返回 null（该层判无效、继续往下找，不误报）。
+     */
+    private fun resolveManualCandidate(raw: String): File? {
+        val f = File(raw.trim())
+        if (f.isFile) return f
+        if (f.isDirectory) {
+            for (name in MANUAL_EXE_NAMES) {
+                val child = File(f, name)
+                if (child.isFile) return child
+            }
         }
         return null
     }
@@ -333,18 +414,52 @@ class YtDlpSupport(private val dataDir: File) {
         if (line.isBlank()) null else File(line)
     }.getOrNull()
 
+    /** 探测失败分类（仅供手动路径的原因透出；定位胜负只看 version 是否为空，语义与旧版一致） */
+    private enum class ProbeFail { TIMEOUT, NOT_RUNNABLE, BAD_OUTPUT }
+
+    private data class ProbeOutcome(val version: String?, val fail: ProbeFail?)
+
     /** 对候选跑 `yt-dlp --version`；输出首行即版本号（如 2025.10.14）。file=null 表示走 PATH 相对名 */
-    private fun probeVersion(file: File?): String? = runCatching {
+    private fun probeVersion(file: File?): String? = probe(file).version
+
+    private fun probe(file: File?): ProbeOutcome {
         val cmd = file?.absolutePath ?: if (isWindows()) "yt-dlp.exe" else "yt-dlp"
-        if (file != null && !file.isFile) return null
-        val proc = ProcessBuilder(cmd, "--version")
-            .redirectErrorStream(true)
-            .start()
-        if (!proc.waitFor(3, TimeUnit.SECONDS)) {
-            proc.destroyForcibly()
-            return null
+        if (file != null && !file.isFile) return ProbeOutcome(null, ProbeFail.NOT_RUNNABLE)
+        val proc = try {
+            ProcessBuilder(cmd, "--version")
+                .redirectErrorStream(true)
+                .start()
+        } catch (e: Exception) {
+            // 无执行权限/不可执行格式等都在进程启动期抛 IOException
+            return ProbeOutcome(null, ProbeFail.NOT_RUNNABLE)
         }
-        if (proc.exitValue() != 0) return null
-        proc.inputStream.bufferedReader().readLine()?.trim()?.takeIf { it.isNotBlank() }
-    }.getOrNull()
+        if (!proc.waitFor(PROBE_TIMEOUT_SEC, TimeUnit.SECONDS)) {
+            proc.destroyForcibly()
+            return ProbeOutcome(null, ProbeFail.TIMEOUT)
+        }
+        if (proc.exitValue() != 0) return ProbeOutcome(null, ProbeFail.NOT_RUNNABLE)
+        val first = runCatching { proc.inputStream.bufferedReader().readLine() }.getOrNull()
+            ?.trim()?.takeIf { it.isNotBlank() }
+        return if (first != null) ProbeOutcome(first, null)
+        else ProbeOutcome(null, ProbeFail.BAD_OUTPUT)
+    }
+
+    companion object {
+        /**
+         * 版本探测超时（秒）。yt-dlp 官方单文件是 PyInstaller 打包，冷启动要先
+         * 解压到临时目录，首跑常超 3 秒（用户真机 yt-dlp_macos 即如此），故放宽
+         * 到 10 秒；ffmpeg 是原生二进制启动快，维持其自家的 3 秒、两边独立。
+         */
+        private const val PROBE_TIMEOUT_SEC = 10L
+
+        /** 常见安装路径（POSIX；与 FfmpegSupport.COMMON_PATHS 同清单、仅工具名不同） */
+        private val COMMON_PATHS = listOf(
+            "/opt/homebrew/bin/yt-dlp",
+            "/usr/local/bin/yt-dlp",
+            "/usr/bin/yt-dlp"
+        )
+
+        /** 手动路径填成目录时，在其中找可执行文件的名字顺序 */
+        private val MANUAL_EXE_NAMES = listOf("yt-dlp", "yt-dlp_macos", "yt-dlp.exe")
+    }
 }

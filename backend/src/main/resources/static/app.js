@@ -1129,6 +1129,12 @@ async function refreshFfmpegCard() {
     box.style.display = '';
     manual.style.display = '';
   }
+  // 手动路径填了但没生效时，后端会给出具体原因（路径不存在/无法运行等），原样展示
+  const diag = document.getElementById('ffmpegManualDiag');
+  if (diag) {
+    if (st.manualHint) { diag.textContent = '手动路径未生效：' + st.manualHint; diag.style.display = ''; }
+    else diag.style.display = 'none';
+  }
 }
 async function ffmpegInstall() {
   const btn = document.getElementById('ffmpegInstallBtn');
@@ -1516,7 +1522,7 @@ async function downloadYoutubePlaylist() {
 
 // ---------- yt-dlp（设置页工具卡，照 ffmpeg 卡模式；命名模板预设） ----------
 let ytdlpState = undefined; // undefined=未拉取，否则为 {available, version, path, source}
-const YTD_SOURCE_TEXT = { manual: '手动指定路径', app: '本应用托管安装', path: '系统 PATH' };
+const YTD_SOURCE_TEXT = { manual: '手动指定路径', app: '本应用托管安装', path: '系统 PATH', system: '系统安装路径' };
 async function fetchYtdlpState(force) {
   if (ytdlpState !== undefined && !force) return ytdlpState;
   const r = await api('/api/youtube/ytdlp');
@@ -1543,6 +1549,12 @@ async function refreshYtdlpCard() {
     manual.style.display = '';
     if (updBox) updBox.style.display = 'none';
     if (updHint) updHint.style.display = 'none';
+  }
+  // 手动路径填了但没生效时，后端会给出具体原因（路径不存在/无法运行等），原样展示
+  const diag = document.getElementById('ytdlpManualDiag');
+  if (diag) {
+    if (st.manualHint) { diag.textContent = '手动路径未生效：' + st.manualHint; diag.style.display = ''; }
+    else diag.style.display = 'none';
   }
 }
 async function ytdlpInstall() { await ytdlpDoInstall(false); }
