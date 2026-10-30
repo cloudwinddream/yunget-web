@@ -88,6 +88,8 @@ enum class Platform(val id: String, val displayName: String, val loginType: Stri
 
 private const val SESSION_TTL_MS = 30L * 60 * 1000
 private const val MAX_FOLDER_FILES = 5000
+/** 夸克/UC 个人盘列表单页条数（listCloudAll 按此翻页取全） */
+private const val CLOUD_PAGE_SIZE = 100
 
 data class ResolveSession(
     val id: String,
@@ -185,19 +187,7 @@ class NetdiskService(
         // 光鸭业务 API 的 did 头：同步取登录设备的 deviceId 缓存（照上游 GuangYaAccountRepository 的注入方式）
         guangyaApi.deviceIdProvider = { guangyaCachedDeviceId }
         // 迅雷 401 自动刷新（pan 请求内部使用）
-        xunleiApi.refreshTokenProvider = { deviceId ->
-            val acc = accounts.get("xunlei")
-            if (acc == null || acc.xunleiRefreshToken.isBlank()) null
-            else {
-                val nt = xunleiApi.refreshToken(acc.xunleiRefreshToken, deviceId)
-                if (nt != null) {
-                    accounts.update("xunlei") {
-                        it.copy(xunleiAccessToken = nt.first, xunleiRefreshToken = nt.second)
-                    }
-                }
-                nt
-            }
-        }
+        xunleiApi.refreshTokenProvider = { deviceId -> refreshXunleiTokens(deviceId) }
         // 过期会话清理
         scope.launch {
             while (true) {
@@ -205,6 +195,46 @@ class NetdiskService(
                 val now = System.currentTimeMillis()
                 sessions.entries.removeIf { now - it.value.createdAt > SESSION_TTL_MS }
             }
+        }
+    }
+
+    /**
+     * 迅雷 refresh_token 换新令牌并回存 AccountStore（刷新结果的持久化只有这一处实现）：
+     * init 里注入 XunleiApi.refreshTokenProvider（pan 请求 401 被动刷新）与
+     * wireXunleiAuth 的令牌过期预刷新共用。
+     * @return 新 (access_token, refresh_token)；无账号 / 无 refresh token / 刷新失败返回 null
+     */
+    private suspend fun refreshXunleiTokens(deviceId: String): Pair<String, String>? {
+        val acc = accounts.get("xunlei") ?: return null
+        if (acc.xunleiRefreshToken.isBlank()) return null
+        val nt = xunleiApi.refreshToken(acc.xunleiRefreshToken, deviceId)
+        if (nt != null) {
+            accounts.update("xunlei") {
+                it.copy(xunleiAccessToken = nt.first, xunleiRefreshToken = nt.second)
+            }
+        }
+        return nt
+    }
+
+    /**
+     * 迅雷 pan 调用前的状态播种（幂等，每次调用前重复执行无副作用）：
+     * XunleiApi 的 currentUserId / currentAccessToken / refreshedCaptcha 都是进程内状态、冷启动后全空；
+     * 分享解析链路靠 XunleiResolveRepository.access() 调 cacheUserId 播种 user_id，
+     * 而账号页容量查询（quota）此前从不播种——冷启动只开账号页时，panCall 需要重初始化 captcha 时
+     * meta.user_id 为空只能拿到降级 token，access_token 又恰好过期时容量必然失败
+     * （token 新鲜时 about 接口可直接放行，所以表现为「刚登录时正常、过期后必现」）。
+     * 这里补齐两样：
+     * ① 把账号 access_token 的 JWT sub 缓存进 XunleiApi（cacheUserId 自身只在为空时写入，重复调用无副作用）；
+     * ② access_token 已过期（或 30 秒内到期）时先走既有刷新+回存，让 getQuota 一开始就用新鲜令牌，
+     *    避免 panCall 仅有的一次重试预算被 captcha_invalid 分支抢占、轮不到 401 刷新分支。
+     */
+    private suspend fun wireXunleiAuth() {
+        val acc = accounts.get("xunlei") ?: return
+        val token = acc.xunleiAccessToken.takeIf { it.isNotBlank() } ?: return
+        xunleiApi.cacheUserId(token)
+        val expMs = xunleiApi.jwtExp(token) * 1000L
+        if (expMs > 0 && expMs <= System.currentTimeMillis() + 30_000L) {
+            refreshXunleiTokens(XunleiDeviceFingerprint.deviceId())
         }
     }
 
@@ -237,11 +267,16 @@ class NetdiskService(
             Platform.PAN123 -> pan123Api.getQuota(
                 acc?.token?.takeIf { it.isNotBlank() } ?: throw IllegalStateException("未登录")
             )
-            Platform.XUNLEI -> xunleiApi.getQuota(
-                acc?.xunleiAccessToken?.takeIf { it.isNotBlank() }
-                    ?: throw IllegalStateException("未登录"),
-                XunleiDeviceFingerprint.deviceId(), ""
-            )
+            Platform.XUNLEI -> {
+                // 先播种 user_id 并按需预刷新令牌（冷启动只开账号页时 pan 的 captcha/401 恢复链才完整）
+                wireXunleiAuth()
+                xunleiApi.getQuota(
+                    // 预刷新可能已换新令牌，重新读账号取当前值
+                    accounts.get("xunlei")?.xunleiAccessToken?.takeIf { it.isNotBlank() }
+                        ?: throw IllegalStateException("未登录"),
+                    XunleiDeviceFingerprint.deviceId(), ""
+                )
+            }
             // 蓝奏云未提供容量接口（上游同样无此能力）
             Platform.LANZOU -> throw IllegalStateException("蓝奏云不提供容量查询")
             Platform.ILANZOU -> ilanzouApi.getQuota(
@@ -719,6 +754,113 @@ class NetdiskService(
     suspend fun pan115Share(id: String): ShareInfo {
         val cookie = credentialOf(Platform.PAN115)
         return pan115Api.createShare(listOf(id), "-1", cookie)
+    }
+
+    // ---------- 夸克 / UC：个人盘（Cookie 登录，__puus 会话刷新走 freshCookieAsync，与分享链路一致） ----------
+
+    /** 云盘列表分页取全：单页 100 条，翻到不满一页为止（上限 100 页防异常死循环） */
+    private suspend fun listCloudAll(fetch: suspend (page: Int) -> List<ShareFile>?): List<ShareFile> {
+        val all = mutableListOf<ShareFile>()
+        var page = 1
+        while (page <= 100) {
+            val items = fetch(page) ?: break
+            all += items
+            if (items.size < CLOUD_PAGE_SIZE) break
+            page++
+        }
+        return all
+    }
+
+    suspend fun quarkDriveList(dirFid: String): List<ShareFile> {
+        val cookie = freshCookieAsync(Platform.QUARK)
+        val pdir = dirFid.ifBlank { "0" }
+        return listCloudAll { page -> quarkApi.listCloudFiles(pdir, cookie, page = page, size = CLOUD_PAGE_SIZE) }
+    }
+
+    suspend fun quarkDriveDownload(fid: String, fname: String): Long {
+        val cookie = freshCookieAsync(Platform.QUARK)
+        val link = quarkApi.getDownloadLink(fid, cookie)
+            ?: throw IllegalStateException("夸克未返回下载地址")
+        return downloadService.enqueue(
+            url = link.downloadUrl,
+            fileName = link.filename.ifBlank { fname },
+            headers = downloadHeaders(Platform.QUARK, link, cookie),
+            size = link.size,
+            platform = "quark",
+            resumeKey = "src-quark-$fid-${link.size}"
+        )
+    }
+
+    suspend fun quarkCreateFolder(parentId: String, name: String): String {
+        val cookie = freshCookieAsync(Platform.QUARK)
+        return quarkApi.createFolder(name, parentId.ifBlank { "0" }, cookie)
+            ?: throw IllegalStateException("创建夸克文件夹失败")
+    }
+
+    suspend fun quarkRename(isDir: Boolean, id: String, name: String) {
+        // 夸克重命名是文件/文件夹统一接口（按 fid），不区分 isDir
+        val cookie = freshCookieAsync(Platform.QUARK)
+        if (!quarkApi.renameFile(id, name, cookie)) throw IllegalStateException("重命名失败，请稍后重试")
+    }
+
+    suspend fun quarkDelete(isDir: Boolean, id: String) {
+        // 删除是异步任务，接口受理即算成功（接口层失败会在 parseData 抛错透传）
+        val cookie = freshCookieAsync(Platform.QUARK)
+        quarkApi.deleteFile(id, cookie)
+    }
+
+    suspend fun quarkShare(id: String, fname: String): ShareInfo {
+        val cookie = freshCookieAsync(Platform.QUARK)
+        // 固定无提取码 + 永久有效（与 115 个人盘建分享的固定档位做法一致）
+        val shareId = quarkApi.createShare(listOf(id), fname, 1, "", 1, cookie)
+            ?: throw IllegalStateException("生成分享失败，请稍后重试")
+        return quarkApi.getShareInfo(shareId, cookie)
+            ?: throw IllegalStateException("生成分享失败，请稍后重试")
+    }
+
+    suspend fun ucDriveList(dirFid: String): List<ShareFile> {
+        val cookie = freshCookieAsync(Platform.UC)
+        val pdir = dirFid.ifBlank { "0" }
+        return listCloudAll { page -> ucApi.listCloudFiles(pdir, cookie, page = page, size = CLOUD_PAGE_SIZE) }
+    }
+
+    suspend fun ucDriveDownload(fid: String, fname: String): Long {
+        val cookie = freshCookieAsync(Platform.UC)
+        val link = ucApi.cloudGetDownloadLink(fid, cookie)
+            ?: throw IllegalStateException("UC 未返回下载地址")
+        return downloadService.enqueue(
+            url = link.downloadUrl,
+            fileName = link.filename.ifBlank { fname },
+            headers = downloadHeaders(Platform.UC, link, cookie),
+            size = link.size,
+            platform = "uc",
+            resumeKey = "src-uc-$fid-${link.size}"
+        )
+    }
+
+    suspend fun ucCreateFolder(parentId: String, name: String): String {
+        val cookie = freshCookieAsync(Platform.UC)
+        return ucApi.createFolder(name, parentId.ifBlank { "0" }, cookie)
+            ?: throw IllegalStateException("创建 UC 文件夹失败")
+    }
+
+    suspend fun ucRename(isDir: Boolean, id: String, name: String) {
+        // UC 重命名同样是文件/文件夹统一接口（按 fid），不区分 isDir
+        val cookie = freshCookieAsync(Platform.UC)
+        if (!ucApi.renameFile(id, name, cookie)) throw IllegalStateException("重命名失败，请稍后重试")
+    }
+
+    suspend fun ucDelete(isDir: Boolean, id: String) {
+        val cookie = freshCookieAsync(Platform.UC)
+        ucApi.deleteFile(id, cookie)
+    }
+
+    suspend fun ucShare(id: String, fname: String): ShareInfo {
+        val cookie = freshCookieAsync(Platform.UC)
+        val shareId = ucApi.createShare(listOf(id), fname, 1, "", 1, cookie)
+            ?: throw IllegalStateException("生成分享失败，请稍后重试")
+        return ucApi.getShareInfo(shareId, cookie)
+            ?: throw IllegalStateException("生成分享失败，请稍后重试")
     }
 
     // ---------- 解析 ----------

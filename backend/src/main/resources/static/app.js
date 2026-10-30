@@ -57,6 +57,7 @@ async function loadPlatforms() {
         <div class="row" style="margin-top:10px">
           <button class="btn small" onclick="cookieLogin('${p.id}')">保存并验证</button>
           ${(p.id === 'quark' || p.id === 'uc') ? `<button class="btn small" onclick="qrLogin('${p.id}')">扫码登录</button>` : ''}
+          ${p.loggedIn && (p.id === 'quark' || p.id === 'uc') ? `<button class="ghost small" onclick="openDrive('${p.id}')">📂 打开个人盘</button>` : ''}
           ${p.loggedIn ? `<button class="danger small" onclick="logout('${p.id}')">退出</button>` : ''}
         </div>`;
     } else if (p.id === 'lanzou') {
@@ -1002,9 +1003,10 @@ function openDrive(platform) {
   document.querySelector('nav.tabs button[data-tab="drive"]').click();
 }
 
-// ---------- 网盘文件（个人盘：蓝奏云 / 蓝奏云优享版 / 光鸭云盘 / 115 网盘） ----------
+// ---------- 网盘文件（个人盘：蓝奏云 / 蓝奏云优享版 / 光鸭云盘 / 115 网盘 / 夸克 / UC） ----------
 const DRIVE_PLATFORMS = [
-  ['lanzou', '蓝奏云'], ['ilanzou', '蓝奏云优享版'], ['guangya', '光鸭云盘'], ['pan115', '115 网盘']
+  ['lanzou', '蓝奏云'], ['ilanzou', '蓝奏云优享版'], ['guangya', '光鸭云盘'], ['pan115', '115 网盘'],
+  ['quark', '夸克网盘'], ['uc', 'UC 网盘']
 ];
 let drivePlatform = 'lanzou';
 let driveStack = [{ fid: '', name: '根目录' }];
