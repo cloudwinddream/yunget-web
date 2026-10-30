@@ -863,6 +863,78 @@ class NetdiskService(
             ?: throw IllegalStateException("生成分享失败，请稍后重试")
     }
 
+    // ---------- 迅雷：个人盘（access_token 登录；令牌管道与容量/分享链路完全同款） ----------
+
+    /**
+     * 迅雷个人盘操作前置：未登录抛个人盘统一的友好提示；已登录先经 wireXunleiAuth 播种 user_id
+     * 并按需预刷新令牌，再重读账号取当前 access_token（预刷新可能刚换新，照 quota 的取法）。
+     * captcha 与分享链路一致传空串：panCall 内部靠 refreshedCaptcha 状态与
+     * captcha_invalid / 401 分支重新 init 自愈，不需要调用方预取。
+     */
+    private suspend fun xunleiToken(): String {
+        credentialOf(Platform.XUNLEI) // 未登录时抛「请先登录迅雷网盘」
+        wireXunleiAuth()
+        return accounts.get("xunlei")?.xunleiAccessToken?.takeIf { it.isNotBlank() }
+            ?: throw IllegalStateException("请先登录迅雷网盘")
+    }
+
+    suspend fun xunleiDriveList(dirFid: String): List<ShareFile> {
+        val token = xunleiToken()
+        // 根目录 parent_id 为空串（getFiles 注释与 ensureTempDir 的既有用法一致），前端根 fid 也是空串、原样透传；
+        // getFiles 内置 filters={"trashed":{"eq":false}}，回收站条目不会混入列表。
+        // 注意：上游 getFiles 固定 limit=50 且不暴露 page_token，单次调用即其全部分页语义。
+        return xunleiApi.getFiles(dirFid, token, XunleiDeviceFingerprint.deviceId(), "")
+            ?: throw IllegalStateException("获取迅雷文件列表失败，请稍后重试")
+    }
+
+    suspend fun xunleiDriveDownload(fid: String, fname: String): Long {
+        val token = xunleiToken()
+        // 直链抽取与分享下载完全一致：getFileDetail 内部 links.application/octet-stream 优先、web_content_link 兜底
+        val link = xunleiApi.getFileDetail(fid, token, XunleiDeviceFingerprint.deviceId(), "")
+            ?: throw IllegalStateException("迅雷未返回下载地址")
+        if (link.downloadUrl.isBlank()) throw IllegalStateException("迅雷未返回下载地址")
+        return downloadService.enqueue(
+            url = link.downloadUrl,
+            fileName = link.filename.ifBlank { fname },
+            headers = downloadHeaders(Platform.XUNLEI, link, token),
+            size = link.size,
+            platform = "xunlei",
+            resumeKey = "src-xunlei-$fid-${link.size}"
+        )
+    }
+
+    suspend fun xunleiCreateFolder(parentId: String, name: String): String {
+        val token = xunleiToken()
+        return xunleiApi.createFolder(name, parentId, token, XunleiDeviceFingerprint.deviceId(), "")
+            ?: throw IllegalStateException("创建迅雷文件夹失败")
+    }
+
+    suspend fun xunleiRename(isDir: Boolean, id: String, name: String) {
+        // 迅雷重命名是文件/文件夹统一接口（按 id PATCH），不区分 isDir（与夸克同款）
+        val token = xunleiToken()
+        if (!xunleiApi.renameFile(id, name, token, XunleiDeviceFingerprint.deviceId(), "")) {
+            throw IllegalStateException("重命名失败，请稍后重试")
+        }
+    }
+
+    suspend fun xunleiDelete(isDir: Boolean, id: String) {
+        // deleteFiles 是 batchTrash 进回收站（可恢复），与其它网盘个人盘删除语义一致；
+        // 不用 batchDelete——那是分享链路清理转存临时文件的永久删除
+        val token = xunleiToken()
+        if (!xunleiApi.deleteFiles(listOf(id), token, XunleiDeviceFingerprint.deviceId(), "")) {
+            throw IllegalStateException("删除失败，请稍后重试")
+        }
+    }
+
+    suspend fun xunleiShare(id: String, fname: String): ShareInfo {
+        val token = xunleiToken()
+        // 固定永久有效（expiration_days="-1"，与 115 个人盘建分享的固定档位一致），提取码由服务端自动生成并随响应返回
+        val info = xunleiApi.createShare(listOf(id), fname, "-1", token, XunleiDeviceFingerprint.deviceId(), "")
+            ?: throw IllegalStateException("生成分享失败，请稍后重试")
+        if (info.shareUrl.isBlank()) throw IllegalStateException("生成分享失败，请稍后重试")
+        return info
+    }
+
     // ---------- 解析 ----------
 
     private fun credentialOf(p: Platform): String {

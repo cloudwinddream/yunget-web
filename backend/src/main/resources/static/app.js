@@ -104,6 +104,7 @@ async function loadPlatforms() {
         <label>密码</label><input type="password" id="p-xunlei">
         <div class="row" style="margin-top:10px">
           <button class="btn small" onclick="xunleiLogin()">密码登录</button>
+          ${p.loggedIn ? `<button class="ghost small" onclick="openDrive('xunlei')">📂 打开个人盘</button>` : ''}
           ${p.loggedIn ? `<button class="danger small" onclick="logout('xunlei')">退出</button>` : ''}
         </div>
         <div style="margin-top:14px;border-top:1px dashed #e5e7eb;padding-top:10px">
@@ -1074,10 +1075,10 @@ function openDrive(platform) {
   document.querySelector('nav.tabs button[data-tab="drive"]').click();
 }
 
-// ---------- 网盘文件（个人盘：蓝奏云 / 蓝奏云优享版 / 光鸭云盘 / 115 网盘 / 夸克 / UC） ----------
+// ---------- 网盘文件（个人盘：蓝奏云 / 蓝奏云优享版 / 光鸭云盘 / 115 网盘 / 夸克 / UC / 迅雷） ----------
 const DRIVE_PLATFORMS = [
   ['lanzou', '蓝奏云'], ['ilanzou', '蓝奏云优享版'], ['guangya', '光鸭云盘'], ['pan115', '115 网盘'],
-  ['quark', '夸克网盘'], ['uc', 'UC 网盘']
+  ['quark', '夸克网盘'], ['uc', 'UC 网盘'], ['xunlei', '迅雷网盘']
 ];
 let drivePlatform = 'lanzou';
 let driveStack = [{ fid: '', name: '根目录' }];

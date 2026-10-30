@@ -279,7 +279,7 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
         }
 
 
-        // ---------- 个人盘文件（蓝奏云 / 蓝奏云优享版 / 光鸭云盘 / 115 网盘 / 夸克 / UC） ----------
+        // ---------- 个人盘文件（蓝奏云 / 蓝奏云优享版 / 光鸭云盘 / 115 网盘 / 夸克 / UC / 迅雷） ----------
 
         get("/drive/{platform}/list") {
             val platform = call.parameters["platform"] ?: return@get call.respond(fail("缺少平台参数"))
@@ -292,6 +292,7 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
                     "pan115" -> netdisk.pan115DriveList(dirFid)
                     "quark" -> netdisk.quarkDriveList(dirFid)
                     "uc" -> netdisk.ucDriveList(dirFid)
+                    "xunlei" -> netdisk.xunleiDriveList(dirFid)
                     else -> return@get call.respond(fail("该平台暂不支持网盘文件管理"))
                 }
                 call.respond(ok(files.map { it.toItem() }))
@@ -311,6 +312,7 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
                     "pan115" -> netdisk.pan115DriveDownload(req.fid, req.fname, req.fidToken)
                     "quark" -> netdisk.quarkDriveDownload(req.fid, req.fname)
                     "uc" -> netdisk.ucDriveDownload(req.fid, req.fname)
+                    "xunlei" -> netdisk.xunleiDriveDownload(req.fid, req.fname)
                     else -> return@post call.respond(fail("该平台暂不支持网盘文件管理"))
                 }
                 call.respond(ok(mapOf("taskId" to id)))
@@ -331,6 +333,7 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
                     "pan115" -> netdisk.pan115CreateFolder(req.parentId, req.name.trim())
                     "quark" -> netdisk.quarkCreateFolder(req.parentId, req.name.trim())
                     "uc" -> netdisk.ucCreateFolder(req.parentId, req.name.trim())
+                    "xunlei" -> netdisk.xunleiCreateFolder(req.parentId, req.name.trim())
                     else -> return@post call.respond(fail("该平台暂不支持网盘文件管理"))
                 }
                 call.respond(ok(mapOf("folderId" to id)))
@@ -351,6 +354,7 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
                     "pan115" -> netdisk.pan115Rename(req.isDir, req.id, req.name.trim())
                     "quark" -> netdisk.quarkRename(req.isDir, req.id, req.name.trim())
                     "uc" -> netdisk.ucRename(req.isDir, req.id, req.name.trim())
+                    "xunlei" -> netdisk.xunleiRename(req.isDir, req.id, req.name.trim())
                     else -> return@post call.respond(fail("该平台暂不支持网盘文件管理"))
                 }
                 call.respond(ok(mapOf("renamed" to true)))
@@ -370,6 +374,7 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
                     "pan115" -> netdisk.pan115Delete(req.id, req.pdirFid)
                     "quark" -> netdisk.quarkDelete(req.isDir, req.id)
                     "uc" -> netdisk.ucDelete(req.isDir, req.id)
+                    "xunlei" -> netdisk.xunleiDelete(req.isDir, req.id)
                     else -> return@post call.respond(fail("该平台暂不支持网盘文件管理"))
                 }
                 call.respond(ok(mapOf("deleted" to true)))
@@ -389,6 +394,7 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
                     "pan115" -> netdisk.pan115Share(req.id)
                     "quark" -> netdisk.quarkShare(req.id, req.fname)
                     "uc" -> netdisk.ucShare(req.id, req.fname)
+                    "xunlei" -> netdisk.xunleiShare(req.id, req.fname)
                     else -> return@post call.respond(fail("该平台暂不支持网盘文件管理"))
                 }
                 call.respond(
