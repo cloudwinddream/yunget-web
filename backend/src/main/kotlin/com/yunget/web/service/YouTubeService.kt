@@ -380,10 +380,21 @@ class YouTubeService(
                 headers = f.http_headers
             )
         }
-        fun subMap(m: Map<String, List<YtSubJson>>): Map<String, List<YtSub>> =
-            m.mapValues { (_, tracks) ->
-                tracks.filter { it.url.isNotBlank() }.map { YtSub(it.url, it.ext, it.name) }
-            }.filterValues { it.isNotEmpty() }
+        fun subMap(m: Map<String, List<YtSubJson>>): Map<String, List<YtSub>> {
+            // 入库即归一化语言键：兜底客户端返回的自动字幕键可能拼入轨道 ID
+            // （如 zh-CN-1oijpNB9Fqw），不洗净会污染 DTO 语言与字幕文件名。
+            // 多个原始键归一到同一干净键时合并轨道，「原始键恰等于干净键」的
+            // 条目（官方/原轨）整体排前，保证 pickVtt 的队首优先语义不变。
+            val merged = LinkedHashMap<String, MutableList<YtSub>>()
+            val ordered = m.entries.sortedBy { (raw, _) -> if (normalizeLangKey(raw) == raw) 0 else 1 }
+            for ((raw, tracksJson) in ordered) {
+                val tracks = tracksJson.filter { it.url.isNotBlank() }
+                    .map { YtSub(it.url, it.ext, it.name) }
+                if (tracks.isEmpty()) continue
+                merged.getOrPut(normalizeLangKey(raw)) { mutableListOf() }.addAll(tracks)
+            }
+            return merged
+        }
         return YtVideoInfo(
             id = j.id,
             title = j.title,
@@ -610,6 +621,25 @@ class YouTubeService(
 
     private fun pickVtt(tracks: List<YtSub>): YtSub? =
         tracks.firstOrNull { it.ext == "vtt" } ?: tracks.firstOrNull()
+
+    /**
+     * 语言键归一化（入库时用）：按 `-` 分段保留 BCP-47 形状的前缀——主段恒保留，
+     * 其后子段仅当「纯字母且 ≤5 字符」或「纯数字且 ≤4 字符」才保留，遇到第一个
+     * 不合规子段即截断（其后全丢），以剥掉兜底客户端拼进键里的轨道 ID
+     * （zh-CN-1oijpNB9Fqw → zh-CN；zh-Hant-HK、es-419、sl-rozaj-biske 不受影响）。
+     * 结果为空（原键为空等极端情况）时退回 sanitizeLangKey(原键)，保证不丢轨。
+     */
+    private fun normalizeLangKey(raw: String): String {
+        val parts = raw.split('-')
+        val kept = mutableListOf(parts.first())
+        for (seg in parts.drop(1)) {
+            val ok = (seg.isNotEmpty() && seg.all { it.isLetter() } && seg.length <= 5) ||
+                (seg.isNotEmpty() && seg.all { it.isDigit() } && seg.length <= 4)
+            if (!ok) break
+            kept += seg
+        }
+        return kept.joinToString("-").ifBlank { sanitizeLangKey(raw) }
+    }
 
     /** 字幕语言键进文件名前的清洗（en-orig、zh-Hans 这类键只保留安全字符） */
     private fun sanitizeLangKey(lang: String): String =
