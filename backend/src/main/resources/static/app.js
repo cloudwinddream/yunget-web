@@ -269,6 +269,18 @@ async function parseShare() {
   const pwd = document.getElementById('sharePwd').value.trim();
   hideMsg('parseMsg');
   if (!link) { showMsg('parseMsg', '请粘贴分享链接', false); return; }
+  // 磁力链接不走网盘解析：交给 Gopeed 引擎，创建成功后自动切到下载任务页
+  if (/^magnet:\?/i.test(link) || link.toLowerCase().includes('magnet:?xt=urn:btih:')) {
+    const mbtn = document.getElementById('parseBtn');
+    mbtn.disabled = true; mbtn.textContent = '创建中…';
+    try {
+      const r = await api('/api/gopeed/tasks', 'POST', { url: link });
+      if (!r.ok) { showMsg('parseMsg', r.message || '磁力任务创建失败', false); return; }
+      showMsg('parseMsg', '磁力任务已创建', true);
+      document.querySelector('nav.tabs button[data-tab="tasks"]').click();
+    } finally { mbtn.disabled = false; mbtn.textContent = '解析'; }
+    return;
+  }
   const btn = document.getElementById('parseBtn');
   btn.disabled = true; btn.textContent = '解析中…';
   try {
@@ -475,6 +487,7 @@ async function batchDelete(batchId, withFile, btn) {
   loadTasks();
 }
 async function loadTasks() {
+  loadGopeedCard();
   const r = await api('/api/tasks');
   if (!r.ok) return;
   const list = r.data;
@@ -536,6 +549,114 @@ async function taskDel(id) {
   loadTasks();
 }
 
+// ---------- Gopeed 磁力任务 ----------
+const GOPEED_STATUS_TXT = { ready: '准备中', running: '下载中', wait: '等待中', pause: '已暂停', error: '失败', done: '已完成' };
+async function gopeedStatus() {
+  const r = await api('/api/gopeed/status');
+  return r.ok ? r.data : null;
+}
+async function loadGopeedCard() {
+  const body = document.getElementById('gopeedBody');
+  if (!body) return;
+  const st = await gopeedStatus();
+  if (!st) { body.innerHTML = '<p class="hint">Gopeed 状态获取失败</p>'; return; }
+  if (!st.installed) {
+    body.innerHTML = `<div class="hint">Gopeed 内核未安装，磁力下载不可用。<button class="ghost small" style="margin-left:8px" onclick="gotoSettings()">去设置</button></div>`;
+    return;
+  }
+  if (!st.running) {
+    body.innerHTML = `<div class="hint">Gopeed 引擎未启动${st.version ? '（内核 ' + escapeHtml(st.version) + '）' : ''}，磁力任务暂不可用。<button class="ghost small" style="margin-left:8px" onclick="gotoSettings()">去设置</button></div>`;
+    return;
+  }
+  const r = await api('/api/gopeed/tasks');
+  if (!r.ok) { body.innerHTML = `<div class="hint">${escapeHtml(r.message || '磁力任务加载失败')}</div>`; return; }
+  const list = r.data || [];
+  if (!list.length) { body.innerHTML = '<div class="empty">暂无磁力任务</div>'; return; }
+  body.innerHTML = '';
+  list.forEach(t => body.appendChild(renderGopeedTask(t)));
+}
+function renderGopeedTask(t) {
+  const d = document.createElement('div');
+  d.className = 'task';
+  const pct = t.total > 0 ? Math.min(100, Math.round(t.downloaded * 100 / t.total)) : 0;
+  const bar = t.status === 'done' ? 'done' : (t.status === 'error' ? 'fail' : '');
+  let actions = '';
+  if (t.status === 'running' || t.status === 'ready' || t.status === 'wait') actions += `<button class="ghost small" onclick="gopeedTaskOp('${t.id}','pause')">暂停</button>`;
+  if (t.status === 'pause' || t.status === 'error') actions += `<button class="ghost small" onclick="gopeedTaskOp('${t.id}','continue')">继续</button>`;
+  actions += `<button class="danger small" onclick="gopeedTaskDel('${t.id}')">删除</button>`;
+  d.innerHTML = `
+      <div class="trow">
+        <div class="tbody">
+          <div class="name">🧲 ${escapeHtml(t.name || '磁力任务')}</div>
+          <div class="pbar ${bar}"><div style="width:${t.status === 'done' ? 100 : pct}%"></div></div>
+          <div class="meta">
+            <span class="status">${GOPEED_STATUS_TXT[t.status] || t.status}</span>
+            <span>${fmtSize(t.downloaded)} / ${fmtSize(t.total)}${t.total > 0 && t.status !== 'done' ? ' · ' + pct + '%' : ''}</span>
+            ${t.status === 'running' && t.speed > 0 ? `<span>${fmtSpeed(t.speed)}</span>` : ''}
+          </div>
+          <div class="actions">${actions}</div>
+        </div>
+      </div>`;
+  return d;
+}
+async function gopeedTaskOp(id, op) { await api(`/api/gopeed/tasks/${encodeURIComponent(id)}/${op}`, 'POST'); loadTasks(); }
+async function gopeedTaskDel(id) { await api(`/api/gopeed/tasks/${encodeURIComponent(id)}`, 'DELETE'); loadTasks(); }
+function gotoSettings() { document.querySelector('nav.tabs button[data-tab="settings"]').click(); }
+
+// ---------- Gopeed 设置 ----------
+async function loadGopeedStatus() {
+  const el = document.getElementById('gopeedStatus');
+  if (!el) return;
+  const st = await gopeedStatus();
+  if (!st) { el.textContent = '状态获取失败'; return; }
+  const plat = `${st.os}-${st.arch}`;
+  el.textContent = !st.installed
+    ? `未安装（本机 ${plat}）`
+    : st.running
+      ? `运行中 · 内核 ${st.version || '未知版本'}（本机 ${plat}）`
+      : `已安装 ${st.version || ''}，未运行（本机 ${plat}）`;
+  document.getElementById('gpInstall').disabled = st.installed;
+  document.getElementById('gpStart').disabled = !st.installed || st.running;
+  document.getElementById('gpStop').disabled = !st.running;
+  document.getElementById('gpUninstall').disabled = !st.installed || st.running;
+}
+function setGopeedBtnsDisabled(dis) {
+  ['gpInstall', 'gpStart', 'gpStop', 'gpUninstall'].forEach(id => {
+    const b = document.getElementById(id);
+    if (b) b.disabled = dis;
+  });
+}
+async function gopeedInstall() {
+  hideMsg('gopeedMsg');
+  showMsg('gopeedMsg', '正在从 Gopeed 官方下载并安装内核（约 20MB），请稍候…', true);
+  setGopeedBtnsDisabled(true);
+  const r = await api('/api/gopeed/install', 'POST', {});
+  showMsg('gopeedMsg', r.ok ? '内核安装完成，点「启动」即可使用磁力下载' : (r.message || '安装失败'), r.ok);
+  loadGopeedStatus();
+}
+async function gopeedStart() {
+  hideMsg('gopeedMsg');
+  setGopeedBtnsDisabled(true);
+  const r = await api('/api/gopeed/start', 'POST', {});
+  showMsg('gopeedMsg', r.ok ? '引擎已启动' : (r.message || '启动失败'), r.ok);
+  loadGopeedStatus();
+}
+async function gopeedStop() {
+  hideMsg('gopeedMsg');
+  setGopeedBtnsDisabled(true);
+  const r = await api('/api/gopeed/stop', 'POST', {});
+  showMsg('gopeedMsg', r.ok ? '引擎已停止' : (r.message || '停止失败'), r.ok);
+  loadGopeedStatus();
+}
+async function gopeedUninstall() {
+  if (!confirm('卸载 Gopeed 内核？已下载的磁力任务记录会保留（在引擎存储里），重装内核后可继续。')) return;
+  hideMsg('gopeedMsg');
+  setGopeedBtnsDisabled(true);
+  const r = await api('/api/gopeed/uninstall', 'POST', {});
+  showMsg('gopeedMsg', r.ok ? '内核已卸载' : (r.message || '卸载失败'), r.ok);
+  loadGopeedStatus();
+}
+
 // ---------- 设置 ----------
 // 设置页平台分组（组标题 + 组内条目渲染；存取仍走 platformConnections/platformConcurrentTasks 两张表）
 const PLATFORM_GROUPS = [
@@ -574,6 +695,7 @@ async function loadSettings() {
   document.getElementById('setAutoRetryMax').value = s.autoRetryMax ?? 10;
   document.getElementById('setQuarkNoSave').checked = s.quarkNoSave !== false;
   document.getElementById('setDir').value = s.downloadDir || '';
+  loadGopeedStatus();
 }
 async function saveSettings() {
   hideMsg('setMsg');

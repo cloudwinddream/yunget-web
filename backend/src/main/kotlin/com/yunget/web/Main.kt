@@ -5,6 +5,7 @@ import com.yunget.web.model.ApiResult
 import com.yunget.web.routes.apiRoutes
 import com.yunget.web.service.AccountStore
 import com.yunget.web.service.DownloadService
+import com.yunget.web.service.GopeedService
 import com.yunget.web.service.HistoryStore
 import com.yunget.web.service.NetdiskService
 import io.ktor.http.HttpStatusCode
@@ -51,17 +52,18 @@ fun main() {
     val accounts = AccountStore(dataDir)
     val downloads = DownloadService(dataDir)
     val netdisk = NetdiskService(accounts, downloads, HistoryStore(dataDir))
+    val gopeed = GopeedService(dataDir, downloads)
 
     Runtime.getRuntime().addShutdownHook(Thread {
         runCatching { downloads.shutdown() }
     })
 
     embeddedServer(Netty, port = port, host = "0.0.0.0") {
-        module(netdisk, downloads)
+        module(netdisk, downloads, gopeed)
     }.start(wait = true)
 }
 
-fun Application.module(netdisk: NetdiskService, downloads: DownloadService) {
+fun Application.module(netdisk: NetdiskService, downloads: DownloadService, gopeed: GopeedService) {
     install(ContentNegotiation) {
         json(Json { ignoreUnknownKeys = true; explicitNulls = false; encodeDefaults = true })
     }
@@ -80,6 +82,6 @@ fun Application.module(netdisk: NetdiskService, downloads: DownloadService) {
     routing {
         // 前端静态页
         staticResources("/", "static", index = "index.html")
-        apiRoutes(netdisk, downloads)
+        apiRoutes(netdisk, downloads, gopeed)
     }
 }

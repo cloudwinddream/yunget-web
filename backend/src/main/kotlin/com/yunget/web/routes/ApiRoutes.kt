@@ -9,6 +9,7 @@ import com.yunget.web.model.DriveFolderRequest
 import com.yunget.web.model.DriveItemRequest
 import com.yunget.web.model.DriveRenameRequest
 import com.yunget.web.model.CookieLoginRequest
+import com.yunget.web.model.GopeedCreateTaskRequest
 import com.yunget.web.model.DirListResponse
 import com.yunget.web.model.QrStatusResponse
 import com.yunget.web.model.DirectDownloadRequest
@@ -25,6 +26,7 @@ import com.yunget.web.model.XunleiSmsRequest
 import com.yunget.web.model.fail
 import com.yunget.web.model.ok
 import com.yunget.web.service.DownloadService
+import com.yunget.web.service.GopeedService
 import com.yunget.web.service.NetdiskService
 import com.yunget.web.service.Platform
 import com.yunget.web.service.QrLoginService
@@ -43,8 +45,10 @@ import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.put
 import io.ktor.server.routing.route
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
-fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService) {
+fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed: GopeedService) {
     route("/api") {
 
         // ---------- 平台与账号 ----------
@@ -516,6 +520,105 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService) {
                 call.respond(ok(downloads.settingsForDisplay()))
             } catch (e: Exception) {
                 call.respond(fail(e.message ?: "恢复默认设置失败"))
+            }
+        }
+
+        // ---------- Gopeed 磁力引擎 ----------
+        // GopeedService 全部是阻塞调用（进程托管 + 同步 HTTP），统一在 IO 调度器上执行
+        get("/gopeed/status") {
+            try {
+                call.respond(ok(withContext(Dispatchers.IO) { gopeed.status() }))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "获取 Gopeed 状态失败"))
+            }
+        }
+
+        post("/gopeed/install") {
+            try {
+                // 同步下载官方内核包（约 20MB），耗时取决于网速
+                val st = withContext(Dispatchers.IO) { gopeed.install() }
+                call.respond(ok(st))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "安装 Gopeed 内核失败"))
+            }
+        }
+
+        post("/gopeed/start") {
+            try {
+                withContext(Dispatchers.IO) { gopeed.start() }
+                call.respond(ok(withContext(Dispatchers.IO) { gopeed.status() }))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "启动 Gopeed 失败"))
+            }
+        }
+
+        post("/gopeed/stop") {
+            try {
+                withContext(Dispatchers.IO) { gopeed.stop() }
+                call.respond(ok(withContext(Dispatchers.IO) { gopeed.status() }))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "停止 Gopeed 失败"))
+            }
+        }
+
+        post("/gopeed/uninstall") {
+            try {
+                val st = withContext(Dispatchers.IO) { gopeed.uninstall() }
+                call.respond(ok(st))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "卸载 Gopeed 内核失败"))
+            }
+        }
+
+        get("/gopeed/tasks") {
+            try {
+                call.respond(ok(withContext(Dispatchers.IO) { gopeed.listTasks() }))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "获取磁力任务失败"))
+            }
+        }
+
+        post("/gopeed/tasks") {
+            try {
+                val req = call.receive<GopeedCreateTaskRequest>()
+                if (req.url.isBlank()) {
+                    call.respond(fail("链接不能为空"))
+                    return@post
+                }
+                val id = withContext(Dispatchers.IO) { gopeed.createTask(req.url.trim(), req.name.trim()) }
+                call.respond(ok(mapOf("id" to id)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "创建磁力任务失败"))
+            }
+        }
+
+        post("/gopeed/tasks/{id}/pause") {
+            val id = call.parameters["id"] ?: return@post call.respond(fail("缺少任务 ID"))
+            try {
+                withContext(Dispatchers.IO) { gopeed.pauseTask(id) }
+                call.respond(ok(mapOf("done" to true)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "暂停失败"))
+            }
+        }
+
+        post("/gopeed/tasks/{id}/continue") {
+            val id = call.parameters["id"] ?: return@post call.respond(fail("缺少任务 ID"))
+            try {
+                withContext(Dispatchers.IO) { gopeed.continueTask(id) }
+                call.respond(ok(mapOf("done" to true)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "继续失败"))
+            }
+        }
+
+        delete("/gopeed/tasks/{id}") {
+            val id = call.parameters["id"] ?: return@delete call.respond(fail("缺少任务 ID"))
+            try {
+                withContext(Dispatchers.IO) { gopeed.deleteTask(id) }
+                call.respond(ok(mapOf("done" to true)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "删除失败"))
             }
         }
 

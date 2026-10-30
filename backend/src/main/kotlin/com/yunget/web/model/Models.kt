@@ -83,6 +83,33 @@ data class DirectDownloadRequest(
     val headers: Map<String, String> = emptyMap()
 )
 
+/** Gopeed 磁力引擎状态（设置页/任务页共用） */
+@Serializable
+data class GopeedStatusResponse(
+    val installed: Boolean,
+    val running: Boolean,
+    val version: String = "",
+    val os: String,
+    val arch: String
+)
+
+/** Gopeed 任务的归一化视图（字段映射见 GopeedService.listTasks） */
+@Serializable
+data class GopeedTaskView(
+    val id: String,
+    val name: String,
+    val total: Long,
+    val downloaded: Long,
+    val speed: Long,
+    val status: String
+)
+
+@Serializable
+data class GopeedCreateTaskRequest(
+    val url: String,
+    val name: String = ""
+)
+
 @Serializable
 data class TaskInfo(
     val id: Long,
