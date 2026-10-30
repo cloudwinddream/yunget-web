@@ -166,3 +166,6 @@ table.files tr.dir:hover td { background: #f6f9ff; }
 .vhead .vmeta { min-width: 0; }
 .vhead .vtext { font-size: 13px; color: #555; white-space: pre-wrap; word-break: break-word; margin-top: 4px; }
 #videoList .vck, #githubList .vck { width: 16px; height: 16px; flex-shrink: 0; }
+/* YouTube 字幕多选区（v1.0.30） */
+.subs { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 4px 0; }
+.subck { font-size: 13px; display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }

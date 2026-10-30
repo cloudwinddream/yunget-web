@@ -71,6 +71,8 @@ class VideoService(
     private data class VideoSession(
         val id: String,
         val result: VideoParseResult,
+        /** 作品 ID（识别阶段的 DetectedVideoLink.id，如 B站 BV 号；命名模板 {id} 用） */
+        val workId: String = "",
         val createdAt: Long = System.currentTimeMillis()
     )
 
@@ -96,7 +98,7 @@ class VideoService(
         }
         if (result.medias.isEmpty()) throw IllegalStateException("没有解析到可下载的媒体")
         val id = UUID.randomUUID().toString()
-        videoSessions[id] = VideoSession(id, result)
+        videoSessions[id] = VideoSession(id, result, workId = detected.id)
         return VideoParseResponse(
             sessionId = id,
             platform = result.platform.name,
@@ -110,7 +112,8 @@ class VideoService(
                 VideoMediaItemDto(
                     index = i,
                     kind = m.kind.name,
-                    fileName = m.fileName.ifBlank { fileNameOf(m.url) },
+                    // 展示名与下载落盘名同源：都走命名模板渲染（见 renderedName）
+                    fileName = renderedName(result, detected.id, i, m),
                     size = m.size,
                     quality = m.quality,
                     isHls = m.isHls,
@@ -118,6 +121,36 @@ class VideoService(
                 )
             }
         )
+    }
+
+    /**
+     * 按设置里的命名模板渲染一条媒体的最终文件名（基名走 [VideoNaming] 渲染 +
+     * 解析器原名的扩展名另拼）。解析响应展示与下载入队共用此函数，保证两处一致；
+     * 模板在两次调用之间被改动时，以下载时刻的设置为准（设置即时生效的既有语义）。
+     */
+    private fun renderedName(result: VideoParseResult, workId: String, index: Int, m: VideoMedia): String {
+        val rawName = m.fileName.ifBlank { fileNameOf(m.url) }
+        val vars = VideoNaming.Vars(
+            title = result.title,
+            author = result.author,
+            id = workId,
+            platform = result.platform.name,
+            quality = m.quality,
+            date = VideoNaming.formatDate(result.timestampSeconds),
+            index = index + 1
+        )
+        val base = VideoNaming.renderBase(downloadService.settings.videoNameTemplate, vars, rawName)
+        val ext = mediaExt(rawName, m.url)
+        return if (ext.isNotBlank()) "$base.$ext" else base
+    }
+
+    /** 扩展名：优先解析器原名里的，其次媒体 URL 路径里的；形态不像扩展名（1–5 位字母数字）则放弃 */
+    private fun mediaExt(rawName: String, url: String): String {
+        fun sane(s: String): String? {
+            val e = s.lowercase()
+            return if (e.length in 1..5 && e.all { it.isLetterOrDigit() }) e else null
+        }
+        return sane(rawName.substringAfterLast('.', "")) ?: sane(url.substringBefore('?').substringAfterLast('.', "")) ?: ""
     }
 
     /**
@@ -196,7 +229,8 @@ class VideoService(
         val ids = mutableListOf<Long>()
         for (i in wanted) {
             val m = s.result.medias.getOrNull(i) ?: continue
-            val name = m.fileName.ifBlank { fileNameOf(m.url) }
+            // 最终文件名走命名模板渲染（与解析响应展示同源，见 renderedName）
+            val name = renderedName(s.result, s.workId, i, m)
             if (m.audioUrl.isNotBlank() && canMux) {
                 ids += enqueueMuxPair(m, name)
                 continue

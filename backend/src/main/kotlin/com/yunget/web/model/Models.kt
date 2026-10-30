@@ -146,7 +146,14 @@ data class SettingsData(
     // 夸克免转存下载（登录态）：优先拿分享凭证直取直链，不占本账号空间；失败自动回退转存
     val quarkNoSave: Boolean = true,
     // ffmpeg 可执行文件路径（B站 DASH 分轨合轨用）；留空则按 PATH → 常见安装路径顺序自动探测
-    val ffmpegPath: String = ""
+    val ffmpegPath: String = "",
+    // yt-dlp 可执行文件路径（YouTube 解析用）；留空则按 托管安装 → PATH 顺序自动探测
+    val ytdlpPath: String = "",
+    // yt-dlp 出站代理（YouTube 在部分网络必须走代理，如 http://127.0.0.1:7890）；留空 = 直连
+    val ytdlpProxy: String = "",
+    // 视频下载命名模板（仅作用于视频/YouTube 的标题生成型文件名，网盘保持原名）；
+    // 变量：{title} 标题 {author} 作者 {id} 作品ID {platform} 平台 {quality} 清晰度 {date} 发布日期 {index} 序号（从 1 开始）
+    val videoNameTemplate: String = "{title}"
 )
 
 @Serializable
@@ -295,4 +302,111 @@ data class GitHubDownloadRequest(
     val sessionId: String,
     /** 要下载的条目下标；空 = 全部 */
     val indexes: List<Int> = emptyList()
+)
+
+// ---------- YouTube 解析（yt-dlp 托管工具，v1.0.30） ----------
+
+@Serializable
+data class YtDlpStatusResponse(
+    val available: Boolean,
+    /** yt-dlp 版本（如 2025.10.14）；不可用时为空 */
+    val version: String = "",
+    /** 实际命中的可执行文件路径；不可用时为空 */
+    val path: String = "",
+    /** 命中来源：manual（设置项路径）| app（应用托管安装）| path（系统 PATH）；不可用时为空 */
+    val source: String = ""
+)
+
+@Serializable
+data class YouTubeAccountResponse(
+    /** 是否已保存 Cookie（仅存不校验，YouTube 无轻量校验接口） */
+    val saved: Boolean
+)
+
+@Serializable
+data class YouTubeQualityDto(
+    /** 视频高度（像素）；-1 = 仅音频伪档 */
+    val height: Int,
+    val label: String
+)
+
+@Serializable
+data class YouTubeSubtitleDto(
+    /** 语言键（原样保留，如 zh-Hans / en-orig）；下载时按此键回查字幕轨 */
+    val lang: String,
+    /** 展示名（yt-dlp 给出的轨道名，缺失时回退为语言键） */
+    val name: String,
+    /** true = 自动生成字幕（automatic_captions）；false = 官方/上传字幕 */
+    val auto: Boolean
+)
+
+@Serializable
+data class YouTubeEntryDto(
+    /** 在播放列表中的下标（0 起） */
+    val index: Int,
+    val id: String,
+    val title: String,
+    /** 秒；未知为 -1 */
+    val duration: Long = -1
+)
+
+@Serializable
+data class YouTubeParseResponse(
+    val sessionId: String,
+    /** video | playlist */
+    val kind: String,
+    val title: String,
+    val author: String = "",
+    val cover: String = "",
+    /** 秒；播放列表为 -1 */
+    val duration: Long = -1,
+    /** 可选清晰度档位（降序，末尾可能含「仅音频」伪档）；播放列表为常用档位表 */
+    val qualities: List<YouTubeQualityDto> = emptyList(),
+    val subtitles: List<YouTubeSubtitleDto> = emptyList(),
+    /** 播放列表条目；单视频为空 */
+    val entries: List<YouTubeEntryDto> = emptyList(),
+    /** 格式概览文案（如「共 38 个格式 · 最高 2160p」） */
+    val formatsSummary: String = ""
+)
+
+@Serializable
+data class YouTubeDownloadRequest(
+    val sessionId: String,
+    /** 目标清晰度：0 = 最高；-1 = 仅音频；正数 = 不超过该高度的最优 */
+    val targetHeight: Int = 0,
+    /** 要一并下载的字幕语言键（对应 YouTubeSubtitleDto.lang） */
+    val subLangs: List<String> = emptyList(),
+    /** 是否允许取自动生成字幕（语言键只在 automatic_captions 里时） */
+    val includeAuto: Boolean = false
+)
+
+@Serializable
+data class YouTubeDownloadResponse(
+    val taskIds: List<Long> = emptyList(),
+    /** 非致命提示（如分轨但无 ffmpeg、字幕缺轨等），可能为空 */
+    val note: String = ""
+)
+
+@Serializable
+data class YouTubePlaylistDownloadRequest(
+    val sessionId: String,
+    /** 选中的条目视频 ID（对应 YouTubeEntryDto.id） */
+    val entryIds: List<String> = emptyList(),
+    val targetHeight: Int = 0,
+    val subLangs: List<String> = emptyList(),
+    val includeAuto: Boolean = false
+)
+
+@Serializable
+data class YouTubeEntryResultDto(
+    val id: String,
+    val title: String,
+    val ok: Boolean,
+    val message: String = "",
+    val taskIds: List<Long> = emptyList()
+)
+
+@Serializable
+data class YouTubePlaylistDownloadResponse(
+    val results: List<YouTubeEntryResultDto> = emptyList()
 )

@@ -9,6 +9,7 @@ import com.yunget.web.service.GopeedService
 import com.yunget.web.service.HistoryStore
 import com.yunget.web.service.NetdiskService
 import com.yunget.web.service.VideoService
+import com.yunget.web.service.YouTubeService
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
@@ -55,17 +56,18 @@ fun main() {
     val netdisk = NetdiskService(accounts, downloads, HistoryStore(dataDir))
     val gopeed = GopeedService(dataDir, downloads)
     val video = VideoService(downloads, accounts, dataDir)
+    val youtube = YouTubeService(downloads, accounts, dataDir)
 
     Runtime.getRuntime().addShutdownHook(Thread {
         runCatching { downloads.shutdown() }
     })
 
     embeddedServer(Netty, port = port, host = "0.0.0.0") {
-        module(netdisk, downloads, gopeed, video)
+        module(netdisk, downloads, gopeed, video, youtube)
     }.start(wait = true)
 }
 
-fun Application.module(netdisk: NetdiskService, downloads: DownloadService, gopeed: GopeedService, video: VideoService) {
+fun Application.module(netdisk: NetdiskService, downloads: DownloadService, gopeed: GopeedService, video: VideoService, youtube: YouTubeService) {
     install(ContentNegotiation) {
         json(Json { ignoreUnknownKeys = true; explicitNulls = false; encodeDefaults = true })
     }
@@ -84,6 +86,6 @@ fun Application.module(netdisk: NetdiskService, downloads: DownloadService, gope
     routing {
         // 前端静态页
         staticResources("/", "static", index = "index.html")
-        apiRoutes(netdisk, downloads, gopeed, video)
+        apiRoutes(netdisk, downloads, gopeed, video, youtube)
     }
 }

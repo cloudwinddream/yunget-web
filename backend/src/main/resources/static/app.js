@@ -126,6 +126,7 @@ async function loadPlatforms() {
     if (p.loggedIn && p.id !== 'lanzou') loadQuota(p.id);
   });
   loadBilibiliAccount();
+  loadYoutubeAccount();
 }
 
 // ---------- B站账号（视频高清专用，与网盘账号相互独立） ----------
@@ -161,6 +162,38 @@ async function bilibiliLogout() {
   const r = await api('/api/video/accounts/bilibili', 'DELETE');
   showMsg('msg-bilibili', r.ok ? '已退出 B站登录' : (r.message || '退出失败'), r.ok);
   loadBilibiliAccount();
+}
+
+// ---------- YouTube 账号（Cookie 仅存不校验，解析失败时请更新） ----------
+async function loadYoutubeAccount() {
+  const badge = document.getElementById('ytBadge');
+  if (!badge) return;
+  const r = await api('/api/youtube/account');
+  const clear = document.getElementById('ytClearBtn');
+  if (!r.ok) { badge.textContent = '状态未知'; badge.className = 'badge'; return; }
+  if (r.data.saved) {
+    badge.textContent = '已保存'; badge.className = 'badge on';
+    clear.style.display = '';
+  } else {
+    badge.textContent = '未保存'; badge.className = 'badge';
+    clear.style.display = 'none';
+  }
+}
+async function youtubeSaveCookie() {
+  const v = document.getElementById('ck-youtube').value.trim();
+  hideMsg('msg-youtube');
+  if (!v) { showMsg('msg-youtube', '请先粘贴 Cookie', false); return; }
+  const r = await api('/api/youtube/account', 'POST', { cookie: v });
+  if (r.ok) {
+    showMsg('msg-youtube', 'Cookie 已保存（未校验，解析失败时请更新）', true);
+    document.getElementById('ck-youtube').value = '';
+    loadYoutubeAccount();
+  } else showMsg('msg-youtube', r.message || '保存失败', false);
+}
+async function youtubeClearCookie() {
+  const r = await api('/api/youtube/account', 'DELETE');
+  showMsg('msg-youtube', r.ok ? '已清除 YouTube Cookie' : (r.message || '清除失败'), r.ok);
+  loadYoutubeAccount();
 }
 
 async function loadQuota(id) {
@@ -317,15 +350,18 @@ async function parseShare() {
     } finally { mbtn.disabled = false; mbtn.textContent = '解析'; }
     return;
   }
-  // 视频 / GitHub 链接分流（后端会再校验，识别错了会给出明确报错）
+  // 视频 / GitHub / YouTube 链接分流（后端会再校验，识别错了会给出明确报错）
   const urlHost = (() => { const m = link.match(/https?:\/\/([^/\s]+)/i); return m ? m[1].toLowerCase() : ''; })();
+  const isYoutubeLink = /(^|\.)(youtube\.com|youtube-nocookie\.com)$/.test(urlHost) || urlHost === 'youtu.be';
   const isVideoLink = /(^|\.)(douyin\.com|iesdouyin\.com|kuaishou\.com|bilibili\.com|b23\.tv|bili2233\.cn|acfun\.cn|weibo\.com|weibo\.cn|video\.weibo\.com|xiaohongshu\.com|xhslink\.com|xhslink\.cn|pixiv\.net|chenzhongtech\.com)$/.test(urlHost);
   const isGithubLink = urlHost === 'github.com' || urlHost === 'raw.githubusercontent.com';
-  if (isVideoLink || isGithubLink) {
+  if (isYoutubeLink || isVideoLink || isGithubLink) {
     const vbtn = document.getElementById('parseBtn');
     vbtn.disabled = true; vbtn.textContent = '解析中…';
     try {
-      if (isVideoLink) await parseVideoLink(link); else await parseGithubLink(link);
+      if (isYoutubeLink) await parseYoutubeLink(link);
+      else if (isVideoLink) await parseVideoLink(link);
+      else await parseGithubLink(link);
     } finally { vbtn.disabled = false; vbtn.textContent = '解析'; }
     return;
   }
@@ -336,6 +372,7 @@ async function parseShare() {
     if (!r.ok) { showMsg('parseMsg', r.message || '解析失败', false); return; }
     document.getElementById('videoCard').style.display = 'none';
     document.getElementById('githubCard').style.display = 'none';
+    document.getElementById('youtubeCard').style.display = 'none';
     curSession = r.data.sessionId;
     curHistoryId = r.data.historyId || '';
     curHistoryFav = !!r.data.favorite;
@@ -748,8 +785,12 @@ async function loadSettings() {
   document.getElementById('setQuarkNoSave').checked = s.quarkNoSave !== false;
   document.getElementById('setDir').value = s.downloadDir || '';
   document.getElementById('setFfmpegPath').value = s.ffmpegPath || '';
+  document.getElementById('setYtdlpPath').value = s.ytdlpPath || '';
+  document.getElementById('setYtdlpProxy').value = s.ytdlpProxy || '';
+  document.getElementById('setNameTemplate').value = s.videoNameTemplate || '{title}';
   loadGopeedStatus();
   refreshFfmpegCard();
+  refreshYtdlpCard();
 }
 async function saveSettings() {
   hideMsg('setMsg');
@@ -773,10 +814,13 @@ async function saveSettings() {
     autoRetryMax: Math.max(0, parseInt(document.getElementById('setAutoRetryMax').value) || 0),
     quarkNoSave: document.getElementById('setQuarkNoSave').checked,
     ffmpegPath: document.getElementById('setFfmpegPath').value.trim(),
+    ytdlpPath: document.getElementById('setYtdlpPath').value.trim(),
+    ytdlpProxy: document.getElementById('setYtdlpProxy').value.trim(),
+    videoNameTemplate: document.getElementById('setNameTemplate').value.trim() || '{title}',
     downloadDir: document.getElementById('setDir').value.trim()
   };
   const r = await api('/api/settings', 'PUT', s);
-  if (r.ok) ffmpegState = undefined; // ffmpegPath 可能已变，后端按新值重探，前端缓存同步失效
+  if (r.ok) { ffmpegState = undefined; ytdlpState = undefined; } // 路径可能已变，后端按新值重探，前端缓存同步失效
   showMsg('setMsg', r.ok ? '设置已保存并即时生效' : (r.message || '保存失败'), r.ok);
 }
 
@@ -1110,6 +1154,7 @@ async function parseVideoLink(link) {
   if (!r.ok) { showMsg('parseMsg', r.message || '视频解析失败', false); return; }
   document.getElementById('fileCard').style.display = 'none';
   document.getElementById('githubCard').style.display = 'none';
+  document.getElementById('youtubeCard').style.display = 'none';
   curVideoSession = r.data.sessionId;
   curVideoMedias = r.data.medias || [];
   document.getElementById('videoCard').style.display = 'block';
@@ -1180,6 +1225,7 @@ async function parseGithubLink(link) {
   if (!r.ok) { showMsg('parseMsg', r.message || 'GitHub 解析失败', false); return; }
   document.getElementById('fileCard').style.display = 'none';
   document.getElementById('videoCard').style.display = 'none';
+  document.getElementById('youtubeCard').style.display = 'none';
   curGithubSession = r.data.sessionId;
   document.getElementById('githubCard').style.display = 'block';
   document.getElementById('githubTitle').textContent = r.data.title || 'GitHub';
@@ -1201,3 +1247,191 @@ async function downloadGithubAll() {
   const r = await api('/api/github/download', 'POST', { sessionId: curGithubSession, indexes: [] });
   showMsg('githubMsg', r.ok ? `已提交 ${r.data.taskIds.length} 个下载任务` : (r.message || '提交失败'), r.ok);
 }
+
+// ---------- YouTube 解析（yt-dlp 托管工具路线） ----------
+let curYtSession = null;
+const YT_PLAYLIST_SUB_LANGS = [['zh-Hans', '中文（简体）'], ['zh-Hant', '中文（繁体）'], ['en', 'English'], ['ja', '日本語'], ['ko', '한국어']];
+function fmtDuration(sec) {
+  if (sec === null || sec === undefined || sec < 0) return '';
+  sec = Math.round(sec);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return (h ? h + ':' : '') + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+}
+async function parseYoutubeLink(link) {
+  document.getElementById('fileCard').style.display = 'none';
+  document.getElementById('videoCard').style.display = 'none';
+  document.getElementById('githubCard').style.display = 'none';
+  const r = await api('/api/youtube/parse', 'POST', { link });
+  const card = document.getElementById('youtubeCard');
+  if (!r.ok) {
+    if ((r.message || '').includes('未检测到 yt-dlp')) {
+      // 未装 yt-dlp：显示卡内引导（去设置页一键安装），而不是只报一句错
+      card.style.display = 'block';
+      document.getElementById('ytTitle').textContent = 'YouTube';
+      document.getElementById('ytVideoBox').style.display = 'none';
+      document.getElementById('ytListBox').style.display = 'none';
+      const g = document.getElementById('ytGuide');
+      g.style.display = 'block';
+      g.innerHTML = '<p class="hint" style="color:#b26a00;margin:6px 0">解析 YouTube 需要 yt-dlp（解析器工具），本机尚未安装。到「设置」页「▶️ YouTube 解析（yt-dlp）」卡点「一键安装」即可——下载的是官方单文件二进制，装在应用自己的数据目录里，不改动系统。</p>' +
+        '<button class="btn small" onclick="document.querySelector(\'nav.tabs button[data-tab=&quot;settings&quot;]\').click()">去设置页安装</button>';
+      showMsg('parseMsg', '未检测到 yt-dlp，请先安装', false);
+      return;
+    }
+    card.style.display = 'none';
+    showMsg('parseMsg', r.message || 'YouTube 解析失败', false);
+    return;
+  }
+  document.getElementById('ytGuide').style.display = 'none';
+  curYtSession = r.data.sessionId;
+  card.style.display = 'block';
+  document.getElementById('ytTitle').textContent = r.data.title || 'YouTube';
+  if (r.data.kind === 'playlist') renderYtPlaylist(r.data); else renderYtVideo(r.data);
+  showMsg('parseMsg', '解析成功', true);
+}
+function ytSubsHtml(subs, prefix) {
+  if (!subs || !subs.length) return '<div class="hint">字幕：该视频无字幕</div>';
+  const off = subs.filter(s => !s.auto), auto = subs.filter(s => s.auto);
+  const box = s => `<label class="subck"><input type="checkbox" class="${prefix}-sub" data-lang="${escapeHtml(s.lang)}" data-auto="${s.auto ? 1 : 0}"> ${escapeHtml(s.name || s.lang)}${s.auto ? '（自动生成）' : ''} <span class="hint">${escapeHtml(s.lang)}</span></label>`;
+  let h = '';
+  if (off.length) h += '<div class="hint" style="margin-top:4px">字幕（与视频同名下载，文件名后缀 .语言.vtt）</div><div class="subs">' + off.map(box).join('') + '</div>';
+  if (auto.length) h += '<div class="hint" style="margin-top:4px">自动字幕</div><div class="subs">' + auto.map(box).join('') + '</div>';
+  return h;
+}
+function renderYtVideo(d) {
+  document.getElementById('ytListBox').style.display = 'none';
+  document.getElementById('ytVideoBox').style.display = 'block';
+  const cover = document.getElementById('ytCover');
+  if (d.cover) { cover.src = d.cover; cover.style.display = 'block'; } else cover.style.display = 'none';
+  document.getElementById('ytAuthor').textContent = d.author ? '作者：' + d.author : '';
+  const meta = [fmtDuration(d.duration) ? '时长 ' + fmtDuration(d.duration) : '', d.formatsSummary || ''].filter(Boolean).join(' · ');
+  document.getElementById('ytMeta').textContent = meta;
+  document.getElementById('ytFormatsSummary').textContent = d.formatsSummary || '';
+  document.getElementById('ytQuality').innerHTML =
+    (d.qualities || []).map(q => `<option value="${q.height}">${escapeHtml(q.label)}</option>`).join('') ||
+    '<option value="0">最高画质</option>';
+  document.getElementById('ytSubsBox').innerHTML = ytSubsHtml(d.subtitles, 'yt');
+  hideMsg('ytMsg');
+}
+function ytCollectSubs(prefix) {
+  const boxes = [...document.querySelectorAll('.' + prefix + '-sub:checked')];
+  return { subLangs: boxes.map(c => c.dataset.lang), includeAuto: boxes.some(c => c.dataset.auto === '1') };
+}
+async function downloadYoutube() {
+  const btn = document.getElementById('ytDlBtn');
+  btn.disabled = true;
+  try {
+    const { subLangs, includeAuto } = ytCollectSubs('yt');
+    const r = await api('/api/youtube/download', 'POST', {
+      sessionId: curYtSession,
+      targetHeight: parseInt(document.getElementById('ytQuality').value) || 0,
+      subLangs, includeAuto
+    });
+    if (!r.ok) { showMsg('ytMsg', r.message || '提交下载失败', false); return; }
+    showMsg('ytMsg', `已提交 ${r.data.taskIds.length} 个下载任务` + (r.data.note ? '；' + r.data.note : ''), true);
+  } finally { btn.disabled = false; }
+}
+function renderYtPlaylist(d) {
+  document.getElementById('ytVideoBox').style.display = 'none';
+  document.getElementById('ytListBox').style.display = 'block';
+  document.getElementById('ytListQuality').innerHTML =
+    (d.qualities || []).map(q => `<option value="${q.height}">${escapeHtml(q.label)}</option>`).join('');
+  document.getElementById('ytListSubsBox').innerHTML =
+    '<div class="hint">字幕（逐条解析后按各视频实际有的轨道下载；某条没有所选语言会自动跳过）</div><div class="subs">' +
+    YT_PLAYLIST_SUB_LANGS.map(([lang, name]) =>
+      `<label class="subck"><input type="checkbox" class="ytl-sub" data-lang="${lang}" data-auto="0"> ${name} <span class="hint">${lang}</span></label>`).join('') +
+    '<label class="subck"><input type="checkbox" id="ytListAutoSub"> 无官方字幕时取自动字幕</label></div>';
+  document.getElementById('ytEntryList').innerHTML = (d.entries || []).map(e =>
+    `<div class="drow">
+      <input type="checkbox" class="ytck" data-id="${escapeHtml(e.id)}" checked onchange="updateYtListSel()">
+      <span class="dic">${e.index + 1}</span>
+      <span class="dname">${escapeHtml(e.title)}</span>
+      <span class="dmeta">${fmtDuration(e.duration)}</span>
+    </div>`).join('') || '<div class="empty">列表为空</div>';
+  document.getElementById('ytListResult').innerHTML = '';
+  hideMsg('ytMsg');
+  updateYtListSel();
+}
+function updateYtListSel() {
+  const n = document.querySelectorAll('.ytck:checked').length;
+  document.getElementById('ytListSelInfo').textContent = n ? `已选 ${n} 个` : '';
+  document.getElementById('ytListDlBtn').textContent = `下载所选 (${n})`;
+}
+function toggleYtListAll(on) {
+  document.querySelectorAll('.ytck').forEach(c => { c.checked = on; });
+  updateYtListSel();
+}
+async function downloadYoutubePlaylist() {
+  const entryIds = [...document.querySelectorAll('.ytck:checked')].map(c => c.dataset.id);
+  if (!entryIds.length) { showMsg('ytMsg', '请先勾选要下载的条目', false); return; }
+  const btn = document.getElementById('ytListDlBtn');
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = '逐条解析提交中…';
+  try {
+    const { subLangs } = ytCollectSubs('ytl');
+    const autoEl = document.getElementById('ytListAutoSub');
+    const r = await api('/api/youtube/playlist/download', 'POST', {
+      sessionId: curYtSession,
+      entryIds,
+      targetHeight: parseInt(document.getElementById('ytListQuality').value) || 0,
+      subLangs,
+      includeAuto: !!(autoEl && autoEl.checked)
+    });
+    if (!r.ok) { showMsg('ytMsg', r.message || '提交下载失败', false); return; }
+    const results = r.data.results || [];
+    const okN = results.filter(x => x.ok).length;
+    showMsg('ytMsg', `播放列表提交完成：成功 ${okN} / 失败 ${results.length - okN}（逐条结果见下）`, results.length - okN === 0);
+    document.getElementById('ytListResult').innerHTML = results.map(x =>
+      x.ok
+        ? `<div class="hint" style="color:#137333">✓ ${escapeHtml(x.title)}${x.message ? '：' + escapeHtml(x.message) : ''}</div>`
+        : `<div class="hint" style="color:#b26a00">✗ ${escapeHtml(x.title)}：${escapeHtml(x.message || '失败')}</div>`
+    ).join('');
+  } finally { btn.disabled = false; btn.textContent = old; updateYtListSel(); }
+}
+
+// ---------- yt-dlp（设置页工具卡，照 ffmpeg 卡模式；命名模板预设） ----------
+let ytdlpState = undefined; // undefined=未拉取，否则为 {available, version, path, source}
+const YTD_SOURCE_TEXT = { manual: '手动指定路径', app: '本应用托管安装', path: '系统 PATH' };
+async function fetchYtdlpState(force) {
+  if (ytdlpState !== undefined && !force) return ytdlpState;
+  const r = await api('/api/youtube/ytdlp');
+  ytdlpState = r.ok ? r.data : { available: false };
+  return ytdlpState;
+}
+async function refreshYtdlpCard() {
+  const stEl = document.getElementById('ytdlpStatus');
+  if (!stEl) return;
+  const st = await fetchYtdlpState(true);
+  const box = document.getElementById('ytdlpInstallBox');
+  const manual = document.getElementById('ytdlpManualHint');
+  if (st.available) {
+    stEl.textContent = `已检测到 yt-dlp ${st.version || ''}（来源：${YTD_SOURCE_TEXT[st.source] || st.source || '未知'}）· ${st.path}`;
+    box.style.display = 'none';
+    manual.style.display = 'none';
+  } else {
+    stEl.textContent = '未检测到 yt-dlp';
+    box.style.display = '';
+    manual.style.display = '';
+  }
+}
+async function ytdlpInstall() {
+  const btn = document.getElementById('ytdlpInstallBtn');
+  btn.disabled = true;
+  const oldText = btn.textContent;
+  btn.textContent = '正在下载安装…';
+  hideMsg('ytdlpMsg');
+  try {
+    const r = await api('/api/youtube/ytdlp/install', 'POST', {});
+    if (r.ok) {
+      ytdlpState = r.data;
+      showMsg('ytdlpMsg', 'yt-dlp 安装完成：' + (r.data.version || '') + '（' + (r.data.path || '') + '）', true);
+    } else {
+      showMsg('ytdlpMsg', r.message || '安装失败', false);
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+    refreshYtdlpCard();
+  }
+}
+function setNameTpl(t) { document.getElementById('setNameTemplate').value = t; }

@@ -26,6 +26,8 @@ import com.yunget.web.model.SettingsData
 import com.yunget.web.model.BilibiliLoginRequest
 import com.yunget.web.model.VideoDownloadRequest
 import com.yunget.web.model.VideoParseRequest
+import com.yunget.web.model.YouTubeDownloadRequest
+import com.yunget.web.model.YouTubePlaylistDownloadRequest
 import com.yunget.web.model.XunleiSmsLoginRequest
 import com.yunget.web.model.XunleiSmsRequest
 import com.yunget.web.model.fail
@@ -34,6 +36,7 @@ import com.yunget.web.service.DownloadService
 import com.yunget.web.service.GopeedService
 import com.yunget.web.service.NetdiskService
 import com.yunget.web.service.VideoService
+import com.yunget.web.service.YouTubeService
 import com.yunget.web.service.Platform
 import com.yunget.web.service.QrLoginService
 import io.ktor.http.ContentDisposition
@@ -54,7 +57,7 @@ import io.ktor.server.routing.route
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed: GopeedService, video: VideoService) {
+fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed: GopeedService, video: VideoService, youtube: YouTubeService) {
     route("/api") {
 
         // ---------- 平台与账号 ----------
@@ -710,6 +713,77 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
                 call.respond(ok(mapOf("taskIds" to ids)))
             } catch (e: Exception) {
                 call.respond(fail(e.message ?: "提交下载失败"))
+            }
+        }
+
+        // ---------- YouTube 解析（yt-dlp 托管工具；真实直链只存服务端会话） ----------
+
+        post("/youtube/parse") {
+            try {
+                val req = call.receive<VideoParseRequest>()
+                if (req.link.isBlank()) return@post call.respond(fail("请粘贴 YouTube 链接"))
+                call.respond(ok(withContext(Dispatchers.IO) { youtube.parse(req.link.trim()) }))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "YouTube 解析失败"))
+            }
+        }
+
+        post("/youtube/download") {
+            try {
+                val req = call.receive<YouTubeDownloadRequest>()
+                call.respond(ok(youtube.download(req)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "提交下载失败"))
+            }
+        }
+
+        post("/youtube/playlist/download") {
+            try {
+                val req = call.receive<YouTubePlaylistDownloadRequest>()
+                call.respond(ok(youtube.downloadPlaylist(req)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "提交下载失败"))
+            }
+        }
+
+        // ---------- YouTube 账号（Cookie 仅存不校验，解析失败时请更新） ----------
+
+        get("/youtube/account") {
+            call.respond(ok(youtube.youtubeAccount()))
+        }
+
+        post("/youtube/account") {
+            try {
+                val req = call.receive<CookieLoginRequest>()
+                youtube.saveYoutubeAccount(req.cookie)
+                call.respond(ok(youtube.youtubeAccount()))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "保存 Cookie 失败"))
+            }
+        }
+
+        delete("/youtube/account") {
+            youtube.clearYoutubeAccount()
+            call.respond(ok(youtube.youtubeAccount()))
+        }
+
+        // ---------- yt-dlp 工具（状态 / 一键安装，仿 ffmpeg） ----------
+
+        get("/youtube/ytdlp") {
+            try {
+                call.respond(ok(withContext(Dispatchers.IO) { youtube.ytdlpStatus() }))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "获取 yt-dlp 状态失败"))
+            }
+        }
+
+        post("/youtube/ytdlp/install") {
+            try {
+                // 同步阻塞（下载二进制），包 Dispatchers.IO
+                val st = withContext(Dispatchers.IO) { youtube.installYtdlp() }
+                call.respond(ok(st))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "yt-dlp 安装失败"))
             }
         }
 
