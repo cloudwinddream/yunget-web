@@ -251,8 +251,17 @@ data class VideoParseResponse(
     /** 非致命降级提示（解析器给出，可能为空） */
     val notice: String = "",
     val medias: List<VideoMediaItemDto> = emptyList(),
-    /** 所属列表信息（目前仅 B站合集）；不属于列表或补查失败时为 null */
-    val listInfo: VideoListInfoDto? = null
+    /** 所属合集信息（仅 B站合集）；不属于合集或补查失败时为 null */
+    val listInfo: VideoListInfoDto? = null,
+    /** 分P选集信息（仅 B站多P视频）；与 [listInfo] 独立，可同时存在 */
+    val partsInfo: VideoListInfoDto? = null,
+    /**
+     * true = 链接指定了第 N 集（N>1）但该集取流失败、主下载区已回退为第 1 集，
+     * 前端需醒目提示用户到分P选集区下载第 N 集（见 [requestedPart]）
+     */
+    val partMismatch: Boolean = false,
+    /** 链接 `?p=` 指定的分P序号（已按范围回退）；无分P信息时为 0 */
+    val requestedPart: Int = 0
 )
 
 @Serializable
@@ -267,7 +276,7 @@ data class VideoListEpisodeDto(
 
 @Serializable
 data class VideoListInfoDto(
-    /** 列表类型：season = B站合集 */
+    /** 列表类型：season = B站合集 / parts = B站分P（episodes 的 bvid 为视频本身、index 为分P号） */
     val kind: String,
     val id: Long,
     val title: String,
@@ -283,7 +292,9 @@ data class VideoListInfoDto(
 data class VideoListDownloadRequest(
     val sessionId: String,
     /** 要下载的集序号（对应 VideoListEpisodeDto.index）；空 = 全部 */
-    val indexes: List<Int> = emptyList()
+    val indexes: List<Int> = emptyList(),
+    /** 列表类型：season = B站合集（缺省，兼容旧前端） / parts = B站分P */
+    val kind: String = "season"
 )
 
 @Serializable

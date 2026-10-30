@@ -1155,6 +1155,7 @@ async function ffmpegInstall() {
 
 // ---------- 视频解析 ----------
 let curVideoSession = null, curVideoMedias = [], curVideoList = null;
+let curVideoParts = null, curPartMismatch = false, curRequestedPart = 0;
 async function parseVideoLink(link) {
   const r = await api('/api/video/parse', 'POST', { link });
   if (!r.ok) { showMsg('parseMsg', r.message || '视频解析失败', false); return; }
@@ -1164,6 +1165,9 @@ async function parseVideoLink(link) {
   curVideoSession = r.data.sessionId;
   curVideoMedias = r.data.medias || [];
   curVideoList = r.data.listInfo || null;
+  curVideoParts = r.data.partsInfo || null;
+  curPartMismatch = !!r.data.partMismatch;
+  curRequestedPart = r.data.requestedPart || 0;
   document.getElementById('videoCard').style.display = 'block';
   document.getElementById('videoTitle').textContent = r.data.title || '视频';
   document.getElementById('videoPlat').textContent = r.data.platformName || r.data.platform || '';
@@ -1175,6 +1179,7 @@ async function parseVideoLink(link) {
   await fetchFfmpegState();
   renderVideoList();
   renderSeasonBox();
+  renderPartsBox();
   showMsg('parseMsg', '解析成功', true);
 }
 function renderVideoList() {
@@ -1262,7 +1267,7 @@ async function downloadSeasonSelected() {
   const old = btn.textContent;
   btn.textContent = '逐集解析提交中…';
   try {
-    const r = await api('/api/video/list/download', 'POST', { sessionId: curVideoSession, indexes });
+    const r = await api('/api/video/list/download', 'POST', { sessionId: curVideoSession, indexes, kind: 'season' });
     if (!r.ok) { showMsg('videoMsg', r.message || '合集下载提交失败', false); return; }
     const results = r.data.results || [];
     const okN = results.filter(x => x.ok).length;
@@ -1275,6 +1280,65 @@ async function downloadSeasonSelected() {
         : `<div class="hint" style="color:#b26a00">✗ 第 ${x.index} 集 ${escapeHtml(x.title)}：${escapeHtml(x.message || '失败')}</div>`
     ).join('');
   } finally { btn.disabled = false; btn.textContent = old; updateSeasonSel(); }
+}
+
+// ---------- B站分P（选集：整单勾选批量下载，落「视频总标题」文件夹） ----------
+function renderPartsBox() {
+  const box = document.getElementById('videoPartsBox');
+  const info = curVideoParts;
+  if (!info || !info.episodes || !info.episodes.length) { box.style.display = 'none'; return; }
+  box.style.display = 'block';
+  document.getElementById('videoPartsTitle').textContent = `📺 分P选集：${info.title}（共 ${info.total} P）`;
+  document.getElementById('videoPartsFolder').textContent =
+    info.folder ? `批量下载将保存到下载目录的文件夹：${info.folder}` : '';
+  const mm = document.getElementById('videoPartMismatch');
+  if (curPartMismatch && curRequestedPart > 1) {
+    mm.style.display = 'block';
+    mm.textContent = `⚠️ 当前链接为第 ${curRequestedPart} 集，但主下载区取流失败、已回退为第 1 集；请在本区勾选下载第 ${curRequestedPart} 集`;
+  } else {
+    mm.style.display = 'none';
+    mm.textContent = '';
+  }
+  document.getElementById('videoPartsList').innerHTML = info.episodes.map(e =>
+    `<div class="drow">
+      <input type="checkbox" class="pck" data-i="${e.index}" checked onchange="updatePartsSel()">
+      <span class="dic">${e.index}</span>
+      <span class="dname">${escapeHtml(e.title)}${e.index === info.currentIndex ? ' <span class="badge on">本集</span>' : ''}</span>
+      <span class="dmeta">${e.duration > 0 ? fmtDuration(e.duration) : ''}</span>
+    </div>`).join('');
+  document.getElementById('videoPartsResult').innerHTML = '';
+  updatePartsSel();
+}
+function updatePartsSel() {
+  const n = document.querySelectorAll('.pck:checked').length;
+  document.getElementById('partsSelInfo').textContent = n ? `已选 ${n} 集` : '';
+  document.getElementById('partsDlBtn').textContent = `下载所选 (${n})`;
+}
+function togglePartsAll(on) {
+  document.querySelectorAll('.pck').forEach(c => { c.checked = on; });
+  updatePartsSel();
+}
+async function downloadPartsSelected() {
+  const indexes = [...document.querySelectorAll('.pck:checked')].map(c => parseInt(c.dataset.i));
+  if (!indexes.length) { showMsg('videoMsg', '请先勾选要下载的分P', false); return; }
+  const btn = document.getElementById('partsDlBtn');
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = '逐集取流提交中…';
+  try {
+    const r = await api('/api/video/list/download', 'POST', { sessionId: curVideoSession, indexes, kind: 'parts' });
+    if (!r.ok) { showMsg('videoMsg', r.message || '分P下载提交失败', false); return; }
+    const results = r.data.results || [];
+    const okN = results.filter(x => x.ok).length;
+    showMsg('videoMsg',
+      `分P提交完成：成功 ${okN} / 失败 ${results.length - okN}，文件保存到文件夹「${r.data.folder || ''}」（逐集结果见下）`,
+      results.length - okN === 0);
+    document.getElementById('videoPartsResult').innerHTML = results.map(x =>
+      x.ok
+        ? `<div class="hint" style="color:#137333">✓ 第 ${x.index} 集 ${escapeHtml(x.title)}${x.message ? '：' + escapeHtml(x.message) : ''}</div>`
+        : `<div class="hint" style="color:#b26a00">✗ 第 ${x.index} 集 ${escapeHtml(x.title)}：${escapeHtml(x.message || '失败')}</div>`
+    ).join('');
+  } finally { btn.disabled = false; btn.textContent = old; updatePartsSel(); }
 }
 
 // ---------- GitHub 解析 ----------

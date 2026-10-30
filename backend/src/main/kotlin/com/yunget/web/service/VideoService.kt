@@ -79,6 +79,8 @@ class VideoService(
         val workId: String = "",
         /** 所属 B站合集（web 层补查得到）；非合集视频为 null */
         val season: BilibiliSeason.Info? = null,
+        /** B站分P选集（web 层补查得到，含各分P的 cid）；非多P视频为 null */
+        val parts: BilibiliPart.Info? = null,
         val createdAt: Long = System.currentTimeMillis()
     )
 
@@ -103,26 +105,72 @@ class VideoService(
             throw IllegalStateException(e.userMessage())
         }
         if (result.medias.isEmpty()) throw IllegalStateException("没有解析到可下载的媒体")
-        // B站合集补查（web 层）：上游解析器不建模合集，这里用 view 接口的 ugc_season
-        // 字段补齐整单信息；任何失败都静默降级为普通单视频，绝不拖垮本次解析
-        val season = if (detected.platform == VideoPlatform.BILIBILI) {
-            val bvid = detected.id.takeIf { it.startsWith("BV", ignoreCase = true) }
+        // 链接指定的分P（?p=N）：优先从短链展开后的终址取，其次原始粘贴文本；取不到为 1
+        val requestedPart = partParamOf(detected.url) ?: partParamOf(link) ?: 1
+        // B站列表补查（web 层）：上游解析器不建模合集/分P，这里用同一次 view 接口
+        // 响应同时补齐 ugc_season（合集）与 pages[]（分P）；任何失败都静默降级为
+        // 普通单视频，绝不拖垮本次解析
+        val bvid = if (detected.platform == VideoPlatform.BILIBILI) {
+            detected.id.takeIf { it.startsWith("BV", ignoreCase = true) }
                 ?: result.url.substringAfterLast('/').takeIf { it.startsWith("BV", ignoreCase = true) }
-            if (bvid != null) fetchSeasonInfo(bvid, cookie) else null
         } else null
+        val viewBody = if (bvid != null) fetchBiliViewBody(bvid, cookie) else null
+        val season = viewBody?.let { body ->
+            BilibiliSeason.parse(body, bvid!!) { reason ->
+                println("[season] 合集补查降级（bvid=$bvid）：$reason")
+            }
+        }
+        val parts = viewBody?.let { body ->
+            BilibiliPart.parse(body, bvid!!, requestedPart) { reason ->
+                println("[parts] 分P补查降级（bvid=$bvid）：$reason")
+            }
+        }
         // 标题口径（用户真机实证）：合集成员的 data.title 是总标题，当前集在合集内的
         // episodes[].title 才是该集的真实标题——展示标题与下载文件名的 {title} 都以
         // 它为准（web 层覆盖，解析器不改）；找不到对应集条目（currentIndex=0）或集
         // 标题为空时回退总标题。原始总标题不另设字段保留：合集语境下前端另有合集
         // 区块展示合集名（listInfo.title），语义不丢。
         val currentEp = season?.episodes?.firstOrNull { it.index == season.currentIndex }
-        val effectiveResult = if (currentEp != null && currentEp.title.isNotBlank()) {
+        var effectiveResult = if (currentEp != null && currentEp.title.isNotBlank()) {
             result.copy(title = currentEp.title)
         } else {
             result
         }
+        // 分P主媒体（核心修复）：上游解析器写死取第一个分P（pages[0].cid），链接
+        // 指定第 N 集（N>1）时主媒体必须在 web 层按该分P的 cid 重新取流（配方复刻
+        // 在 BilibiliPart.fetchMedia）；取流失败不拖垮解析——保留第 1 集媒体并置
+        // partMismatch，前端醒目提示改到下方选集区下载第 N 集（不静默给错内容）。
+        // 标题口径与合集一致：主媒体内容确为该分P时（第 1 集天然成立 / 换流成功），
+        // 展示与命名 {title} 改以该分P的 part 标题为准；优先级 分P标题 > 合集集
+        // 标题 > 总标题。换流失败时不覆盖标题，避免把第 1 集的文件误名为第 N 集。
+        var partMismatch = false
+        if (parts != null && bvid != null) {
+            val curPart = parts.parts.firstOrNull { it.index == parts.currentIndex }
+            if (curPart != null) {
+                var mediaIsCurPart = parts.currentIndex == 1
+                if (parts.currentIndex != 1) {
+                    val media = try {
+                        BilibiliPart.fetchMedia(bvid, curPart.cid, cookie, curPart.title, result.title)
+                    } catch (e: Exception) {
+                        println("[parts] 第 ${curPart.index} 分P取流失败（bvid=$bvid）：${e.message}，主媒体回退第 1 集")
+                        null
+                    }
+                    if (media != null) {
+                        effectiveResult = effectiveResult.copy(medias = listOf(media))
+                        mediaIsCurPart = true
+                    } else {
+                        partMismatch = true
+                    }
+                }
+                if (mediaIsCurPart && curPart.title.isNotBlank()) {
+                    effectiveResult = effectiveResult.copy(title = curPart.title)
+                }
+            }
+        }
         val id = UUID.randomUUID().toString()
-        videoSessions[id] = VideoSession(id, effectiveResult, workId = detected.id, season = season)
+        videoSessions[id] = VideoSession(
+            id, effectiveResult, workId = detected.id, season = season, parts = parts
+        )
         return VideoParseResponse(
             sessionId = id,
             platform = effectiveResult.platform.name,
@@ -156,18 +204,37 @@ class VideoService(
                         VideoListEpisodeDto(e.index, e.bvid, e.title, e.duration)
                     }
                 )
-            }
+            },
+            partsInfo = parts?.let { p ->
+                VideoListInfoDto(
+                    kind = "parts",
+                    id = 0,
+                    title = p.title,
+                    folder = p.folder,
+                    total = p.parts.size,
+                    currentIndex = p.currentIndex,
+                    episodes = p.parts.map { e ->
+                        VideoListEpisodeDto(e.index, p.bvid, e.title, e.duration)
+                    }
+                )
+            },
+            partMismatch = partMismatch,
+            requestedPart = parts?.currentIndex ?: 0
         )
     }
 
+    /** 从 URL/文本中提取 B站分P参数 `?p=N`（&p= 亦可）；无或非法返回 null */
+    private fun partParamOf(text: String): Int? =
+        Regex("""[?&]p=(\d+)""").find(text)?.groupValues?.get(1)?.toIntOrNull()?.takeIf { it > 0 }
+
     /**
-     * 补查 B站合集信息：`x/web-interface/view` 的 `data.ugc_season`。请求头照
-     * BilibiliParser.apiHeaders 同款（UA_CHROME + Referer bilibili.com + 已保存的
-     * B站 Cookie 若有）。接口失败 / 不是合集 / 集数不足一律返回 null 并在日志留
-     * 一行原因（静默降级，不影响单视频解析结果）。
+     * 拉取 B站 `x/web-interface/view` 的原始响应体：合集（ugc_season）与分P
+     * （pages[]）共用同一次响应，避免重复请求。请求头照 BilibiliParser.apiHeaders
+     * 同款（UA_CHROME + Referer bilibili.com + 已保存的 B站 Cookie 若有）。
+     * 请求失败返回 null，调用方按无列表信息静默降级（不影响单视频解析结果）。
      */
-    private suspend fun fetchSeasonInfo(bvid: String, cookie: String): BilibiliSeason.Info? {
-        val body = try {
+    private suspend fun fetchBiliViewBody(bvid: String, cookie: String): String? {
+        return try {
             withContext(Dispatchers.IO) {
                 val req = Request.Builder()
                     .url("https://api.bilibili.com/x/web-interface/view?bvid=$bvid")
@@ -177,7 +244,7 @@ class VideoService(
                     .build()
                 HttpClients.apiClient().newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) {
-                        println("[season] 合集补查 HTTP ${resp.code}（bvid=$bvid），按无合集处理")
+                        println("[bili-view] view 补查 HTTP ${resp.code}（bvid=$bvid），按无列表信息处理")
                         null
                     } else {
                         resp.body?.string()
@@ -185,11 +252,8 @@ class VideoService(
                 }
             }
         } catch (e: Exception) {
-            println("[season] 合集补查请求失败（bvid=$bvid）：${e.message}，按无合集处理")
-            return null
-        } ?: return null
-        return BilibiliSeason.parse(body, bvid) { reason ->
-            println("[season] 合集补查降级（bvid=$bvid）：$reason")
+            println("[bili-view] view 补查请求失败（bvid=$bvid）：${e.message}，按无列表信息处理")
+            null
         }
     }
 
@@ -405,6 +469,49 @@ class VideoService(
             }
         }
         return VideoListDownloadResponse(folder = season.folder, results = results)
+    }
+
+    /**
+     * B站分P批量下载：逐个分P**顺序**按其 cid 在 web 层取流（[BilibiliPart.fetchMedia]，
+     * 复刻上游解析器的 playurl 配方：已登录 DASH 高清、否则 durl 单文件），走与单
+     * 视频/合集相同的入队路径（分轨合轨或双文件）。{title} = 该分P的 part 标题
+     * （空则回退视频总标题）、{index} = 分P号；成品统一落到「视频总标题」文件夹
+     * （[BilibiliPart.Info.folder]）。单个分P失败不中断其余，逐条结果聚合返回。
+     */
+    suspend fun downloadPartsList(sessionId: String, indexes: List<Int>): VideoListDownloadResponse {
+        val s = videoSessions[sessionId]
+            ?: throw IllegalStateException("解析会话已过期，请重新解析")
+        val parts = s.parts
+            ?: throw IllegalArgumentException("该视频没有分P列表，无法按分P批量下载")
+        val wanted = if (indexes.isEmpty()) parts.parts
+        else parts.parts.filter { it.index in indexes.toSet() }
+        if (wanted.isEmpty()) throw IllegalArgumentException("请先勾选要下载的分P")
+        val cookie = accounts.get(BILIBILI_KEY)?.cookie?.takeIf { it.isNotBlank() } ?: ""
+        val canMux = ffmpeg.executable(downloadService.settings.ffmpegPath) != null
+        val results = mutableListOf<VideoListEntryResultDto>()
+        for (part in wanted) {
+            try {
+                val m = BilibiliPart.fetchMedia(parts.bvid, part.cid, cookie, part.title, parts.title)
+                // 命名口径：{title} 以该分P的 part 标题为准（与单集 parse 的覆盖一致）
+                val named = s.result.copy(title = part.title.ifBlank { parts.title })
+                val ids = enqueueMedia(named, parts.bvid, part.index - 1, m, relPath = parts.folder, canMux = canMux)
+                val note = when {
+                    m.audioUrl.isBlank() -> ""
+                    canMux -> "分轨下载，完成后自动合轨"
+                    else -> "分轨双文件下载（未检测到 ffmpeg）"
+                }
+                results += VideoListEntryResultDto(
+                    index = part.index, bvid = parts.bvid, title = part.title,
+                    ok = ids.isNotEmpty(), message = note, taskIds = ids
+                )
+            } catch (e: Exception) {
+                results += VideoListEntryResultDto(
+                    index = part.index, bvid = parts.bvid, title = part.title,
+                    ok = false, message = e.message ?: "取流失败"
+                )
+            }
+        }
+        return VideoListDownloadResponse(folder = parts.folder, results = results)
     }
 
     /** 「片名.mp4」→「片名.audio.m4s」；无扩展名时直接追加 */

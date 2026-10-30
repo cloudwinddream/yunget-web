@@ -668,13 +668,19 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
             }
         }
 
-        // B站合集批量下载：逐集顺序解析入队，成品落「合集名」文件夹；逐条结果聚合返回
+        // B站列表批量下载（kind 分发）：season = 合集逐集解析入队、落「合集名」文件夹；
+        // parts = 分P逐个按 cid 取流入队、落「视频总标题」文件夹；逐条结果聚合返回
         post("/video/list/download") {
             try {
                 val req = call.receive<VideoListDownloadRequest>()
-                call.respond(ok(video.downloadSeasonList(req.sessionId, req.indexes)))
+                val resp = if (req.kind == "parts") {
+                    video.downloadPartsList(req.sessionId, req.indexes)
+                } else {
+                    video.downloadSeasonList(req.sessionId, req.indexes)
+                }
+                call.respond(ok(resp))
             } catch (e: Exception) {
-                call.respond(fail(e.message ?: "合集下载提交失败"))
+                call.respond(fail(e.message ?: "列表下载提交失败"))
             }
         }
 
