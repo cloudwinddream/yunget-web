@@ -281,11 +281,25 @@ async function parseShare() {
     } finally { mbtn.disabled = false; mbtn.textContent = '解析'; }
     return;
   }
+  // 视频 / GitHub 链接分流（后端会再校验，识别错了会给出明确报错）
+  const urlHost = (() => { const m = link.match(/https?:\/\/([^/\s]+)/i); return m ? m[1].toLowerCase() : ''; })();
+  const isVideoLink = /(^|\.)(douyin\.com|iesdouyin\.com|kuaishou\.com|bilibili\.com|b23\.tv|bili2233\.cn|acfun\.cn|weibo\.com|weibo\.cn|video\.weibo\.com|xiaohongshu\.com|xhslink\.com|xhslink\.cn|pixiv\.net|chenzhongtech\.com)$/.test(urlHost);
+  const isGithubLink = urlHost === 'github.com' || urlHost === 'raw.githubusercontent.com';
+  if (isVideoLink || isGithubLink) {
+    const vbtn = document.getElementById('parseBtn');
+    vbtn.disabled = true; vbtn.textContent = '解析中…';
+    try {
+      if (isVideoLink) await parseVideoLink(link); else await parseGithubLink(link);
+    } finally { vbtn.disabled = false; vbtn.textContent = '解析'; }
+    return;
+  }
   const btn = document.getElementById('parseBtn');
   btn.disabled = true; btn.textContent = '解析中…';
   try {
     const r = await api('/api/parse', 'POST', { link, pwd });
     if (!r.ok) { showMsg('parseMsg', r.message || '解析失败', false); return; }
+    document.getElementById('videoCard').style.display = 'none';
+    document.getElementById('githubCard').style.display = 'none';
     curSession = r.data.sessionId;
     curHistoryId = r.data.historyId || '';
     curHistoryFav = !!r.data.favorite;
@@ -664,7 +678,9 @@ const PLATFORM_GROUPS = [
     ['quark', '夸克'], ['uc', 'UC'], ['xunlei', '迅雷'],
     ['baidu', '百度'], ['pan123', '123'], ['c139', '139'],
     ['lanzou', '蓝奏云'], ['ilanzou', '优享版'], ['guangya', '光鸭'], ['pan115', '115']
-  ] }
+  ] },
+  { title: '视频', items: [['video', '视频解析']] },
+  { title: '其他', items: [['github', 'GitHub']] }
 ];
 const ALL_PLATFORMS_CONN = PLATFORM_GROUPS.flatMap(g => g.items);
 async function loadSettings() {
@@ -677,7 +693,7 @@ async function loadSettings() {
     `<div class="pgroup-title">${g.title}</div>` + g.items.map(([id, name]) => {
       const v = pc[id] || (id === 'xunlei' ? 8 : 32);
       const note = id === 'xunlei' ? ' <span class="hint">默认 8，可调</span>' : '';
-      return `<div class="connrow"><span class="connname">${name}网盘${note}</span><div class="setctl"><select id="pc-${id}">` +
+      return `<div class="connrow"><span class="connname">${name}${g.title === '网盘' ? '网盘' : ''}${note}</span><div class="setctl"><select id="pc-${id}">` +
         THREAD_OPTS.map(o => `<option value="${o}"${o === v ? ' selected' : ''}>${o}</option>`).join('') +
         `</select><span class="unit">线程</span></div></div>`;
     }).join('')
@@ -997,4 +1013,95 @@ async function driveNewFolder() {
   const r = await api('/api/drive/' + drivePlatform + '/folder', 'POST', { parentId: driveCurFid(), name: name.trim() });
   if (r.ok) { showMsg('driveMsg', '已新建文件夹', true); loadDrive(); }
   else showMsg('driveMsg', r.message || '新建失败', false);
+}
+
+// ---------- 视频解析 ----------
+let curVideoSession = null, curVideoMedias = [];
+async function parseVideoLink(link) {
+  const r = await api('/api/video/parse', 'POST', { link });
+  if (!r.ok) { showMsg('parseMsg', r.message || '视频解析失败', false); return; }
+  document.getElementById('fileCard').style.display = 'none';
+  document.getElementById('githubCard').style.display = 'none';
+  curVideoSession = r.data.sessionId;
+  curVideoMedias = r.data.medias || [];
+  document.getElementById('videoCard').style.display = 'block';
+  document.getElementById('videoTitle').textContent = r.data.title || '视频';
+  document.getElementById('videoPlat').textContent = r.data.platformName || r.data.platform || '';
+  document.getElementById('videoAuthor').textContent = r.data.author ? '作者：' + r.data.author : '';
+  document.getElementById('videoText').textContent = r.data.text || '';
+  document.getElementById('videoNotice').textContent = r.data.notice || '';
+  const cover = document.getElementById('videoCover');
+  if (r.data.cover) { cover.src = r.data.cover; cover.style.display = 'block'; } else cover.style.display = 'none';
+  renderVideoList();
+  showMsg('parseMsg', '解析成功', true);
+}
+function renderVideoList() {
+  const el = document.getElementById('videoList');
+  if (!curVideoMedias.length) { el.innerHTML = '<div class="empty">没有可下载的媒体</div>'; return; }
+  el.innerHTML = curVideoMedias.map(m => {
+    const icon = m.kind === 'IMAGE' ? '🖼️' : m.kind === 'AUDIO' ? '🎵' : '🎬';
+    const tags = [
+      m.quality ? `<span class="badge">${escapeHtml(m.quality)}</span>` : '',
+      m.isHls ? '<span class="badge">HLS</span>' : '',
+      m.needsMux ? '<span class="badge" title="音视频分轨：会生成视频轨与 .audio.m4s 音轨两个文件，需自行合轨">分轨</span>' : ''
+    ].join(' ');
+    return `<div class="drow">
+      <input type="checkbox" class="vck" data-i="${m.index}" checked onchange="updateVideoSel()">
+      <span class="dic">${icon}</span>
+      <span class="dname">${escapeHtml(m.fileName)} ${tags}</span>
+      <span class="dmeta">${m.size > 0 ? fmtSize(m.size) : '大小未知'}</span>
+    </div>`;
+  }).join('');
+  updateVideoSel();
+}
+function updateVideoSel() {
+  const n = document.querySelectorAll('.vck:checked').length;
+  document.getElementById('videoSelInfo').textContent = n ? `已选 ${n} 项` : '';
+}
+function toggleVideoAll(on) {
+  document.querySelectorAll('.vck').forEach(c => { c.checked = on; });
+  updateVideoSel();
+}
+async function downloadVideoSelected() {
+  const indexes = [...document.querySelectorAll('.vck:checked')].map(c => parseInt(c.dataset.i));
+  if (!indexes.length) { showMsg('videoMsg', '请先勾选要下载的媒体', false); return; }
+  const btn = document.getElementById('videoDlBtn');
+  btn.disabled = true;
+  try {
+    const r = await api('/api/video/download', 'POST', { sessionId: curVideoSession, indexes });
+    if (!r.ok) { showMsg('videoMsg', r.message || '提交下载失败', false); return; }
+    showMsg('videoMsg', `已提交 ${r.data.taskIds.length} 个下载任务`, true);
+    if (curVideoMedias.some(m => m.needsMux && indexes.includes(m.index))) {
+      showMsg('videoMsg', '已提交下载；注意：分轨媒体会生成视频轨 + .audio.m4s 音轨两个文件，需自行合轨', true);
+    }
+  } finally { btn.disabled = false; }
+}
+
+// ---------- GitHub 解析 ----------
+let curGithubSession = null;
+async function parseGithubLink(link) {
+  const r = await api('/api/github/parse', 'POST', { link });
+  if (!r.ok) { showMsg('parseMsg', r.message || 'GitHub 解析失败', false); return; }
+  document.getElementById('fileCard').style.display = 'none';
+  document.getElementById('videoCard').style.display = 'none';
+  curGithubSession = r.data.sessionId;
+  document.getElementById('githubCard').style.display = 'block';
+  document.getElementById('githubTitle').textContent = r.data.title || 'GitHub';
+  const kindIcon = k => k === 'zip' ? '🗜️' : k === 'release' ? '📦' : '📄';
+  document.getElementById('githubList').innerHTML = (r.data.items || []).map(it =>
+    `<div class="drow">
+      <span class="dic">${kindIcon(it.kind)}</span>
+      <span class="dname">${escapeHtml(it.name)}</span>
+      <span class="dmeta">${it.size > 0 ? fmtSize(it.size) : '大小未知'}</span>
+      <span class="dacts"><button class="ghost small" onclick="downloadGithubItem(${it.index})">下载</button></span>
+    </div>`).join('') || '<div class="empty">没有可下载的内容</div>';
+  showMsg('parseMsg', '解析成功', true);
+}
+async function downloadGithubItem(index) {
+  const r = await api('/api/github/download', 'POST', { sessionId: curGithubSession, indexes: [index] });
+  showMsg('githubMsg', r.ok ? '已提交下载' : (r.message || '提交失败'), r.ok);
+}
+async function downloadGithubAll() {
+  const r = await api('/api/github/download', 'POST', { sessionId: curGithubSession, indexes: [] });
+  showMsg('githubMsg', r.ok ? `已提交 ${r.data.taskIds.length} 个下载任务` : (r.message || '提交失败'), r.ok);
 }

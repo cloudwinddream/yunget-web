@@ -207,3 +207,70 @@ data class XunleiLoginResponse(
     // 迅雷风控的验证页面（如有），可在浏览器打开完成验证
     val reviewUrl: String = ""
 )
+
+// ---------- 视频解析 / GitHub（v1.0.28） ----------
+
+@Serializable
+data class VideoParseRequest(val link: String)
+
+@Serializable
+data class VideoMediaItemDto(
+    val index: Int,
+    /** VIDEO | IMAGE | AUDIO */
+    val kind: String,
+    val fileName: String,
+    val size: Long,
+    val quality: String = "",
+    val isHls: Boolean = false,
+    /** true = 音视频分轨（B站 DASH），下载会生成视频轨 + 音轨两个任务，需自行合轨 */
+    val needsMux: Boolean = false
+)
+
+@Serializable
+data class VideoParseResponse(
+    val sessionId: String,
+    /** 平台枚举名（DOUYIN / BILIBILI / …） */
+    val platform: String,
+    val platformName: String,
+    val title: String,
+    val author: String = "",
+    val cover: String = "",
+    val text: String = "",
+    /** 非致命降级提示（解析器给出，可能为空） */
+    val notice: String = "",
+    val medias: List<VideoMediaItemDto> = emptyList()
+)
+
+@Serializable
+data class VideoDownloadRequest(
+    val sessionId: String,
+    /** 要下载的媒体下标（对应 VideoMediaItemDto.index）；空 = 全部 */
+    val indexes: List<Int> = emptyList()
+)
+
+@Serializable
+data class GitHubParseRequest(val link: String)
+
+@Serializable
+data class GitHubItemDto(
+    val index: Int,
+    val name: String,
+    /** 字节数；未知为 -1 */
+    val size: Long,
+    /** file | zip | release */
+    val kind: String
+)
+
+@Serializable
+data class GitHubParseResponse(
+    val sessionId: String,
+    val title: String,
+    val items: List<GitHubItemDto> = emptyList()
+)
+
+@Serializable
+data class GitHubDownloadRequest(
+    val sessionId: String,
+    /** 要下载的条目下标；空 = 全部 */
+    val indexes: List<Int> = emptyList()
+)

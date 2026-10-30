@@ -9,6 +9,8 @@ import com.yunget.web.model.DriveFolderRequest
 import com.yunget.web.model.DriveItemRequest
 import com.yunget.web.model.DriveRenameRequest
 import com.yunget.web.model.CookieLoginRequest
+import com.yunget.web.model.GitHubDownloadRequest
+import com.yunget.web.model.GitHubParseRequest
 import com.yunget.web.model.GopeedCreateTaskRequest
 import com.yunget.web.model.DirListResponse
 import com.yunget.web.model.QrStatusResponse
@@ -21,6 +23,8 @@ import com.yunget.web.model.ParseRequest
 import com.yunget.web.model.ParseResponse
 import com.yunget.web.model.PasswordLoginRequest
 import com.yunget.web.model.SettingsData
+import com.yunget.web.model.VideoDownloadRequest
+import com.yunget.web.model.VideoParseRequest
 import com.yunget.web.model.XunleiSmsLoginRequest
 import com.yunget.web.model.XunleiSmsRequest
 import com.yunget.web.model.fail
@@ -28,6 +32,7 @@ import com.yunget.web.model.ok
 import com.yunget.web.service.DownloadService
 import com.yunget.web.service.GopeedService
 import com.yunget.web.service.NetdiskService
+import com.yunget.web.service.VideoService
 import com.yunget.web.service.Platform
 import com.yunget.web.service.QrLoginService
 import io.ktor.http.ContentDisposition
@@ -48,7 +53,7 @@ import io.ktor.server.routing.route
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed: GopeedService) {
+fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed: GopeedService, video: VideoService) {
     route("/api") {
 
         // ---------- 平台与账号 ----------
@@ -619,6 +624,50 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
                 call.respond(ok(mapOf("done" to true)))
             } catch (e: Exception) {
                 call.respond(fail(e.message ?: "删除失败"))
+            }
+        }
+
+
+        // ---------- 视频解析 / GitHub 解析（v1.0.28） ----------
+        // 媒体与文件真实 URL 只存服务端会话，前端按下标回查下载（同网盘会话模式）
+
+        post("/video/parse") {
+            try {
+                val req = call.receive<VideoParseRequest>()
+                if (req.link.isBlank()) return@post call.respond(fail("请粘贴视频链接"))
+                call.respond(ok(video.parseVideo(req.link.trim())))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "视频解析失败"))
+            }
+        }
+
+        post("/video/download") {
+            try {
+                val req = call.receive<VideoDownloadRequest>()
+                val ids = video.downloadVideo(req.sessionId, req.indexes)
+                call.respond(ok(mapOf("taskIds" to ids)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "提交下载失败"))
+            }
+        }
+
+        post("/github/parse") {
+            try {
+                val req = call.receive<GitHubParseRequest>()
+                if (req.link.isBlank()) return@post call.respond(fail("请粘贴 GitHub 链接"))
+                call.respond(ok(video.parseGitHub(req.link.trim())))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "GitHub 解析失败"))
+            }
+        }
+
+        post("/github/download") {
+            try {
+                val req = call.receive<GitHubDownloadRequest>()
+                val ids = video.downloadGitHub(req.sessionId, req.indexes)
+                call.respond(ok(mapOf("taskIds" to ids)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "提交下载失败"))
             }
         }
 
