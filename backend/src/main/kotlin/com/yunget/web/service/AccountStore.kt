@@ -18,7 +18,20 @@ data class AccountData(
     val xunleiAccessToken: String = "",
     val xunleiRefreshToken: String = "",
     val nickname: String = "",
-    val updatedAt: Long = 0L
+    val updatedAt: Long = 0L,
+    // ---- v1.0.26 新增（优享 / 光鸭）：均带默认值，旧 accounts.json 可直接读 ----
+    /** 登录密码（优享 appToken 失效时静默重登用；仅本机存储） */
+    val password: String = "",
+    /** 登录账号名（优享静默重登用；昵称可能与账号名不同，故单列） */
+    val username: String = "",
+    /** 通用 refresh token（光鸭 access token 续期用） */
+    val refreshToken: String = "",
+    /** 设备标识（优享 uuid / 光鸭 deviceId，首次生成后持久化，换设备标识会被风控盯上） */
+    val deviceId: String = "",
+    /** 光鸭设备签名（wdi10.<deviceId><随机尾>，与 deviceId 成对生成、成对持久化） */
+    val deviceSign: String = "",
+    /** 平台侧用户 ID（优享取链的 downloadId 需要 userId） */
+    val userId: String = ""
 )
 
 class AccountStore(dataDir: File) {

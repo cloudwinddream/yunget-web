@@ -39,7 +39,7 @@ document.querySelectorAll('nav.tabs button').forEach(b => {
 
 // ---------- 账号 ----------
 const LOGIN_HINTS = {
-  quark: 'pan.quark.cn', uc: 'drive.uc.cn', baidu: 'pan.baidu.com', c139: 'yun.139.com'
+  quark: 'pan.quark.cn', uc: 'drive.uc.cn', baidu: 'pan.baidu.com', c139: 'yun.139.com', pan115: '115.com'
 };
 async function loadPlatforms() {
   const r = await api('/api/platforms');
@@ -65,10 +65,30 @@ async function loadPlatforms() {
         <label>密码</label><input type="password" id="p-${p.id}">
         <div class="row" style="margin-top:10px">
           <button class="btn small" onclick="pwdLogin('${p.id}')">登录</button>
-          ${p.loggedIn ? `<button class="ghost small" onclick="openDrive()">📂 打开个人盘</button>` : ''}
+          ${p.loggedIn ? `<button class="ghost small" onclick="openDrive('lanzou')">📂 打开个人盘</button>` : ''}
           ${p.loggedIn ? `<button class="danger small" onclick="logout('${p.id}')">退出</button>` : ''}
         </div>
         <div class="hint" style="margin-top:6px">账号密码登录，登录态保存在服务器供个人盘使用；只下分享链接的话无需登录</div>`;
+    } else if (p.id === 'ilanzou') {
+      body = `
+        <label>账号（蓝奏云优享版账号）</label><input type="text" id="u-${p.id}">
+        <label>密码</label><input type="password" id="p-${p.id}">
+        <div class="row" style="margin-top:10px">
+          <button class="btn small" onclick="pwdLogin('${p.id}')">登录</button>
+          ${p.loggedIn ? `<button class="ghost small" onclick="openDrive('ilanzou')">📂 打开个人盘</button>` : ''}
+          ${p.loggedIn ? `<button class="danger small" onclick="logout('${p.id}')">退出</button>` : ''}
+        </div>
+        <div class="hint" style="margin-top:6px">账号密码登录，密码会一并保存：登录令牌失效时自动重新登录续期（appToken 自动续期）；只下分享链接的话无需登录</div>`;
+    } else if (p.id === 'guangya') {
+      body = `
+        <label>账号（手机号/邮箱/用户名）</label><input type="text" id="u-${p.id}">
+        <label>密码</label><input type="password" id="p-${p.id}">
+        <div class="row" style="margin-top:10px">
+          <button class="btn small" onclick="pwdLogin('${p.id}')">登录</button>
+          ${p.loggedIn ? `<button class="ghost small" onclick="openDrive('guangya')">📂 打开个人盘</button>` : ''}
+          ${p.loggedIn ? `<button class="danger small" onclick="logout('${p.id}')">退出</button>` : ''}
+        </div>
+        <div class="hint" style="margin-top:6px">账号密码登录，登录令牌到期会自动续期；只下分享链接的话无需登录</div>`;
     } else if (p.id === 'pan123') {
       body = `
         <label>账号（手机号/邮箱）</label><input type="text" id="u-${p.id}">
@@ -517,27 +537,35 @@ async function taskDel(id) {
 }
 
 // ---------- 设置 ----------
-const PLATFORMS_CONN = [
-  ['quark', '夸克'], ['uc', 'UC'], ['xunlei', '迅雷'],
-  ['baidu', '百度'], ['pan123', '123'], ['c139', '139'],
-  ['lanzou', '蓝奏云']
+// 设置页平台分组（组标题 + 组内条目渲染；存取仍走 platformConnections/platformConcurrentTasks 两张表）
+const PLATFORM_GROUPS = [
+  { title: '网盘', items: [
+    ['quark', '夸克'], ['uc', 'UC'], ['xunlei', '迅雷'],
+    ['baidu', '百度'], ['pan123', '123'], ['c139', '139'],
+    ['lanzou', '蓝奏云'], ['ilanzou', '优享版'], ['guangya', '光鸭'], ['pan115', '115']
+  ] }
 ];
+const ALL_PLATFORMS_CONN = PLATFORM_GROUPS.flatMap(g => g.items);
 async function loadSettings() {
   const r = await api('/api/settings');
   if (!r.ok) return;
   const s = r.data;
   const pc = s.platformConnections || {};
   const THREAD_OPTS = [1, 2, 4, 8, 16, 32, 64, 128, 256];
-  document.getElementById('platformConnRows').innerHTML = PLATFORMS_CONN.map(([id, name]) => {
-    const v = pc[id] || (id === 'xunlei' ? 8 : 32);
-    const note = id === 'xunlei' ? ' <span class="hint">默认 8，可调</span>' : '';
-    return `<div class="connrow"><span class="connname">${name}网盘${note}</span><div class="setctl"><select id="pc-${id}">` +
-      THREAD_OPTS.map(o => `<option value="${o}"${o === v ? ' selected' : ''}>${o}</option>`).join('') +
-      `</select><span class="unit">线程</span></div></div>`;
-  }).join('');
+  document.getElementById('platformConnRows').innerHTML = PLATFORM_GROUPS.map(g =>
+    `<div class="pgroup-title">${g.title}</div>` + g.items.map(([id, name]) => {
+      const v = pc[id] || (id === 'xunlei' ? 8 : 32);
+      const note = id === 'xunlei' ? ' <span class="hint">默认 8，可调</span>' : '';
+      return `<div class="connrow"><span class="connname">${name}网盘${note}</span><div class="setctl"><select id="pc-${id}">` +
+        THREAD_OPTS.map(o => `<option value="${o}"${o === v ? ' selected' : ''}>${o}</option>`).join('') +
+        `</select><span class="unit">线程</span></div></div>`;
+    }).join('')
+  ).join('');
   const pt = s.platformConcurrentTasks || {};
-  document.getElementById('platformConcInputs').innerHTML = PLATFORMS_CONN.map(([id, name]) =>
-    `<span class="pconn"><i>${name}</i><input type="text" id="pt-${id}" inputmode="numeric" placeholder="全局" value="${pt[id] || ''}"></span>`
+  document.getElementById('platformConcInputs').innerHTML = PLATFORM_GROUPS.map(g =>
+    `<div class="pconn-group">${g.title}</div>` + g.items.map(([id, name]) =>
+      `<span class="pconn"><i>${name}</i><input type="text" id="pt-${id}" inputmode="numeric" placeholder="全局" value="${pt[id] || ''}"></span>`
+    ).join('')
   ).join('');
   document.getElementById('setConc').value = s.maxConcurrentTasks;
   document.getElementById('setLimit').value = (s.speedLimitBps / 1048576).toFixed(1);
@@ -550,12 +578,12 @@ async function loadSettings() {
 async function saveSettings() {
   hideMsg('setMsg');
   const platformConnections = {};
-  PLATFORMS_CONN.forEach(([id]) => {
+  ALL_PLATFORMS_CONN.forEach(([id]) => {
     const el = document.getElementById('pc-' + id);
     if (el) platformConnections[id] = parseInt(el.value) || (id === 'xunlei' ? 8 : 32);
   });
   const platformConcurrentTasks = {};
-  PLATFORMS_CONN.forEach(([id]) => {
+  ALL_PLATFORMS_CONN.forEach(([id]) => {
     const v = parseInt(document.getElementById('pt-' + id).value);
     if (v > 0) platformConcurrentTasks[id] = Math.min(64, v);
   });
@@ -741,11 +769,39 @@ function inputCancel() {
   document.getElementById('inputModal').style.display = 'none';
   if (inputResolve) { inputResolve(null); inputResolve = null; }
 }
-function openDrive() { document.querySelector('nav.tabs button[data-tab="drive"]').click(); }
+function openDrive(platform) {
+  if (platform && platform !== drivePlatform) {
+    drivePlatform = platform;
+    driveStack = [{ fid: '', name: '根目录' }];
+  }
+  document.querySelector('nav.tabs button[data-tab="drive"]').click();
+}
 
-// ---------- 网盘文件（蓝奏云个人盘） ----------
+// ---------- 网盘文件（个人盘：蓝奏云 / 蓝奏云优享版 / 光鸭云盘 / 115 网盘） ----------
+const DRIVE_PLATFORMS = [
+  ['lanzou', '蓝奏云'], ['ilanzou', '蓝奏云优享版'], ['guangya', '光鸭云盘'], ['pan115', '115 网盘']
+];
+let drivePlatform = 'lanzou';
 let driveStack = [{ fid: '', name: '根目录' }];
 let driveItems = [];
+function drivePlatformName() {
+  const f = DRIVE_PLATFORMS.find(([id]) => id === drivePlatform);
+  return f ? f[1] : drivePlatform;
+}
+function renderDrivePlatSwitch() {
+  const el = document.getElementById('drivePlatSwitch');
+  if (!el) return;
+  el.innerHTML = DRIVE_PLATFORMS.map(([id, name]) =>
+    `<button class="ghost small${id === drivePlatform ? ' on' : ''}" onclick="setDrivePlatform('${id}')">${name}</button>`).join('');
+}
+function setDrivePlatform(p) {
+  if (p !== drivePlatform) {
+    drivePlatform = p;
+    driveStack = [{ fid: '', name: '根目录' }];
+  }
+  renderDrivePlatSwitch();
+  loadDrive();
+}
 function driveCurFid() { return driveStack[driveStack.length - 1].fid; }
 function renderDriveCrumb() {
   document.getElementById('driveCrumb').innerHTML = driveStack.map((c, i) =>
@@ -757,12 +813,13 @@ function driveRefresh() { loadDrive(); }
 async function loadDrive() {
   const list = document.getElementById('driveList');
   list.innerHTML = '<p class="hint">加载中…</p>';
+  renderDrivePlatSwitch();
   renderDriveCrumb();
   document.getElementById('driveShareBox').innerHTML = '';
-  const r = await api('/api/drive/lanzou/list?dirFid=' + encodeURIComponent(driveCurFid()));
+  const r = await api('/api/drive/' + drivePlatform + '/list?dirFid=' + encodeURIComponent(driveCurFid()));
   if (!r.ok) {
     list.innerHTML = '';
-    showMsg('driveMsg', (r.message || '加载失败') + '（请先在「账号」页登录蓝奏云）', false);
+    showMsg('driveMsg', (r.message || '加载失败') + '（请先在「账号」页登录' + drivePlatformName() + '）', false);
     return;
   }
   hideMsg('driveMsg');
@@ -784,37 +841,38 @@ async function loadDrive() {
 function driveEnter(i) { driveStack.push({ fid: driveItems[i].fid, name: driveItems[i].fname }); loadDrive(); }
 async function driveDownload(i) {
   const f = driveItems[i];
-  const r = await api('/api/drive/lanzou/download', 'POST', { fid: f.fid, fname: f.fname });
+  const r = await api('/api/drive/' + drivePlatform + '/download', 'POST', { fid: f.fid, fname: f.fname, fidToken: f.fidToken || '' });
   if (r.ok) showMsg('driveMsg', '已加入下载：' + f.fname, true);
   else showMsg('driveMsg', r.message || '下载失败', false);
 }
 async function driveShare(i) {
   const f = driveItems[i];
-  const r = await api('/api/drive/lanzou/share', 'POST', { isDir: f.isdir, id: f.fid });
+  const r = await api('/api/drive/' + drivePlatform + '/share', 'POST', { isDir: f.isdir, id: f.fid, fname: f.fname });
   if (!r.ok) { showMsg('driveMsg', r.message || '生成分享失败', false); return; }
   const box = document.getElementById('driveShareBox');
   const txt = r.data.shareUrl + (r.data.passcode ? '  提取码：' + r.data.passcode : '');
-  box.innerHTML = `<div class="sharebox"><span>「${escapeHtml(f.fname)}」分享链接：<b>${escapeHtml(r.data.shareUrl)}</b>${r.data.passcode ? ' · 提取码 <b>' + escapeHtml(r.data.passcode) + '</b>' : ''}</span><span class="row" style="gap:8px"><button class="ghost small" onclick="navigator.clipboard.writeText('${txt.replace(/'/g, "")}').then(()=>showMsg('driveMsg','已复制分享链接',true))">复制</button><button class="ghost small" onclick="document.getElementById('driveShareBox').innerHTML=''">关闭</button></span></div>`;
+  const warn = r.data.warning ? `<div class="hint" style="margin-top:4px">⚠️ ${escapeHtml(r.data.warning)}</div>` : '';
+  box.innerHTML = `<div class="sharebox"><span>「${escapeHtml(f.fname)}」分享链接：<b>${escapeHtml(r.data.shareUrl)}</b>${r.data.passcode ? ' · 提取码 <b>' + escapeHtml(r.data.passcode) + '</b>' : ''}${warn}</span><span class="row" style="gap:8px"><button class="ghost small" onclick="navigator.clipboard.writeText('${txt.replace(/'/g, "")}').then(()=>showMsg('driveMsg','已复制分享链接',true))">复制</button><button class="ghost small" onclick="document.getElementById('driveShareBox').innerHTML=''">关闭</button></span></div>`;
 }
 async function driveRename(i) {
   const f = driveItems[i];
   const name = await askInput('重命名' + (f.isdir ? '文件夹' : '文件'), f.fname);
   if (name === null || !name.trim() || name.trim() === f.fname) return;
-  const r = await api('/api/drive/lanzou/rename', 'POST', { isDir: f.isdir, id: f.fid, name: name.trim() });
+  const r = await api('/api/drive/' + drivePlatform + '/rename', 'POST', { isDir: f.isdir, id: f.fid, name: name.trim() });
   if (r.ok) { showMsg('driveMsg', '已重命名', true); loadDrive(); }
   else showMsg('driveMsg', r.message || '重命名失败', false);
 }
 async function driveDelete(i) {
   const f = driveItems[i];
   if (!confirm('确定删除「' + f.fname + '」？' + (f.isdir ? '文件夹内的文件也会一并删除。' : ''))) return;
-  const r = await api('/api/drive/lanzou/delete', 'POST', { isDir: f.isdir, id: f.fid });
+  const r = await api('/api/drive/' + drivePlatform + '/delete', 'POST', { isDir: f.isdir, id: f.fid, pdirFid: f.pdirFid || '' });
   if (r.ok) { showMsg('driveMsg', '已删除', true); loadDrive(); }
   else showMsg('driveMsg', r.message || '删除失败', false);
 }
 async function driveNewFolder() {
   const name = await askInput('新建文件夹', '');
   if (name === null || !name.trim()) return;
-  const r = await api('/api/drive/lanzou/folder', 'POST', { parentId: driveCurFid(), name: name.trim() });
+  const r = await api('/api/drive/' + drivePlatform + '/folder', 'POST', { parentId: driveCurFid(), name: name.trim() });
   if (r.ok) { showMsg('driveMsg', '已新建文件夹', true); loadDrive(); }
   else showMsg('driveMsg', r.message || '新建失败', false);
 }

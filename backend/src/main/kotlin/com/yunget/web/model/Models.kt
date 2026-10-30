@@ -141,7 +141,7 @@ data class PasswordLoginRequest(val username: String, val password: String)
 
 /** 个人盘文件操作（蓝奏云起步，后续平台共用） */
 @Serializable
-data class DriveDownloadRequest(val fid: String, val fname: String = "")
+data class DriveDownloadRequest(val fid: String, val fname: String = "", val fidToken: String = "")
 
 @Serializable
 data class DriveFolderRequest(val parentId: String = "", val name: String)
@@ -150,7 +150,14 @@ data class DriveFolderRequest(val parentId: String = "", val name: String)
 data class DriveRenameRequest(val isDir: Boolean, val id: String, val name: String)
 
 @Serializable
-data class DriveItemRequest(val isDir: Boolean, val id: String)
+data class DriveItemRequest(
+    val isDir: Boolean,
+    val id: String,
+    /** 文件名（光鸭建分享的标题用；其余平台忽略） */
+    val fname: String = "",
+    /** 父目录 id（115 删除接口需要 pid；其余平台忽略） */
+    val pdirFid: String = ""
+)
 
 @Serializable
 data class XunleiSmsRequest(val mobile: String)

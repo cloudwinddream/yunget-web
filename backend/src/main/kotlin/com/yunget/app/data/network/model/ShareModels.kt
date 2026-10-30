@@ -57,7 +57,9 @@ data class ShareInfo(
     val passcode: String,
     val pwdId: String,
     val title: String,
-    val expiredType: Int
+    val expiredType: Int,
+    /** 附加提示（如 115「分享已创建但有效期设置未生效」）；无提示为 null */
+    val warning: String? = null
 )
 
 /**
