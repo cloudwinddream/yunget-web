@@ -32,6 +32,7 @@ if [ ! -f /tmp/cp.txt ]; then
     "com.squareup.okhttp3:okhttp:4.12.0" \
     "com.squareup.okio:okio-jvm:3.9.0" \
     "org.json:json:20240303" \
+    "org.tukaani:xz:1.9" \
     "org.slf4j:slf4j-simple:2.0.13"
 fi
 

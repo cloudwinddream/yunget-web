@@ -23,6 +23,7 @@ import com.yunget.web.model.ParseRequest
 import com.yunget.web.model.ParseResponse
 import com.yunget.web.model.PasswordLoginRequest
 import com.yunget.web.model.SettingsData
+import com.yunget.web.model.BilibiliLoginRequest
 import com.yunget.web.model.VideoDownloadRequest
 import com.yunget.web.model.VideoParseRequest
 import com.yunget.web.model.XunleiSmsLoginRequest
@@ -648,6 +649,47 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
                 call.respond(ok(mapOf("taskIds" to ids)))
             } catch (e: Exception) {
                 call.respond(fail(e.message ?: "提交下载失败"))
+            }
+        }
+
+        // ---------- B站账号（Cookie 登录，解锁 DASH 高清；存 AccountStore 独立键） ----------
+
+        get("/video/accounts/bilibili") {
+            call.respond(ok(video.bilibiliAccount()))
+        }
+
+        post("/video/accounts/bilibili") {
+            try {
+                val req = call.receive<BilibiliLoginRequest>()
+                if (req.cookie.isBlank()) return@post call.respond(fail("请粘贴 Cookie"))
+                call.respond(ok(video.loginBilibili(req.cookie)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "B站登录失败"))
+            }
+        }
+
+        delete("/video/accounts/bilibili") {
+            video.logoutBilibili()
+            call.respond(ok(video.bilibiliAccount()))
+        }
+
+        // ---------- ffmpeg（B站分轨合轨：状态 / 一键安装） ----------
+
+        get("/video/ffmpeg") {
+            try {
+                call.respond(ok(withContext(Dispatchers.IO) { video.ffmpegStatus() }))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "获取 ffmpeg 状态失败"))
+            }
+        }
+
+        post("/video/ffmpeg/install") {
+            try {
+                // 同步阻塞（下载+解压），照 Gopeed 路由的做法包 Dispatchers.IO
+                val st = withContext(Dispatchers.IO) { video.installFfmpeg() }
+                call.respond(ok(st))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "ffmpeg 安装失败"))
             }
         }
 

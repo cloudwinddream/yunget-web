@@ -4,22 +4,33 @@ import com.yunget.app.data.network.GitHubApi
 import com.yunget.app.data.network.GitHubLinkParser
 import com.yunget.app.data.network.GitHubLinkType
 import com.yunget.app.data.network.HttpClients
+import com.yunget.app.data.network.video.BilibiliParser
 import com.yunget.app.data.network.video.DetectedVideoLink
 import com.yunget.app.data.network.video.VideoHttp
+import com.yunget.app.data.network.video.VideoMedia
 import com.yunget.app.data.network.video.VideoLinkParser
 import com.yunget.app.data.network.video.VideoParseException
 import com.yunget.app.data.network.video.VideoParseResult
 import com.yunget.app.data.network.video.VideoParsers
+import com.yunget.app.data.network.video.VideoPlatform
 import com.yunget.app.data.network.video.userMessage
+import com.yunget.web.model.BilibiliAccountResponse
+import com.yunget.web.model.FfmpegStatusResponse
 import com.yunget.web.model.GitHubItemDto
 import com.yunget.web.model.GitHubParseResponse
 import com.yunget.web.model.VideoMediaItemDto
 import com.yunget.web.model.VideoParseResponse
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.Request
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 private const val SESSION_TTL_MS = 30L * 60 * 1000
 
@@ -30,13 +41,28 @@ private const val SESSION_TTL_MS = 30L * 60 * 1000
  * 与网盘会话同理：解析产出的**真实媒体 URL 与请求头只存服务端**，前端只拿到
  * 会话 ID + 媒体下标，下载时按下标回查，避免直链（多带签名/时效）出现在页面里。
  *
- * - 视频：本期不接视频平台账号，cookie 一律传 ""（需要登录的平台由解析器自己
- *   抛 UNSUPPORTED 并给出可操作提示）；
+ * - 视频：仅 B站接 Cookie 登录（存 AccountStore 的 "bilibili" 键），登录后解析
+ *   BilibiliParser 才会走 DASH 高清分轨；其它平台 cookie 传 ""（需要登录的平台
+ *   由解析器自己抛 UNSUPPORTED 并给出可操作提示）；
+ * - B站 DASH 分轨：检测到 ffmpeg 时两轨下到暂存目录、齐了自动合轨为单个 mp4；
+ *   无 ffmpeg 时维持双文件下载（前端 needsMux 明示）；
  * - GitHub：无 Token 匿名访问（限额 60 次/小时/IP），只处理公开仓库。
  */
 class VideoService(
-    private val downloadService: DownloadService
+    private val downloadService: DownloadService,
+    private val accounts: AccountStore,
+    dataDir: File
 ) {
+
+    private val ffmpeg = FfmpegSupport(dataDir)
+    private val muxScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    companion object {
+        /** AccountStore 中 B站登录态的键（与网盘 Platform 枚举无关，单独存放） */
+        const val BILIBILI_KEY = "bilibili"
+        /** 合轨暂存目录（下载目录下）；两轨先下到这里，合轨成功后清理 */
+        const val MUX_STAGING_DIR = ".yunget-mux"
+    }
 
     // ------------------------------------------------------------------
     // 视频
@@ -59,8 +85,12 @@ class VideoService(
         } ?: throw IllegalArgumentException("无法识别视频链接")
         val parser = VideoParsers.of(detected.platform)
             ?: throw IllegalArgumentException("暂不支持${detected.platform.displayName}")
+        // 仅 B站注入登录 Cookie（解锁 DASH 高清）；其它平台保持匿名
+        val cookie = if (detected.platform == VideoPlatform.BILIBILI) {
+            accounts.get(BILIBILI_KEY)?.cookie?.takeIf { it.isNotBlank() } ?: ""
+        } else ""
         val result = try {
-            parser.parse(detected, cookie = "")
+            parser.parse(detected, cookie = cookie)
         } catch (e: VideoParseException) {
             throw IllegalStateException(e.userMessage())
         }
@@ -106,23 +136,71 @@ class VideoService(
         return detected.takeIf { !it.isShortLink }
     }
 
+    // ------------------------------------------------------------------
+    // B站账号（Cookie 登录，仅用于解锁 DASH 高清；存 AccountStore 独立键）
+    // ------------------------------------------------------------------
+
+    fun bilibiliAccount(): BilibiliAccountResponse {
+        val acc = accounts.get(BILIBILI_KEY)
+        val loggedIn = !acc?.cookie.isNullOrBlank()
+        return BilibiliAccountResponse(
+            loggedIn = loggedIn,
+            nickname = if (loggedIn) acc?.nickname ?: "" else ""
+        )
+    }
+
+    /** 用 BilibiliParser.validateCookie 校验（nav 接口回昵称），通过才保存登录态 */
+    suspend fun loginBilibili(cookie: String): BilibiliAccountResponse {
+        val c = cookie.trim()
+        if (c.isBlank()) throw IllegalArgumentException("请粘贴 Cookie")
+        val nickname = BilibiliParser.validateCookie(c)
+            ?: throw IllegalStateException(
+                "B站 Cookie 校验失败：未登录或 Cookie 已过期（也可能是网络不通），请重新从浏览器复制完整的 Cookie"
+            )
+        accounts.save(BILIBILI_KEY, AccountData(cookie = c, nickname = nickname))
+        return BilibiliAccountResponse(loggedIn = true, nickname = nickname)
+    }
+
+    fun logoutBilibili() {
+        accounts.remove(BILIBILI_KEY)
+    }
+
+    // ------------------------------------------------------------------
+    // ffmpeg（合轨支持：状态查询 / 一键安装，定位逻辑在 FfmpegSupport）
+    // ------------------------------------------------------------------
+
+    fun ffmpegStatus(): FfmpegStatusResponse =
+        ffmpeg.status(downloadService.settings.ffmpegPath)
+
+    /** 同步阻塞（下载安装包），路由层需包 Dispatchers.IO */
+    fun installFfmpeg(): FfmpegStatusResponse =
+        ffmpeg.install(downloadService.settings.ffmpegPath)
+
     /**
      * 按下标把媒体入队下载。返回新建的任务 ID 列表。
      *
      * - HLS 媒体（AcFun 的 m3u8）：URL 原样入队即可——下载引擎里 HLS 插件
      *   （turbo-plugin-hls）的 `HlsBackend.supports` 按「http(s) 且 path 以 .m3u8 结尾」
      *   认领，DownloadService 已装该插件，不需要任何特殊标记；
-     * - DASH 分轨媒体（B站，audioUrl 非空）：本期不合轨，生成两个任务——
-     *   视频轨用原名，音轨名为「原名（去扩展）.audio.m4s」，前端据 needsMux 明示。
+     * - DASH 分轨媒体（B站，audioUrl 非空）：
+     *   - 检测到 ffmpeg：两轨改下到暂存目录 `.yunget-mux/<groupId>`（固定名 v.m4s/a.m4s），
+     *     两边 onComplete 计数、齐了自动合轨成单个 mp4 落到下载目录根（见 [runMux]）；
+     *   - 无 ffmpeg：维持双文件——视频轨用原名，音轨名为「原名（去扩展）.audio.m4s」，
+     *     前端据 needsMux 明示需自行合轨。
      */
     suspend fun downloadVideo(sessionId: String, indexes: List<Int>): List<Long> {
         val s = videoSessions[sessionId]
             ?: throw IllegalStateException("解析会话已过期，请重新解析")
         val wanted = if (indexes.isEmpty()) s.result.medias.indices.toList() else indexes.distinct()
+        val canMux = ffmpeg.executable(downloadService.settings.ffmpegPath) != null
         val ids = mutableListOf<Long>()
         for (i in wanted) {
             val m = s.result.medias.getOrNull(i) ?: continue
             val name = m.fileName.ifBlank { fileNameOf(m.url) }
+            if (m.audioUrl.isNotBlank() && canMux) {
+                ids += enqueueMuxPair(m, name)
+                continue
+            }
             ids += downloadService.enqueue(
                 url = m.url,
                 fileName = name,
@@ -151,6 +229,175 @@ class VideoService(
         val dot = videoName.lastIndexOf('.')
         val base = if (dot > 0) videoName.substring(0, dot) else videoName
         return "$base.audio.m4s"
+    }
+
+    // ------------------------------------------------------------------
+    // DASH 合轨协调（两轨都下完 → ffmpeg -c copy 合成单个 mp4）
+    // ------------------------------------------------------------------
+
+    /**
+     * 一组合轨任务的内存状态。两轨各注册一个 onComplete 回调，[remaining] 倒数到 0
+     * 时由后到者触发合轨。状态只在内存：应用重启即丢失，未完成的两轨会留在暂存
+     * 目录 `.yunget-mux/` 里（设置页合轨卡有提示），不做持久化恢复。
+     * 注意：onComplete 只在任务成功完成时由 DownloadService 调用；某轨永久失败时
+     * 该组永远凑不齐，另一轨留在暂存目录——可接受的降级。
+     */
+    private data class MuxJob(
+        val groupId: String,
+        val finalName: String,
+        val videoTaskId: AtomicLong = AtomicLong(-1),
+        val audioTaskId: AtomicLong = AtomicLong(-1),
+        val remaining: AtomicInteger = AtomicInteger(2)
+    )
+
+    private val muxJobs = ConcurrentHashMap<String, MuxJob>()
+
+    private suspend fun enqueueMuxPair(m: VideoMedia, displayName: String): List<Long> {
+        val groupId = UUID.randomUUID().toString()
+        val rel = "$MUX_STAGING_DIR/$groupId"
+        val job = MuxJob(groupId = groupId, finalName = ensureMp4Name(displayName))
+        muxJobs[groupId] = job
+        val vId = downloadService.enqueue(
+            url = m.url,
+            fileName = "v.m4s",
+            headers = m.headers,
+            size = m.size,
+            platform = "video",
+            resumeKey = "video-mux-$groupId-v",
+            relPath = rel,
+            onComplete = { onMuxTrackComplete(groupId) }
+        )
+        job.videoTaskId.set(vId)
+        val aId = downloadService.enqueue(
+            url = m.audioUrl,
+            fileName = "a.m4s",
+            headers = m.audioHeaders,
+            size = -1,
+            platform = "video",
+            resumeKey = "video-mux-$groupId-a",
+            relPath = rel,
+            onComplete = { onMuxTrackComplete(groupId) }
+        )
+        job.audioTaskId.set(aId)
+        println("[mux] 分轨下载已入队：组 $groupId 视频轨任务 $vId、音轨任务 $aId，合轨目标 ${job.finalName}")
+        return listOf(vId, aId)
+    }
+
+    private fun onMuxTrackComplete(groupId: String) {
+        val job = muxJobs[groupId] ?: return
+        if (job.remaining.decrementAndGet() != 0) return
+        muxJobs.remove(groupId)
+        muxScope.launch { runMux(job) }
+    }
+
+    /** 合轨主体（IO 线程）：成功删两轨；失败保底把两轨移到下载目录根，绝不删源文件 */
+    private fun runMux(job: MuxJob) {
+        val base = downloadService.resolvedDownloadsDir()
+        val stagingDir = File(base, "$MUX_STAGING_DIR/${job.groupId}")
+        val vFile = trackFile(job.videoTaskId.get(), stagingDir, "v.m4s")
+        val aFile = trackFile(job.audioTaskId.get(), stagingDir, "a.m4s")
+        val ffmpegFile = ffmpeg.executable(downloadService.settings.ffmpegPath)
+        if (ffmpegFile == null || !vFile.isFile || !aFile.isFile) {
+            println(
+                "[mux] 合轨前置条件不满足（组 ${job.groupId}：ffmpeg=${ffmpegFile != null} " +
+                    "视频轨=${vFile.isFile} 音轨=${aFile.isFile}），改走双文件保底"
+            )
+            fallbackKeepTracks(job, base, vFile, aFile)
+            cleanupStaging(base, stagingDir)
+            return
+        }
+        val finalFile = uniqueFile(base, sanitizeFileName(job.finalName))
+        val tmpOut = File(base, finalFile.nameWithoutExtension + ".muxing.mp4")
+        val logFile = File(stagingDir, "ffmpeg.log")
+        val exit = runCatching {
+            val pb = ProcessBuilder(
+                ffmpegFile.absolutePath,
+                "-nostdin", "-hide_banner", "-loglevel", "error",
+                "-i", vFile.absolutePath,
+                "-i", aFile.absolutePath,
+                "-c", "copy", "-movflags", "+faststart",
+                "-y", tmpOut.absolutePath
+            )
+            pb.redirectErrorStream(true)
+            pb.redirectOutput(logFile)
+            pb.start().waitFor()
+        }.getOrElse { e ->
+            println("[mux] 合轨进程启动失败（组 ${job.groupId}）：${e.message}")
+            -1
+        }
+        if (exit == 0 && tmpOut.isFile && tmpOut.length() > 0) {
+            if (!tmpOut.renameTo(finalFile)) {
+                runCatching { tmpOut.copyTo(finalFile, overwrite = true); tmpOut.delete() }
+            }
+            vFile.delete()
+            aFile.delete()
+            println("[mux] 合轨完成：${finalFile.absolutePath}（组 ${job.groupId}）")
+        } else {
+            tmpOut.delete()
+            val tail = runCatching { logFile.readText().takeLast(500) }.getOrDefault("")
+            println("[mux] 合轨失败（组 ${job.groupId}，退出码 $exit）$tail；改走双文件保底")
+            fallbackKeepTracks(job, base, vFile, aFile)
+        }
+        cleanupStaging(base, stagingDir)
+    }
+
+    /** 轨道实际落盘路径：优先任务记录的 savePath（完成回调触发时已写入），缺失时按暂存目录推算 */
+    private fun trackFile(taskId: Long, stagingDir: File, fallbackName: String): File {
+        val sp = if (taskId > 0) {
+            downloadService.get(taskId)?.savePath?.takeIf { it.isNotBlank() }
+        } else null
+        return if (sp != null) File(sp) else File(stagingDir, fallbackName)
+    }
+
+    /** 合轨失败保底：两轨移到下载目录根（原名.video.m4s / 原名.audio.m4s），源文件只移不删 */
+    private fun fallbackKeepTracks(job: MuxJob, base: File, vFile: File, aFile: File) {
+        val stem = job.finalName.removeSuffix(".mp4").removeSuffix(".MP4")
+        moveIfExists(vFile, uniqueFile(base, sanitizeFileName("$stem.video.m4s")))
+        moveIfExists(aFile, uniqueFile(base, sanitizeFileName("$stem.audio.m4s")))
+    }
+
+    private fun moveIfExists(src: File, dest: File) {
+        if (!src.isFile) return
+        if (src.canonicalPath == dest.canonicalPath) return
+        if (!src.renameTo(dest)) {
+            runCatching { src.copyTo(dest, overwrite = true); src.delete() }
+        }
+    }
+
+    /** 清暂存组目录（空才删得动）及可能变空的 .yunget-mux 父目录；残留文件时保留不动 */
+    private fun cleanupStaging(base: File, stagingDir: File) {
+        runCatching { stagingDir.delete() }
+        runCatching { File(base, MUX_STAGING_DIR).delete() }
+    }
+
+    /** 合轨产物名确保以 .mp4 结尾（B站解析器本就给 .mp4，这里兜底其它来源） */
+    private fun ensureMp4Name(name: String): String {
+        val n = name.ifBlank { "bilibili_${System.currentTimeMillis()}.mp4" }
+        if (n.lowercase().endsWith(".mp4")) return n
+        val dot = n.lastIndexOf('.')
+        return if (dot > 0) n.substring(0, dot) + ".mp4" else "$n.mp4"
+    }
+
+    /** 与 DownloadService 同款的文件名清洗（那份是 private，这里复制小工具自用） */
+    private fun sanitizeFileName(name: String): String {
+        var n = name.trim().ifBlank { "download" }
+        n = n.replace(Regex("[/\\\\:*?\"<>|]"), "_")
+        if (n.length > 200) n = n.take(200)
+        return n
+    }
+
+    private fun uniqueFile(dir: File, name: String): File {
+        var f = File(dir, name)
+        if (!f.exists()) return f
+        val baseName = name.substringBeforeLast('.', name)
+        val ext = name.substringAfterLast('.', "")
+        var i = 1
+        while (f.exists()) {
+            f = if (ext.isNotEmpty() && ext != name) File(dir, "$baseName($i).$ext")
+            else File(dir, "$name($i)")
+            i++
+        }
+        return f
     }
 
     // ------------------------------------------------------------------

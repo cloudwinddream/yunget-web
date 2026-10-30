@@ -54,7 +54,7 @@ fun main() {
     val downloads = DownloadService(dataDir)
     val netdisk = NetdiskService(accounts, downloads, HistoryStore(dataDir))
     val gopeed = GopeedService(dataDir, downloads)
-    val video = VideoService(downloads)
+    val video = VideoService(downloads, accounts, dataDir)
 
     Runtime.getRuntime().addShutdownHook(Thread {
         runCatching { downloads.shutdown() }

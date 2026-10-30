@@ -144,7 +144,9 @@ data class SettingsData(
     val autoRetry: Boolean = true,
     val autoRetryMax: Int = 10,
     // 夸克免转存下载（登录态）：优先拿分享凭证直取直链，不占本账号空间；失败自动回退转存
-    val quarkNoSave: Boolean = true
+    val quarkNoSave: Boolean = true,
+    // ffmpeg 可执行文件路径（B站 DASH 分轨合轨用）；留空则按 PATH → 常见安装路径顺序自动探测
+    val ffmpegPath: String = ""
 )
 
 @Serializable
@@ -246,6 +248,26 @@ data class VideoDownloadRequest(
     val sessionId: String,
     /** 要下载的媒体下标（对应 VideoMediaItemDto.index）；空 = 全部 */
     val indexes: List<Int> = emptyList()
+)
+
+@Serializable
+data class BilibiliLoginRequest(val cookie: String)
+
+@Serializable
+data class BilibiliAccountResponse(
+    val loggedIn: Boolean,
+    val nickname: String = ""
+)
+
+@Serializable
+data class FfmpegStatusResponse(
+    val available: Boolean,
+    /** ffmpeg 版本号（如 6.1.1）；不可用时为空 */
+    val version: String = "",
+    /** 实际命中的可执行文件路径；不可用时为空 */
+    val path: String = "",
+    /** 命中来源：manual（设置项路径）| app（应用托管安装）| path（系统 PATH）| system（常见安装路径）；不可用时为空 */
+    val source: String = ""
 )
 
 @Serializable

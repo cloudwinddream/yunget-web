@@ -125,6 +125,42 @@ async function loadPlatforms() {
     grid.appendChild(d);
     if (p.loggedIn && p.id !== 'lanzou') loadQuota(p.id);
   });
+  loadBilibiliAccount();
+}
+
+// ---------- B站账号（视频高清专用，与网盘账号相互独立） ----------
+async function loadBilibiliAccount() {
+  const badge = document.getElementById('biliBadge');
+  if (!badge) return;
+  const r = await api('/api/video/accounts/bilibili');
+  const nick = document.getElementById('biliNick');
+  const out = document.getElementById('biliLogoutBtn');
+  if (!r.ok) { badge.textContent = '状态未知'; badge.className = 'badge'; return; }
+  if (r.data.loggedIn) {
+    badge.textContent = '已登录'; badge.className = 'badge on';
+    nick.textContent = r.data.nickname ? '昵称：' + r.data.nickname : '';
+    out.style.display = '';
+  } else {
+    badge.textContent = '未登录'; badge.className = 'badge';
+    nick.textContent = '';
+    out.style.display = 'none';
+  }
+}
+async function bilibiliLogin() {
+  const v = document.getElementById('ck-bilibili').value.trim();
+  hideMsg('msg-bilibili');
+  if (!v) { showMsg('msg-bilibili', '请先粘贴 Cookie', false); return; }
+  const r = await api('/api/video/accounts/bilibili', 'POST', { cookie: v });
+  if (r.ok) {
+    showMsg('msg-bilibili', '登录成功：' + (r.data.nickname || ''), true);
+    document.getElementById('ck-bilibili').value = '';
+    loadBilibiliAccount();
+  } else showMsg('msg-bilibili', r.message || '登录失败', false);
+}
+async function bilibiliLogout() {
+  const r = await api('/api/video/accounts/bilibili', 'DELETE');
+  showMsg('msg-bilibili', r.ok ? '已退出 B站登录' : (r.message || '退出失败'), r.ok);
+  loadBilibiliAccount();
 }
 
 async function loadQuota(id) {
@@ -711,7 +747,9 @@ async function loadSettings() {
   document.getElementById('setAutoRetryMax').value = s.autoRetryMax ?? 10;
   document.getElementById('setQuarkNoSave').checked = s.quarkNoSave !== false;
   document.getElementById('setDir').value = s.downloadDir || '';
+  document.getElementById('setFfmpegPath').value = s.ffmpegPath || '';
   loadGopeedStatus();
+  refreshFfmpegCard();
 }
 async function saveSettings() {
   hideMsg('setMsg');
@@ -734,9 +772,11 @@ async function saveSettings() {
     autoRetry: document.getElementById('setAutoRetry').checked,
     autoRetryMax: Math.max(0, parseInt(document.getElementById('setAutoRetryMax').value) || 0),
     quarkNoSave: document.getElementById('setQuarkNoSave').checked,
+    ffmpegPath: document.getElementById('setFfmpegPath').value.trim(),
     downloadDir: document.getElementById('setDir').value.trim()
   };
   const r = await api('/api/settings', 'PUT', s);
+  if (r.ok) ffmpegState = undefined; // ffmpegPath 可能已变，后端按新值重探，前端缓存同步失效
   showMsg('setMsg', r.ok ? '设置已保存并即时生效' : (r.message || '保存失败'), r.ok);
 }
 
@@ -1015,6 +1055,54 @@ async function driveNewFolder() {
   else showMsg('driveMsg', r.message || '新建失败', false);
 }
 
+// ---------- ffmpeg（B站分轨合轨支持；状态缓存供视频卡徽标与设置页共用） ----------
+let ffmpegState = undefined; // undefined=未拉取，否则为 {available, version, path, source}
+const FFMPEG_SOURCE_TEXT = { manual: '手动指定路径', app: '本应用托管安装', path: '系统 PATH', system: '系统安装路径' };
+async function fetchFfmpegState(force) {
+  if (ffmpegState !== undefined && !force) return ffmpegState;
+  const r = await api('/api/video/ffmpeg');
+  ffmpegState = r.ok ? r.data : { available: false };
+  return ffmpegState;
+}
+/** 设置页合轨卡按状态分叉：已检测到只显示状态；未检测到才露出一键安装与手动说明 */
+async function refreshFfmpegCard() {
+  const stEl = document.getElementById('ffmpegStatus');
+  if (!stEl) return;
+  const st = await fetchFfmpegState(true);
+  const box = document.getElementById('ffmpegInstallBox');
+  const manual = document.getElementById('ffmpegManualHint');
+  if (st.available) {
+    stEl.textContent = `已检测到 ffmpeg v${st.version || '?'}（来源：${FFMPEG_SOURCE_TEXT[st.source] || st.source || '未知'}）· ${st.path}`;
+    box.style.display = 'none';
+    manual.style.display = 'none';
+  } else {
+    stEl.textContent = '未检测到 ffmpeg';
+    box.style.display = '';
+    manual.style.display = '';
+  }
+}
+async function ffmpegInstall() {
+  const btn = document.getElementById('ffmpegInstallBtn');
+  btn.disabled = true;
+  const oldText = btn.textContent;
+  btn.textContent = '正在下载安装…';
+  hideMsg('ffmpegMsg');
+  try {
+    const r = await api('/api/video/ffmpeg/install', 'POST', {});
+    if (r.ok) {
+      ffmpegState = r.data;
+      showMsg('ffmpegMsg', 'ffmpeg 安装完成：v' + (r.data.version || '') + '（' + (r.data.path || '') + '）', true);
+    } else {
+      showMsg('ffmpegMsg', r.message || '安装失败', false);
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+    refreshFfmpegCard();
+    if (curVideoMedias.length) renderVideoList();
+  }
+}
+
 // ---------- 视频解析 ----------
 let curVideoSession = null, curVideoMedias = [];
 async function parseVideoLink(link) {
@@ -1032,6 +1120,7 @@ async function parseVideoLink(link) {
   document.getElementById('videoNotice').textContent = r.data.notice || '';
   const cover = document.getElementById('videoCover');
   if (r.data.cover) { cover.src = r.data.cover; cover.style.display = 'block'; } else cover.style.display = 'none';
+  await fetchFfmpegState();
   renderVideoList();
   showMsg('parseMsg', '解析成功', true);
 }
@@ -1040,10 +1129,13 @@ function renderVideoList() {
   if (!curVideoMedias.length) { el.innerHTML = '<div class="empty">没有可下载的媒体</div>'; return; }
   el.innerHTML = curVideoMedias.map(m => {
     const icon = m.kind === 'IMAGE' ? '🖼️' : m.kind === 'AUDIO' ? '🎵' : '🎬';
+    const muxTag = !m.needsMux ? '' : (ffmpegState && ffmpegState.available
+      ? '<span class="badge on" title="音视频分轨：两轨下完后由 ffmpeg 自动合成为单个 mp4">高清 · 自动合轨</span>'
+      : '<span class="badge" title="音视频分轨：未检测到 ffmpeg，会生成视频轨与 .audio.m4s 音轨两个文件，需自行合轨（可在设置页一键安装 ffmpeg）">分轨（双文件）</span>');
     const tags = [
       m.quality ? `<span class="badge">${escapeHtml(m.quality)}</span>` : '',
       m.isHls ? '<span class="badge">HLS</span>' : '',
-      m.needsMux ? '<span class="badge" title="音视频分轨：会生成视频轨与 .audio.m4s 音轨两个文件，需自行合轨">分轨</span>' : ''
+      muxTag
     ].join(' ');
     return `<div class="drow">
       <input type="checkbox" class="vck" data-i="${m.index}" checked onchange="updateVideoSel()">
@@ -1072,7 +1164,11 @@ async function downloadVideoSelected() {
     if (!r.ok) { showMsg('videoMsg', r.message || '提交下载失败', false); return; }
     showMsg('videoMsg', `已提交 ${r.data.taskIds.length} 个下载任务`, true);
     if (curVideoMedias.some(m => m.needsMux && indexes.includes(m.index))) {
-      showMsg('videoMsg', '已提交下载；注意：分轨媒体会生成视频轨 + .audio.m4s 音轨两个文件，需自行合轨', true);
+      if (ffmpegState && ffmpegState.available) {
+        showMsg('videoMsg', '已提交下载；分轨媒体的两轨下完后会自动合轨为单个 mp4', true);
+      } else {
+        showMsg('videoMsg', '已提交下载；注意：分轨媒体会生成视频轨 + .audio.m4s 音轨两个文件，需自行合轨（设置页可一键安装 ffmpeg 开启自动合轨）', true);
+      }
     }
   } finally { btn.disabled = false; }
 }
