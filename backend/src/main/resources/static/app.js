@@ -1082,6 +1082,7 @@ const DRIVE_PLATFORMS = [
 let drivePlatform = 'lanzou';
 let driveStack = [{ fid: '', name: '根目录' }];
 let driveItems = [];
+let driveSelected = new Set(); // 个人盘多选状态：存 fid，仅对当前文件夹视图有效，每次 loadDrive 重渲染时清空
 function drivePlatformName() {
   const f = DRIVE_PLATFORMS.find(([id]) => id === drivePlatform);
   return f ? f[1] : drivePlatform;
@@ -1111,20 +1112,25 @@ function driveRefresh() { loadDrive(); }
 async function loadDrive() {
   const list = document.getElementById('driveList');
   list.innerHTML = '<p class="hint">加载中…</p>';
+  driveSelected.clear(); // 切换目录/平台/刷新都重新渲染，选择只对当前视图有效，进新视图先清空
+  updateDriveBatchBar();
   renderDrivePlatSwitch();
   renderDriveCrumb();
   document.getElementById('driveShareBox').innerHTML = '';
   const r = await api('/api/drive/' + drivePlatform + '/list?dirFid=' + encodeURIComponent(driveCurFid()));
   if (!r.ok) {
+    driveItems = [];
     list.innerHTML = '';
     showMsg('driveMsg', (r.message || '加载失败') + '（请先在「账号」页登录' + drivePlatformName() + '）', false);
+    updateDriveBatchBar();
     return;
   }
   hideMsg('driveMsg');
   driveItems = r.data || [];
-  if (!driveItems.length) { list.innerHTML = '<p class="hint">这个文件夹是空的</p>'; return; }
+  if (!driveItems.length) { list.innerHTML = '<p class="hint">这个文件夹是空的</p>'; updateDriveBatchBar(); return; }
   list.innerHTML = driveItems.map((f, i) => `
     <div class="drow">
+      <input type="checkbox" class="dck" onchange="driveToggleOne(${i}, this.checked)">
       <span class="dic">${f.isdir ? '📁' : '📄'}</span>
       ${f.isdir ? `<button class="dname link" onclick="driveEnter(${i})">${escapeHtml(f.fname)}</button>` : `<span class="dname">${escapeHtml(f.fname)}</span>`}
       <span class="dmeta">${f.isdir ? '' : fmtSize(f.fsize)}${f.modifyTime ? ' · ' + escapeHtml(f.modifyTime) : ''}</span>
@@ -1166,6 +1172,70 @@ async function driveDelete(i) {
   const r = await api('/api/drive/' + drivePlatform + '/delete', 'POST', { isDir: f.isdir, id: f.fid, pdirFid: f.pdirFid || '' });
   if (r.ok) { showMsg('driveMsg', '已删除', true); loadDrive(); }
   else showMsg('driveMsg', r.message || '删除失败', false);
+}
+// ---------- 个人盘多选（批量下载 / 批量删除：纯前端编排，逐个复用单项端点，单项失败隔离） ----------
+function driveSelItems() { return driveItems.filter(f => driveSelected.has(f.fid)); }
+function updateDriveBatchBar() {
+  const all = document.getElementById('driveCkAll');
+  if (!all) return;
+  const n = driveSelected.size;
+  all.checked = driveItems.length > 0 && n === driveItems.length;
+  all.indeterminate = n > 0 && n < driveItems.length;
+  document.getElementById('driveSelCount').textContent = n ? `已选 ${n} 项` : '';
+  const fileN = driveSelItems().filter(f => !f.isdir).length;
+  const dl = document.getElementById('driveBatchDl');
+  dl.disabled = fileN === 0;
+  dl.textContent = fileN ? `下载所选（${fileN}）` : '下载所选';
+  document.getElementById('driveBatchDel').disabled = n === 0;
+}
+function driveToggleOne(i, on) {
+  const f = driveItems[i];
+  if (!f) return;
+  if (on) driveSelected.add(f.fid); else driveSelected.delete(f.fid);
+  updateDriveBatchBar();
+}
+function driveToggleAll(on) {
+  driveSelected.clear();
+  if (on) driveItems.forEach(f => driveSelected.add(f.fid));
+  document.querySelectorAll('#driveList .dck').forEach(c => { c.checked = on; });
+  updateDriveBatchBar();
+}
+function clearDriveSelection() {
+  driveSelected.clear();
+  document.querySelectorAll('#driveList .dck').forEach(c => { c.checked = false; });
+  updateDriveBatchBar();
+}
+async function driveDownloadSelected() {
+  const sel = driveSelItems();
+  const files = sel.filter(f => !f.isdir);
+  const dirN = sel.length - files.length;
+  if (!files.length) { showMsg('driveMsg', '所选内容里没有文件（文件夹暂不支持整夹下载）', false); return; }
+  let ok = 0, firstErr = '';
+  for (const f of files) {
+    const r = await api('/api/drive/' + drivePlatform + '/download', 'POST', { fid: f.fid, fname: f.fname, fidToken: f.fidToken || '' });
+    if (r.ok) ok++; else if (!firstErr) firstErr = r.message || '下载失败';
+  }
+  const fail = files.length - ok;
+  showMsg('driveMsg',
+    `批量下载：成功 ${ok} 个` +
+    (fail ? `，失败 ${fail} 个（${firstErr}）` : '') +
+    (dirN ? `；已跳过 ${dirN} 个文件夹（暂不支持整夹下载）` : ''),
+    fail === 0);
+  clearDriveSelection(); // 下载只是入队，不刷新列表，仅清选择
+}
+async function driveDeleteSelected() {
+  const sel = driveSelItems();
+  if (!sel.length) return;
+  const dirN = sel.filter(f => f.isdir).length;
+  if (!confirm(`确定删除所选 ${sel.length} 项？` + (dirN ? `其中含 ${dirN} 个文件夹，文件夹内的文件也会一并删除。` : ''))) return;
+  let ok = 0, firstErr = '';
+  for (const f of sel) {
+    const r = await api('/api/drive/' + drivePlatform + '/delete', 'POST', { isDir: f.isdir, id: f.fid, pdirFid: f.pdirFid || '' });
+    if (r.ok) ok++; else if (!firstErr) firstErr = r.message || '删除失败';
+  }
+  const fail = sel.length - ok;
+  await loadDrive(); // 刷新列表（loadDrive 会清空选择）；汇总放在刷新之后显示，避免被 hideMsg 盖掉
+  showMsg('driveMsg', `批量删除：成功 ${ok} 项` + (fail ? `，失败 ${fail} 项（${firstErr}）` : ''), fail === 0);
 }
 async function driveNewFolder() {
   const name = await askInput('新建文件夹', '');

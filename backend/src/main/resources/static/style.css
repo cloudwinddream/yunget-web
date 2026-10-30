@@ -162,6 +162,8 @@ table.files tr.dir:hover td { background: #f6f9ff; }
 /* 网盘文件（个人盘） */
 .crumb { display: flex; align-items: center; flex-wrap: wrap; gap: 2px; }
 .crumb .csep { color: #9aa3ad; }
+.ckbar button:disabled { opacity: .45; cursor: default; }
+.drow .dck { flex-shrink: 0; margin: 0; }
 .drow { display: flex; align-items: center; gap: 10px; padding: 9px 6px; border-bottom: 1px solid #eef0f3; }
 .drow:last-child { border-bottom: none; }
 .drow .dic { font-size: 18px; flex-shrink: 0; }
