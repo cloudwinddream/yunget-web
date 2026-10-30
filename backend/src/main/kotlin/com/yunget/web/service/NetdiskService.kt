@@ -3,6 +3,10 @@ package com.yunget.web.service
 import com.yunget.app.data.network.BaiduApi
 import com.yunget.app.data.network.BaiduConstants
 import com.yunget.app.data.network.C139Api
+import com.yunget.app.data.network.LanzouApi
+import com.yunget.app.data.network.LanzouConstants
+import com.yunget.app.data.network.LanzouLog
+import com.yunget.app.data.network.LanzouLoginParams
 import com.yunget.app.data.network.C139Constants
 import com.yunget.app.data.network.Pan123Api
 import com.yunget.app.data.network.Pan123Constants
@@ -18,9 +22,11 @@ import com.yunget.app.data.network.XunleiDeviceFingerprint
 import com.yunget.app.data.network.XunleiKouling
 import com.yunget.app.data.network.model.DownloadLink
 import com.yunget.app.data.network.model.ShareFile
+import com.yunget.app.data.network.model.ShareInfo
 import com.yunget.app.data.network.model.ShareSession
 import com.yunget.app.data.repository.BaiduResolveRepository
 import com.yunget.app.data.repository.C139ResolveRepository
+import com.yunget.app.data.repository.LanzouResolveRepository
 import com.yunget.app.data.repository.Pan123ResolveRepository
 import com.yunget.app.data.repository.QuarkResolveRepository
 import com.yunget.app.data.repository.ShareResolveRepository
@@ -44,7 +50,8 @@ enum class Platform(val id: String, val displayName: String, val loginType: Stri
     XUNLEI("xunlei", "迅雷网盘", "password"),
     BAIDU("baidu", "百度网盘", "cookie"),
     PAN123("pan123", "123 云盘", "password"),
-    C139("c139", "139 云盘（和彩云）", "cookie");
+    C139("c139", "139 云盘（和彩云）", "cookie"),
+    LANZOU("lanzou", "蓝奏云", "password");
 
     companion object {
         fun fromId(id: String): Platform? = values().find { it.id == id }
@@ -55,6 +62,7 @@ enum class Platform(val id: String, val displayName: String, val loginType: Stri
             SharePlatform.BAIDU -> BAIDU
             SharePlatform.PAN123 -> PAN123
             SharePlatform.C139 -> C139
+            SharePlatform.LANZOU -> LANZOU
         }
     }
 }
@@ -89,12 +97,14 @@ class NetdiskService(
     private val baiduApi = BaiduApi()
     private val pan123Api = Pan123Api()
     private val c139Api = C139Api()
+    private val lanzouApi = LanzouApi()
 
     private val repos: Map<Platform, ShareResolveRepository> = mapOf(
         Platform.QUARK to QuarkResolveRepository(quarkApi),
         Platform.UC to UCResolveRepository(ucApi),
         Platform.BAIDU to BaiduResolveRepository(baiduApi),
         Platform.C139 to C139ResolveRepository(c139Api),
+        Platform.LANZOU to LanzouResolveRepository(lanzouApi),
         Platform.PAN123 to Pan123ResolveRepository(pan123Api) { accounts.get("pan123")?.token },
         Platform.XUNLEI to XunleiResolveRepository(
             api = xunleiApi,
@@ -120,6 +130,7 @@ class NetdiskService(
     private val sessions = ConcurrentHashMap<String, ResolveSession>()
 
     init {
+        LanzouLog.install { msg -> println("[lanzou] $msg") }
         // 迅雷 401 自动刷新（pan 请求内部使用）
         xunleiApi.refreshTokenProvider = { deviceId ->
             val acc = accounts.get("xunlei")
@@ -152,6 +163,7 @@ class NetdiskService(
             Platform.QUARK, Platform.UC, Platform.BAIDU, Platform.C139 -> !acc?.cookie.isNullOrBlank()
             Platform.PAN123 -> !acc?.token.isNullOrBlank()
             Platform.XUNLEI -> !acc?.xunleiAccessToken.isNullOrBlank()
+            Platform.LANZOU -> !acc?.cookie.isNullOrBlank()
         }
         PlatformInfo(p.id, p.displayName, p.loginType, loggedIn, acc?.nickname ?: "")
     }
@@ -175,6 +187,8 @@ class NetdiskService(
                     ?: throw IllegalStateException("未登录"),
                 XunleiDeviceFingerprint.deviceId(), ""
             )
+            // 蓝奏云未提供容量接口（上游同样无此能力）
+            Platform.LANZOU -> throw IllegalStateException("蓝奏云不提供容量查询")
         } ?: throw IllegalStateException("获取容量失败，请稍后重试")
         return mapOf("used" to q.used, "total" to q.total, "usedInTrash" to q.usedInTrash)
     }
@@ -302,12 +316,98 @@ class NetdiskService(
         accounts.remove(platformId)
     }
 
+
+    suspend fun loginLanzou(username: String, password: String): Result<String> {
+        return try {
+            val name = username.trim()
+            val cookie = lanzouApi.login(name, password)
+            // 校验登录态确实可用（能取到 uid/vei 才算登录成功）
+            lanzouApi.fetchLoginParams(cookie)
+                ?: throw IllegalStateException("蓝奏云登录态无效，请重试")
+            accounts.save("lanzou", AccountData(cookie = cookie, nickname = name))
+            Result.success(name)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // ---------- 蓝奏个人盘 ----------
+
+    private val lanzouParamsCache = ConcurrentHashMap<String, LanzouLoginParams>()
+
+    /** 个人盘操作前置：登录 Cookie + uid/vei（按 Cookie 指纹缓存，避免每次多打一趟 mydisk） */
+    private suspend fun lanzouParams(): Pair<String, LanzouLoginParams> {
+        val cookie = credentialOf(Platform.LANZOU)
+        val key = cookie.hashCode().toString()
+        lanzouParamsCache[key]?.let { return cookie to it }
+        val params = lanzouApi.fetchLoginParams(cookie)
+            ?: throw IllegalStateException("蓝奏登录态无效，请重新登录")
+        lanzouParamsCache[key] = params
+        return cookie to params
+    }
+
+    suspend fun lanzouDriveList(dirFid: String): List<ShareFile> {
+        val (cookie, params) = lanzouParams()
+        val folderId = dirFid.ifBlank { LanzouConstants.ROOT_FOLDER_ID }
+            .removePrefix(LanzouConstants.FOLDER_PREFIX)
+            .ifBlank { LanzouConstants.ROOT_FOLDER_ID }
+        return lanzouApi.listCloudFiles(cookie, params.uid, params.vei, folderId)
+    }
+
+    suspend fun lanzouDriveDownload(fid: String, fname: String): Long {
+        val (cookie, params) = lanzouParams()
+        val fileId = fid.removePrefix(LanzouConstants.FILE_PREFIX)
+        val link = lanzouApi.getPersonalDownloadLink(cookie, params.uid, params.vei, fileId, fname)
+        return downloadService.enqueue(
+            url = link.downloadUrl,
+            fileName = link.filename.ifBlank { fname },
+            headers = downloadHeaders(Platform.LANZOU, link, cookie),
+            size = link.size,
+            platform = "lanzou",
+            resumeKey = "src-lanzou-$fileId-${link.size}"
+        )
+    }
+
+    suspend fun lanzouCreateFolder(parentId: String, name: String): String {
+        val (cookie, params) = lanzouParams()
+        val parent = parentId.removePrefix(LanzouConstants.FOLDER_PREFIX)
+            .ifBlank { LanzouConstants.ROOT_FOLDER_ID }
+        return lanzouApi.createFolder(cookie, params.uid, params.vei, parent, name)
+    }
+
+    suspend fun lanzouRename(isDir: Boolean, id: String, name: String) {
+        val (cookie, params) = lanzouParams()
+        if (isDir) {
+            lanzouApi.renameFolder(cookie, params.uid, params.vei, id.removePrefix(LanzouConstants.FOLDER_PREFIX), name)
+        } else {
+            lanzouApi.renameFile(cookie, params.uid, params.vei, id.removePrefix(LanzouConstants.FILE_PREFIX), name)
+        }
+    }
+
+    suspend fun lanzouDelete(isDir: Boolean, id: String) {
+        val (cookie, params) = lanzouParams()
+        if (isDir) {
+            lanzouApi.deleteFolder(cookie, params.uid, params.vei, id.removePrefix(LanzouConstants.FOLDER_PREFIX))
+        } else {
+            lanzouApi.deleteFile(cookie, params.uid, params.vei, id.removePrefix(LanzouConstants.FILE_PREFIX))
+        }
+    }
+
+    suspend fun lanzouShare(isDir: Boolean, id: String): ShareInfo {
+        val (cookie, params) = lanzouParams()
+        return if (isDir) {
+            lanzouApi.createFolderShare(cookie, params.uid, params.vei, id.removePrefix(LanzouConstants.FOLDER_PREFIX))
+        } else {
+            lanzouApi.createFileShare(cookie, params.uid, params.vei, id.removePrefix(LanzouConstants.FILE_PREFIX))
+        }
+    }
+
     // ---------- 解析 ----------
 
     private fun credentialOf(p: Platform): String {
         val acc = accounts.get(p.id) ?: throw IllegalStateException("请先登录${p.displayName}")
         return when (p) {
-            Platform.QUARK, Platform.UC, Platform.BAIDU, Platform.C139 -> {
+            Platform.QUARK, Platform.UC, Platform.BAIDU, Platform.C139, Platform.LANZOU -> {
                 val c = acc.cookie
                 if (c.isBlank()) throw IllegalStateException("请先登录${p.displayName}")
                 // 夸克/UC 的 __puus 自动刷新由调用方经 freshCookieAsync 处理
@@ -356,7 +456,7 @@ class NetdiskService(
         } else link
         val parsed = ShareLinkParser.parse(effectiveLink) ?: throw IllegalArgumentException("无法识别分享链接")
         val platform = Platform.fromSharePlatform(parsed.platform)
-        val cred = if (platform == Platform.QUARK || platform == Platform.UC) {
+        val cred = if (platform == Platform.QUARK || platform == Platform.UC || platform == Platform.LANZOU) {
             cookieOrEmptyAsync(platform)
         } else credentialOf(platform)
         val repo = repos[platform]!!
@@ -384,7 +484,7 @@ class NetdiskService(
 
     suspend fun listFiles(sessionId: String, dirFid: String): List<ShareFile> {
         val s = sessions[sessionId] ?: throw IllegalStateException("解析会话已过期，请重新解析")
-        val cred = if (s.platform == Platform.QUARK || s.platform == Platform.UC) {
+        val cred = if (s.platform == Platform.QUARK || s.platform == Platform.UC || s.platform == Platform.LANZOU) {
             cookieOrEmptyAsync(s.platform)
         } else credentialOf(s.platform)
         return repos[s.platform]!!.listFiles(s.session, dirFid.ifBlank { "0" }, cred).getOrThrow()
@@ -507,7 +607,7 @@ class NetdiskService(
         val ids = mutableListOf<Long>()
         for (f in files) {
             if (f.isdir) continue
-            val cred = if (s.platform == Platform.QUARK || s.platform == Platform.UC) {
+            val cred = if (s.platform == Platform.QUARK || s.platform == Platform.UC || s.platform == Platform.LANZOU) {
                 cookieOrEmptyAsync(s.platform)
             } else credentialOf(s.platform)
             val shareFile = ShareFile(
@@ -593,6 +693,16 @@ class NetdiskService(
                 "Referer" to UCConstants.DOWNLOAD_REFERER,
                 "Origin" to UCConstants.WEB_ORIGIN
             )
+            // 蓝奏云：下载节点要求 Referer 为节点 origin，并注入 down_ip=1 Cookie（上游协议 §A4）
+            Platform.LANZOU -> {
+                val origin = runCatching { java.net.URI(link.downloadUrl) }.getOrNull()
+                    ?.let { "${it.scheme}://${it.host}" } ?: "https://pan.lanzoui.com"
+                mapOf(
+                    "User-Agent" to LanzouConstants.WEB_UA,
+                    "Referer" to "$origin/",
+                    "Cookie" to LanzouConstants.DOWN_IP_COOKIE
+                )
+            }
             // 夸克：防盗链固定 Referer
             Platform.QUARK -> if (link.guestCookie.isNotBlank()) mapOf(
                 // 游客链路：缺 __pugs 则 CDN 直接 412

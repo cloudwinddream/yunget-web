@@ -139,6 +139,19 @@ data class BatchDeleteRequest(val ids: List<Long>, val deleteFile: Boolean = fal
 @Serializable
 data class PasswordLoginRequest(val username: String, val password: String)
 
+/** 个人盘文件操作（蓝奏云起步，后续平台共用） */
+@Serializable
+data class DriveDownloadRequest(val fid: String, val fname: String = "")
+
+@Serializable
+data class DriveFolderRequest(val parentId: String = "", val name: String)
+
+@Serializable
+data class DriveRenameRequest(val isDir: Boolean, val id: String, val name: String)
+
+@Serializable
+data class DriveItemRequest(val isDir: Boolean, val id: String)
+
 @Serializable
 data class XunleiSmsRequest(val mobile: String)
 

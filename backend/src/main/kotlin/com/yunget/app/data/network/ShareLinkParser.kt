@@ -19,7 +19,7 @@
 package com.yunget.app.data.network
 
 /** 网盘平台 */
-enum class SharePlatform { QUARK, UC, XUNLEI, BAIDU, C139, PAN123 }
+enum class SharePlatform { QUARK, UC, XUNLEI, BAIDU, C139, PAN123, LANZOU }
 
 /**
  * 解析结果：share_id + 提取码 + 平台。
@@ -104,6 +104,14 @@ object ShareLinkParser {
             val pwd = pwdInUrlRegex.find(url)?.groupValues?.getOrNull(1)
                 ?: pwdInTextRegex.find(text)?.groupValues?.getOrNull(1)
             return ParsedShare(shareId = sid, pwd = pwd, platform = SharePlatform.PAN123)
+        }
+        // 蓝奏云链接：域名族多变（lanzou*/lanzo*/lansou* 及镜像子域），按 host 判定；
+        // shareId 不用（仓库直接用完整链接），提取码同其它平台规则
+        val lanzouHost = runCatching { java.net.URI(url) }.getOrNull()?.host
+        if (lanzouHost != null && LanzouConstants.isLanzouHost(lanzouHost)) {
+            val pwd = pwdInUrlRegex.find(url)?.groupValues?.getOrNull(1)
+                ?: pwdInTextRegex.find(text)?.groupValues?.getOrNull(1)
+            return ParsedShare(shareId = url, pwd = pwd, platform = SharePlatform.LANZOU)
         }
         return null
     }

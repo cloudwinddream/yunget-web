@@ -139,3 +139,16 @@ table.files tr.dir:hover td { background: #f6f9ff; }
 .connname { flex: 1; font-size: 14px; color: #333; }
 .connrow select { border: 1px solid #d5dae2; border-radius: 6px; padding: 7px 10px; font-size: 14px; background: #fff; }
 .connrow select:focus { outline: none; border-color: #1a73e8; }
+
+/* 网盘文件（个人盘） */
+.crumb { display: flex; align-items: center; flex-wrap: wrap; gap: 2px; }
+.crumb .csep { color: #9aa3ad; }
+.drow { display: flex; align-items: center; gap: 10px; padding: 9px 6px; border-bottom: 1px solid #eef0f3; }
+.drow:last-child { border-bottom: none; }
+.drow .dic { font-size: 18px; flex-shrink: 0; }
+.drow .dname { font-size: 14px; word-break: break-all; text-align: left; }
+.drow button.dname.link { background: none; border: none; padding: 0; color: #1565c0; cursor: pointer; font: inherit; }
+.drow button.dname.link:hover { text-decoration: underline; }
+.drow .dmeta { font-size: 12px; color: #8a929c; white-space: nowrap; }
+.drow .dacts { margin-left: auto; display: flex; gap: 6px; flex-shrink: 0; }
+.sharebox { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; background: #eef6ee; border: 1px solid #cfe6cf; border-radius: 8px; padding: 9px 12px; margin: 8px 0; font-size: 13px; word-break: break-all; }

@@ -30,6 +30,7 @@ document.querySelectorAll('nav.tabs button').forEach(b => {
     tab.classList.add('active');
     stopTaskPoll();
     if (b.dataset.tab === 'accounts') loadPlatforms();
+    if (b.dataset.tab === 'drive') loadDrive();
     if (b.dataset.tab === 'history') loadHistory();
     if (b.dataset.tab === 'tasks') { loadTasks(); startTaskPoll(); }
     if (b.dataset.tab === 'settings') loadSettings();
@@ -58,6 +59,16 @@ async function loadPlatforms() {
           ${(p.id === 'quark' || p.id === 'uc') ? `<button class="btn small" onclick="qrLogin('${p.id}')">扫码登录</button>` : ''}
           ${p.loggedIn ? `<button class="danger small" onclick="logout('${p.id}')">退出</button>` : ''}
         </div>`;
+    } else if (p.id === 'lanzou') {
+      body = `
+        <label>账号（蓝奏云官网用户名）</label><input type="text" id="u-${p.id}">
+        <label>密码</label><input type="password" id="p-${p.id}">
+        <div class="row" style="margin-top:10px">
+          <button class="btn small" onclick="pwdLogin('${p.id}')">登录</button>
+          ${p.loggedIn ? `<button class="ghost small" onclick="openDrive()">📂 打开个人盘</button>` : ''}
+          ${p.loggedIn ? `<button class="danger small" onclick="logout('${p.id}')">退出</button>` : ''}
+        </div>
+        <div class="hint" style="margin-top:6px">账号密码登录，登录态保存在服务器供个人盘使用；只下分享链接的话无需登录</div>`;
     } else if (p.id === 'pan123') {
       body = `
         <label>账号（手机号/邮箱）</label><input type="text" id="u-${p.id}">
@@ -88,11 +99,11 @@ async function loadPlatforms() {
     d.innerHTML = `
       <h3>${p.name} <span class="badge ${p.loggedIn ? 'on' : ''}">${p.loggedIn ? '已登录' : '未登录'}</span></h3>
       <div class="nick">${p.loggedIn && p.nickname ? '昵称：' + escapeHtml(p.nickname) : ''}</div>
-      ${p.loggedIn ? `<div class="quota" id="quota-${p.id}"></div>` : ''}
+      ${p.loggedIn && p.id !== 'lanzou' ? `<div class="quota" id="quota-${p.id}"></div>` : ''}
       ${body}
       <div class="msg" id="msg-${p.id}"></div>`;
     grid.appendChild(d);
-    if (p.loggedIn) loadQuota(p.id);
+    if (p.loggedIn && p.id !== 'lanzou') loadQuota(p.id);
   });
 }
 
@@ -508,7 +519,8 @@ async function taskDel(id) {
 // ---------- 设置 ----------
 const PLATFORMS_CONN = [
   ['quark', '夸克'], ['uc', 'UC'], ['xunlei', '迅雷'],
-  ['baidu', '百度'], ['pan123', '123'], ['c139', '139']
+  ['baidu', '百度'], ['pan123', '123'], ['c139', '139'],
+  ['lanzou', '蓝奏云']
 ];
 async function loadSettings() {
   const r = await api('/api/settings');
@@ -707,3 +719,102 @@ async function clearHistory() {
   if (r.ok) { loadHistory(); }
 }
 loadFavorites();
+
+// ---------- 通用输入弹窗 ----------
+let inputResolve = null;
+function askInput(title, initial) {
+  return new Promise(res => {
+    inputResolve = res;
+    document.getElementById('inputTitle').textContent = title;
+    const v = document.getElementById('inputValue');
+    v.value = initial || '';
+    document.getElementById('inputModal').style.display = 'flex';
+    setTimeout(() => { v.focus(); v.select(); }, 30);
+  });
+}
+function inputOk() {
+  const v = document.getElementById('inputValue').value;
+  document.getElementById('inputModal').style.display = 'none';
+  if (inputResolve) { inputResolve(v); inputResolve = null; }
+}
+function inputCancel() {
+  document.getElementById('inputModal').style.display = 'none';
+  if (inputResolve) { inputResolve(null); inputResolve = null; }
+}
+function openDrive() { document.querySelector('nav.tabs button[data-tab="drive"]').click(); }
+
+// ---------- 网盘文件（蓝奏云个人盘） ----------
+let driveStack = [{ fid: '', name: '根目录' }];
+let driveItems = [];
+function driveCurFid() { return driveStack[driveStack.length - 1].fid; }
+function renderDriveCrumb() {
+  document.getElementById('driveCrumb').innerHTML = driveStack.map((c, i) =>
+    (i ? ' <span class="csep">›</span> ' : '') +
+    `<button class="ghost small" onclick="driveCrumbTo(${i})">${escapeHtml(c.name)}</button>`).join('');
+}
+function driveCrumbTo(n) { driveStack = driveStack.slice(0, n + 1); loadDrive(); }
+function driveRefresh() { loadDrive(); }
+async function loadDrive() {
+  const list = document.getElementById('driveList');
+  list.innerHTML = '<p class="hint">加载中…</p>';
+  renderDriveCrumb();
+  document.getElementById('driveShareBox').innerHTML = '';
+  const r = await api('/api/drive/lanzou/list?dirFid=' + encodeURIComponent(driveCurFid()));
+  if (!r.ok) {
+    list.innerHTML = '';
+    showMsg('driveMsg', (r.message || '加载失败') + '（请先在「账号」页登录蓝奏云）', false);
+    return;
+  }
+  hideMsg('driveMsg');
+  driveItems = r.data || [];
+  if (!driveItems.length) { list.innerHTML = '<p class="hint">这个文件夹是空的</p>'; return; }
+  list.innerHTML = driveItems.map((f, i) => `
+    <div class="drow">
+      <span class="dic">${f.isdir ? '📁' : '📄'}</span>
+      ${f.isdir ? `<button class="dname link" onclick="driveEnter(${i})">${escapeHtml(f.fname)}</button>` : `<span class="dname">${escapeHtml(f.fname)}</span>`}
+      <span class="dmeta">${f.isdir ? '' : fmtSize(f.fsize)}${f.modifyTime ? ' · ' + escapeHtml(f.modifyTime) : ''}</span>
+      <span class="dacts">
+        ${f.isdir ? '' : `<button class="ghost small" onclick="driveDownload(${i})">下载</button>`}
+        <button class="ghost small" onclick="driveShare(${i})">分享</button>
+        <button class="ghost small" onclick="driveRename(${i})">重命名</button>
+        <button class="ghost small danger" onclick="driveDelete(${i})">删除</button>
+      </span>
+    </div>`).join('');
+}
+function driveEnter(i) { driveStack.push({ fid: driveItems[i].fid, name: driveItems[i].fname }); loadDrive(); }
+async function driveDownload(i) {
+  const f = driveItems[i];
+  const r = await api('/api/drive/lanzou/download', 'POST', { fid: f.fid, fname: f.fname });
+  if (r.ok) showMsg('driveMsg', '已加入下载：' + f.fname, true);
+  else showMsg('driveMsg', r.message || '下载失败', false);
+}
+async function driveShare(i) {
+  const f = driveItems[i];
+  const r = await api('/api/drive/lanzou/share', 'POST', { isDir: f.isdir, id: f.fid });
+  if (!r.ok) { showMsg('driveMsg', r.message || '生成分享失败', false); return; }
+  const box = document.getElementById('driveShareBox');
+  const txt = r.data.shareUrl + (r.data.passcode ? '  提取码：' + r.data.passcode : '');
+  box.innerHTML = `<div class="sharebox"><span>「${escapeHtml(f.fname)}」分享链接：<b>${escapeHtml(r.data.shareUrl)}</b>${r.data.passcode ? ' · 提取码 <b>' + escapeHtml(r.data.passcode) + '</b>' : ''}</span><span class="row" style="gap:8px"><button class="ghost small" onclick="navigator.clipboard.writeText('${txt.replace(/'/g, "")}').then(()=>showMsg('driveMsg','已复制分享链接',true))">复制</button><button class="ghost small" onclick="document.getElementById('driveShareBox').innerHTML=''">关闭</button></span></div>`;
+}
+async function driveRename(i) {
+  const f = driveItems[i];
+  const name = await askInput('重命名' + (f.isdir ? '文件夹' : '文件'), f.fname);
+  if (name === null || !name.trim() || name.trim() === f.fname) return;
+  const r = await api('/api/drive/lanzou/rename', 'POST', { isDir: f.isdir, id: f.fid, name: name.trim() });
+  if (r.ok) { showMsg('driveMsg', '已重命名', true); loadDrive(); }
+  else showMsg('driveMsg', r.message || '重命名失败', false);
+}
+async function driveDelete(i) {
+  const f = driveItems[i];
+  if (!confirm('确定删除「' + f.fname + '」？' + (f.isdir ? '文件夹内的文件也会一并删除。' : ''))) return;
+  const r = await api('/api/drive/lanzou/delete', 'POST', { isDir: f.isdir, id: f.fid });
+  if (r.ok) { showMsg('driveMsg', '已删除', true); loadDrive(); }
+  else showMsg('driveMsg', r.message || '删除失败', false);
+}
+async function driveNewFolder() {
+  const name = await askInput('新建文件夹', '');
+  if (name === null || !name.trim()) return;
+  const r = await api('/api/drive/lanzou/folder', 'POST', { parentId: driveCurFid(), name: name.trim() });
+  if (r.ok) { showMsg('driveMsg', '已新建文件夹', true); loadDrive(); }
+  else showMsg('driveMsg', r.message || '新建失败', false);
+}

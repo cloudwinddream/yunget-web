@@ -4,6 +4,10 @@ import com.yunget.app.data.network.model.ShareFile
 import com.yunget.web.model.ApiResult
 import com.yunget.web.model.BatchActionRequest
 import com.yunget.web.model.BatchDeleteRequest
+import com.yunget.web.model.DriveDownloadRequest
+import com.yunget.web.model.DriveFolderRequest
+import com.yunget.web.model.DriveItemRequest
+import com.yunget.web.model.DriveRenameRequest
 import com.yunget.web.model.CookieLoginRequest
 import com.yunget.web.model.DirListResponse
 import com.yunget.web.model.QrStatusResponse
@@ -76,7 +80,13 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService) {
                     }
                     "password" -> {
                         val req = call.receive<PasswordLoginRequest>()
-                        if (p == Platform.PAN123) {
+                        if (p == Platform.LANZOU) {
+                            val r = netdisk.loginLanzou(req.username, req.password)
+                            r.fold(
+                                onSuccess = { call.respond(ok(mapOf("nickname" to it))) },
+                                onFailure = { call.respond(fail(it.message ?: "登录失败")) }
+                            )
+                        } else if (p == Platform.PAN123) {
                             val r = netdisk.loginPan123(req.username, req.password)
                             r.fold(
                                 onSuccess = { call.respond(ok(mapOf("nickname" to it))) },
@@ -238,6 +248,91 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService) {
                 )
             } catch (e: Exception) {
                 call.respond(fail(e.message ?: "获取文件列表失败"))
+            }
+        }
+
+
+        // ---------- 个人盘文件（当前实现：蓝奏云） ----------
+
+        get("/drive/{platform}/list") {
+            val platform = call.parameters["platform"] ?: return@get call.respond(fail("缺少平台参数"))
+            try {
+                if (platform != "lanzou") return@get call.respond(fail("该平台暂不支持网盘文件管理"))
+                val dirFid = call.request.queryParameters["dirFid"] ?: ""
+                val files = netdisk.lanzouDriveList(dirFid)
+                call.respond(
+                    ok(files.map {
+                        FileItem(
+                            fid = it.fid, fname = it.fname, fsize = it.fsize,
+                            isdir = it.isdir, pdirFid = it.pdirFid,
+                            fidToken = it.fidToken, modifyTime = it.modifyTime
+                        )
+                    })
+                )
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "获取文件列表失败"))
+            }
+        }
+
+        post("/drive/{platform}/download") {
+            val platform = call.parameters["platform"] ?: return@post call.respond(fail("缺少平台参数"))
+            try {
+                if (platform != "lanzou") return@post call.respond(fail("该平台暂不支持网盘文件管理"))
+                val req = call.receive<DriveDownloadRequest>()
+                val id = netdisk.lanzouDriveDownload(req.fid, req.fname)
+                call.respond(ok(mapOf("taskId" to id)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "下载失败"))
+            }
+        }
+
+        post("/drive/{platform}/folder") {
+            val platform = call.parameters["platform"] ?: return@post call.respond(fail("缺少平台参数"))
+            try {
+                if (platform != "lanzou") return@post call.respond(fail("该平台暂不支持网盘文件管理"))
+                val req = call.receive<DriveFolderRequest>()
+                if (req.name.isBlank()) return@post call.respond(fail("文件夹名不能为空"))
+                val id = netdisk.lanzouCreateFolder(req.parentId, req.name.trim())
+                call.respond(ok(mapOf("folderId" to id)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "新建文件夹失败"))
+            }
+        }
+
+        post("/drive/{platform}/rename") {
+            val platform = call.parameters["platform"] ?: return@post call.respond(fail("缺少平台参数"))
+            try {
+                if (platform != "lanzou") return@post call.respond(fail("该平台暂不支持网盘文件管理"))
+                val req = call.receive<DriveRenameRequest>()
+                if (req.name.isBlank()) return@post call.respond(fail("名称不能为空"))
+                netdisk.lanzouRename(req.isDir, req.id, req.name.trim())
+                call.respond(ok(mapOf("renamed" to true)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "重命名失败"))
+            }
+        }
+
+        post("/drive/{platform}/delete") {
+            val platform = call.parameters["platform"] ?: return@post call.respond(fail("缺少平台参数"))
+            try {
+                if (platform != "lanzou") return@post call.respond(fail("该平台暂不支持网盘文件管理"))
+                val req = call.receive<DriveItemRequest>()
+                netdisk.lanzouDelete(req.isDir, req.id)
+                call.respond(ok(mapOf("deleted" to true)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "删除失败"))
+            }
+        }
+
+        post("/drive/{platform}/share") {
+            val platform = call.parameters["platform"] ?: return@post call.respond(fail("缺少平台参数"))
+            try {
+                if (platform != "lanzou") return@post call.respond(fail("该平台暂不支持网盘文件管理"))
+                val req = call.receive<DriveItemRequest>()
+                val info = netdisk.lanzouShare(req.isDir, req.id)
+                call.respond(ok(mapOf("shareUrl" to info.shareUrl, "passcode" to info.passcode)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "生成分享失败"))
             }
         }
 

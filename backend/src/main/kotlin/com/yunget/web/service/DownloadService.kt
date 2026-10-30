@@ -207,7 +207,7 @@ class DownloadService(dataDir: File) {
         /** 迅雷默认连接数（原版为固定值；本项目改为默认 8、可调，避免锁死导致部分用户降速） */
         const val XUNLEI_CONNECTIONS = 8
         /** 参与并发统计的网盘 id（含 "" = 普通直链下载） */
-        val PLATFORM_IDS = listOf("quark", "uc", "xunlei", "baidu", "pan123", "c139", "")
+        val PLATFORM_IDS = listOf("quark", "uc", "xunlei", "baidu", "pan123", "c139", "lanzou", "")
     }
 
     /** 恢复默认设置：回到 SettingsData() 初始值（各网盘连接数 32、迅雷固定 8 等）；
