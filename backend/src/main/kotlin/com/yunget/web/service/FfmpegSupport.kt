@@ -1,6 +1,5 @@
 package com.yunget.web.service
 
-import com.yunget.app.data.network.HttpClients
 import com.yunget.web.model.FfmpegStatusResponse
 import okhttp3.Request
 import org.tukaani.xz.XZInputStream
@@ -111,7 +110,7 @@ class FfmpegSupport(private val dataDir: File) {
      * 否则清理托管目录残留后下载官方静态构建并安装，装完返回刷新后的状态。
      * 任一步失败抛 IllegalStateException，文案注明是哪一步（下载/解压/定位/探测）。
      */
-    fun install(customPath: String): FfmpegStatusResponse {
+    fun install(customPath: String, toolProxy: String = ""): FfmpegStatusResponse {
         status(customPath).let { if (it.available) return it }
 
         val pkg = packageFor() ?: throw IllegalStateException(
@@ -124,9 +123,9 @@ class FfmpegSupport(private val dataDir: File) {
 
         val archive = File(dir, pkg.fileName)
         try {
-            download(pkg.url, archive)
+            download(pkg.url, archive, toolProxy)
         } catch (e: Exception) {
-            throw IllegalStateException("下载 ffmpeg 安装包失败（网络或地址问题）：${e.message}", e)
+            throw IllegalStateException("下载 ffmpeg 安装包失败（网络或地址问题）：${e.message}${InstallHttp.PROXY_HINT}", e)
         }
         try {
             if (pkg.isZip) unzip(archive, dir) else untarXz(archive, dir)
@@ -178,13 +177,13 @@ class FfmpegSupport(private val dataDir: File) {
         }
     }
 
-    /** 流式下载落盘（大文件不进内存）；HTTP 非 2xx 视为下载失败 */
-    private fun download(url: String, dest: File) {
+    /** 流式下载落盘（大文件不进内存）；HTTP 非 2xx 视为下载失败。toolProxy 非空时经工具安装代理下载 */
+    private fun download(url: String, dest: File, toolProxy: String = "") {
         val request = Request.Builder()
             .url(url)
             .header("User-Agent", "YunGet-Web")
             .build()
-        HttpClients.downloadClient().newCall(request).execute().use { resp ->
+        InstallHttp.downloadClient(toolProxy).newCall(request).execute().use { resp ->
             if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}")
             val body = resp.body ?: throw IllegalStateException("响应为空")
             body.byteStream().use { input ->

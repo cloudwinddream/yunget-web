@@ -188,8 +188,9 @@ class YouTubeService(
 
     fun ytdlpStatus(): YtDlpStatusResponse = ytdlp.status(settings.ytdlpPath)
 
-    /** 同步阻塞（下载二进制），路由层需包 Dispatchers.IO */
-    fun installYtdlp(): YtDlpStatusResponse = ytdlp.install(settings.ytdlpPath)
+    /** 同步阻塞（下载二进制），路由层需包 Dispatchers.IO。安装下载走工具安装代理，ytdlpProxy 兜底 */
+    fun installYtdlp(): YtDlpStatusResponse =
+        ytdlp.install(settings.ytdlpPath, settings.toolProxy, settings.ytdlpProxy)
 
     // ------------------------------------------------------------------
     // 解析

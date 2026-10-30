@@ -714,6 +714,7 @@ function setGopeedBtnsDisabled(dis) {
   });
 }
 async function gopeedInstall() {
+  await saveSettings(); // 先把本页设置（含工具安装代理）落盘再安装，避免填了代理没保存就点安装
   hideMsg('gopeedMsg');
   showMsg('gopeedMsg', '正在从 Gopeed 官方下载并安装内核（约 20MB），请稍候…', true);
   setGopeedBtnsDisabled(true);
@@ -787,6 +788,7 @@ async function loadSettings() {
   document.getElementById('setFfmpegPath').value = s.ffmpegPath || '';
   document.getElementById('setYtdlpPath').value = s.ytdlpPath || '';
   document.getElementById('setYtdlpProxy').value = s.ytdlpProxy || '';
+  document.getElementById('setToolProxy').value = s.toolProxy || '';
   document.getElementById('setNameTemplate').value = s.videoNameTemplate || '{title}';
   loadGopeedStatus();
   refreshFfmpegCard();
@@ -816,6 +818,7 @@ async function saveSettings() {
     ffmpegPath: document.getElementById('setFfmpegPath').value.trim(),
     ytdlpPath: document.getElementById('setYtdlpPath').value.trim(),
     ytdlpProxy: document.getElementById('setYtdlpProxy').value.trim(),
+    toolProxy: document.getElementById('setToolProxy').value.trim(),
     videoNameTemplate: document.getElementById('setNameTemplate').value.trim() || '{title}',
     downloadDir: document.getElementById('setDir').value.trim()
   };
@@ -1132,6 +1135,7 @@ async function ffmpegInstall() {
   btn.textContent = '正在下载安装…';
   hideMsg('ffmpegMsg');
   try {
+    await saveSettings(); // 先把本页设置（含工具安装代理）落盘再安装，避免填了代理没保存就点安装
     const r = await api('/api/video/ffmpeg/install', 'POST', {});
     if (r.ok) {
       ffmpegState = r.data;
@@ -1421,6 +1425,7 @@ async function ytdlpInstall() {
   btn.textContent = '正在下载安装…';
   hideMsg('ytdlpMsg');
   try {
+    await saveSettings(); // 先把本页设置（含工具安装代理）落盘再安装，避免填了代理没保存就点安装
     const r = await api('/api/youtube/ytdlp/install', 'POST', {});
     if (r.ok) {
       ytdlpState = r.data;

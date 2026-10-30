@@ -207,7 +207,7 @@ class VideoService(
 
     /** 同步阻塞（下载安装包），路由层需包 Dispatchers.IO */
     fun installFfmpeg(): FfmpegStatusResponse =
-        ffmpeg.install(downloadService.settings.ffmpegPath)
+        ffmpeg.install(downloadService.settings.ffmpegPath, downloadService.settings.toolProxy)
 
     /**
      * 按下标把媒体入队下载。返回新建的任务 ID 列表。

@@ -1,6 +1,5 @@
 package com.yunget.web.service
 
-import com.yunget.app.data.network.HttpClients
 import com.yunget.web.model.GopeedStatusResponse
 import com.yunget.web.model.GopeedTaskView
 import okhttp3.MediaType.Companion.toMediaType
@@ -88,7 +87,7 @@ class GopeedService(
         /** 停止时等待进程自行退出的上限（毫秒），超时强杀 */
         private const val STOP_TIMEOUT_MS = 3_000L
 
-        /** 本机 OS（Gopeed 官方资产名用词）：windows / darwin / linux */
+        /** 本机 OS（内部/展示用词）：windows / darwin / linux */
         fun osKey(): String {
             val os = System.getProperty("os.name").orEmpty().lowercase()
             return when {
@@ -97,6 +96,13 @@ class GopeedService(
                 else -> "linux"
             }
         }
+
+        /**
+         * Gopeed 官方 Release 资产名里的 OS 段用词：macOS 段官方写 **macos** 不是 darwin
+         * （v1.9.3 实测资产名 gopeed-web-v1.9.3-macos-arm64.zip；写成 darwin 永远找不到包）。
+         * windows / linux 与 [osKey] 一致。状态展示仍用 osKey() 的 darwin。
+         */
+        fun assetOsKey(): String = if (osKey() == "darwin") "macos" else osKey()
 
         /** 本机架构（Gopeed 官方资产名用词）：aarch64/arm64 → arm64，其余 → amd64 */
         fun archKey(): String {
@@ -187,28 +193,58 @@ class GopeedService(
             .header("Accept", "application/vnd.github+json")
             .header("User-Agent", UA)
             .build()
-        val json = HttpClients.apiClient().newCall(req).execute().use { resp ->
-            val text = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) {
-                throw IllegalStateException("获取 Gopeed 官方 Release 失败（HTTP ${resp.code}）")
+        // 元数据请求也走工具安装代理（GitHub API 在部分网络同样直连不通）
+        val json = try {
+            InstallHttp.apiClient(downloads.settings.toolProxy).newCall(req).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    throw IllegalStateException("获取 Gopeed 官方 Release 失败（HTTP ${resp.code}）${InstallHttp.PROXY_HINT}")
+                }
+                runCatching { JSONObject(text) }.getOrElse {
+                    throw IllegalStateException("Gopeed 官方 Release 响应格式异常")
+                }
             }
-            runCatching { JSONObject(text) }.getOrElse {
-                throw IllegalStateException("Gopeed 官方 Release 响应格式异常")
-            }
+        } catch (e: IllegalStateException) {
+            throw e
+        } catch (e: Exception) {
+            throw IllegalStateException("获取 Gopeed 官方 Release 失败：${e.message}${InstallHttp.PROXY_HINT}", e)
         }
         val tag = json.optString("tag_name")
         if (tag.isBlank()) throw IllegalStateException("Gopeed 官方 Release 缺少版本号")
-        val wanted = "gopeed-web-$tag-${osKey()}-${archKey()}.zip"
-        val asset = json.optJSONArray("assets")?.let { arr ->
-            (0 until arr.length())
-                .mapNotNull { arr.optJSONObject(it) }
-                .firstOrNull { it.optString("name").equals(wanted, ignoreCase = true) }
-        } ?: throw IllegalStateException("Gopeed 官方 Release（$tag）里没有本机可用的内核包 $wanted")
+        val assets = json.optJSONArray("assets")?.let { arr ->
+            (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+        }.orEmpty()
+        val osSeg = assetOsKey()
+        val arch = archKey()
+        val wanted = "gopeed-web-$tag-$osSeg-$arch.zip"
+        // 先按精确名找；官方改名（如 darwin→macos 这类段位用词变化）时再按模式兜底：
+        // 同为 web 包、同 OS 段、同架构的资产即视为本机包，实际资产名以命中者为准。
+        var asset = assets.firstOrNull { it.optString("name").equals(wanted, ignoreCase = true) }
+        var actualName = wanted
+        if (asset == null) {
+            asset = assets.firstOrNull { a ->
+                val n = a.optString("name").lowercase()
+                n.startsWith("gopeed-web-$tag-") &&
+                    n.contains("-$osSeg-") &&
+                    n.endsWith("-$arch.zip")
+            }
+            if (asset != null) {
+                actualName = asset.optString("name")
+                log.info("Gopeed 内核包精确名 {} 未命中，按模式兜底选用实际资产 {}", wanted, actualName)
+            }
+        }
+        if (asset == null) {
+            val webAssets = assets.map { it.optString("name") }.filter { it.startsWith("gopeed-web-") }
+            throw IllegalStateException(
+                "Gopeed 官方 Release（$tag）里没有本机可用的内核包 $wanted；" +
+                    "该 Release 的 web 类资产有：${webAssets.joinToString("、").ifBlank { "（无）" }}"
+            )
+        }
         val direct = asset.optString("browser_download_url")
         if (direct.isBlank()) throw IllegalStateException("内核包缺少下载地址")
         return KernelPlan(
             version = tag,
-            assetName = wanted,
+            assetName = actualName,
             url = direct,
             size = asset.optLong("size"),
             digest = asset.optString("digest")
@@ -221,8 +257,10 @@ class GopeedService(
         val target = File(dir, plan.assetName)
         if (target.exists()) runCatching { target.delete() }
         val req = Request.Builder().url(plan.url).header("User-Agent", UA).build()
-        HttpClients.downloadClient().newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) throw IllegalStateException("内核下载失败（HTTP ${resp.code}）")
+        val client = InstallHttp.downloadClient(downloads.settings.toolProxy)
+        try {
+            client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) throw IllegalStateException("内核下载失败（HTTP ${resp.code}）${InstallHttp.PROXY_HINT}")
             val body = resp.body ?: throw IllegalStateException("内核下载响应为空")
             var downloaded = 0L
             target.outputStream().buffered().use { out ->
@@ -241,6 +279,12 @@ class GopeedService(
                 runCatching { target.delete() }
                 throw IllegalStateException("内核下载不完整（$downloaded/$total 字节）")
             }
+            }
+        } catch (e: IllegalStateException) {
+            throw e
+        } catch (e: Exception) {
+            runCatching { target.delete() }
+            throw IllegalStateException("内核下载失败：${e.message}${InstallHttp.PROXY_HINT}", e)
         }
         return target
     }

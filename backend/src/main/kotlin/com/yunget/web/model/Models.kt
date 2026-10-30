@@ -151,6 +151,9 @@ data class SettingsData(
     val ytdlpPath: String = "",
     // yt-dlp 出站代理（YouTube 在部分网络必须走代理，如 http://127.0.0.1:7890）；留空 = 直连
     val ytdlpProxy: String = "",
+    // 工具安装代理：ffmpeg / yt-dlp / Gopeed 三家「一键安装」下载官方源时共用
+    // （GitHub 等官方源在部分网络直连不通、TLS 握手会被掐）；支持 http:// / https:// / socks5://；留空 = 直连
+    val toolProxy: String = "",
     // 视频下载命名模板（仅作用于视频/YouTube 的标题生成型文件名，网盘保持原名）；
     // 变量：{title} 标题 {author} 作者 {id} 作品ID {platform} 平台 {quality} 清晰度 {date} 发布日期 {index} 序号（从 1 开始）
     val videoNameTemplate: String = "{title}"

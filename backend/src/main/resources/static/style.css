@@ -59,6 +59,14 @@ table.files tr.dir:hover td { background: #f6f9ff; }
 /* 设置页（v1.0.18 重排：分组卡片 + 说明左置 + 控件右置 + 开关样式） */
 .setrow { display: flex; align-items: center; gap: 16px; padding: 11px 0; border-bottom: 1px dashed #eef1f5; }
 .setrow:last-child { border-bottom: none; }
+/* 块状变体（v1.0.31）：label+大块编辑区（如平台 chips）的行改纵向排布。
+   根因：普通 .setrow 是横向 flex，编辑区（.pconn-grid）的固有宽度会把同行的
+   .setlab 挤碎（长 hint 逐字竖排、整行被撑高一屏）。块状时 setlab 与编辑区各占整行。 */
+.setrow--block { flex-direction: column; align-items: stretch; gap: 8px; }
+.setrow--block .setlab { flex: none; width: 100%; }
+.setrow--block .setlab label { display: inline-block; margin: 0 10px 0 0; }
+.setrow--block .pconn-grid { width: 100%; justify-content: flex-start; }
+.setrow--block .connlist { width: 100%; }
 .setlab { flex: 1; min-width: 0; }
 .setlab label { display: block; margin: 0 0 2px; font-size: 14px; color: #333; }
 .setctl { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }

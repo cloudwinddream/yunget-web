@@ -1,6 +1,5 @@
 package com.yunget.web.service
 
-import com.yunget.app.data.network.HttpClients
 import com.yunget.web.model.YtDlpStatusResponse
 import okhttp3.Request
 import java.io.File
@@ -99,7 +98,12 @@ class YtDlpSupport(private val dataDir: File) {
      * 否则清理托管目录残留后下载官方单文件二进制，跑 --version 验证后写入 version.txt。
      * 失败抛 IllegalStateException，文案注明步骤（下载/验证）。
      */
-    fun install(customPath: String): YtDlpStatusResponse {
+    /**
+     * @param toolProxy 工具安装代理（设置项 toolProxy，三家安装共用，优先）
+     * @param fallbackProxy 兜底代理（设置项 ytdlpProxy——用户可能早先在 yt-dlp 卡里填过）；
+     *   toolProxy 为空时才用它，避免用户填过一处却对安装不生效。
+     */
+    fun install(customPath: String, toolProxy: String = "", fallbackProxy: String = ""): YtDlpStatusResponse {
         status(customPath).let { if (it.available) return it }
 
         val pkg = packageFor() ?: throw IllegalStateException(
@@ -110,10 +114,11 @@ class YtDlpSupport(private val dataDir: File) {
         dir.mkdirs()
 
         val exe = File(dir, pkg.fileName)
+        val effectiveProxy = toolProxy.trim().ifBlank { fallbackProxy.trim() }
         try {
-            download(pkg.url, exe)
+            download(pkg.url, exe, effectiveProxy)
         } catch (e: Exception) {
-            throw IllegalStateException("下载 yt-dlp 失败（网络或地址问题）：${e.message}", e)
+            throw IllegalStateException("下载 yt-dlp 失败（网络或地址问题）：${e.message}${InstallHttp.PROXY_HINT}", e)
         }
         if (!isWindows()) runCatching { exe.setExecutable(true, false) }
         val version = probeVersion(exe)
@@ -141,13 +146,13 @@ class YtDlpSupport(private val dataDir: File) {
         }
     }
 
-    /** 流式下载落盘；HTTP 非 2xx 视为失败（与 FfmpegSupport.download 同实现） */
-    private fun download(url: String, dest: File) {
+    /** 流式下载落盘；HTTP 非 2xx 视为失败（与 FfmpegSupport.download 同实现）。proxy 非空时经工具安装代理下载 */
+    private fun download(url: String, dest: File, proxy: String = "") {
         val request = Request.Builder()
             .url(url)
             .header("User-Agent", "YunGet-Web")
             .build()
-        HttpClients.downloadClient().newCall(request).execute().use { resp ->
+        InstallHttp.downloadClient(proxy).newCall(request).execute().use { resp ->
             if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}")
             val body = resp.body ?: throw IllegalStateException("响应为空")
             body.byteStream().use { input ->
