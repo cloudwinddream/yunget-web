@@ -820,6 +820,29 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
             }
         }
 
+        // ---------- Deno 工具（yt-dlp 的 JS 运行时；状态 / 一键安装，仿 yt-dlp） ----------
+
+        get("/youtube/deno") {
+            try {
+                call.respond(ok(withContext(Dispatchers.IO) { youtube.denoStatus() }))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "获取 Deno 状态失败"))
+            }
+        }
+
+        post("/youtube/deno/install") {
+            try {
+                // 请求体与 yt-dlp 安装同构：{"force":true} = 强制重装（「更新」按钮）
+                val req = runCatching { call.receive<YtDlpInstallRequest>() }
+                    .getOrDefault(YtDlpInstallRequest())
+                // 同步阻塞（下载二进制），包 Dispatchers.IO
+                val st = withContext(Dispatchers.IO) { youtube.installDeno(req.force) }
+                call.respond(ok(st))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "Deno 安装失败"))
+            }
+        }
+
         get("/health") {
             call.respond(ok(mapOf("status" to "ok")))
         }

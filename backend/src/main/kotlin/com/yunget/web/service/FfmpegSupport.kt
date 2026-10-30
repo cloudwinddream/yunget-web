@@ -440,10 +440,13 @@ class FfmpegSupport(private val dataDir: File) {
     }
 
     companion object {
-        private val COMMON_PATHS = listOf(
-            "/opt/homebrew/bin/ffmpeg",
-            "/usr/local/bin/ffmpeg",
-            "/usr/bin/ffmpeg"
-        )
+        /** 常见安装路径（POSIX；~/.local/bin 为用户级手动安装的常见落点，与 YtDlpSupport 同构） */
+        private val COMMON_PATHS: List<String>
+            get() = listOf(
+                "/opt/homebrew/bin/ffmpeg",
+                "/usr/local/bin/ffmpeg",
+                File(System.getProperty("user.home").orEmpty(), ".local/bin/ffmpeg").path,
+                "/usr/bin/ffmpeg"
+            )
     }
 }

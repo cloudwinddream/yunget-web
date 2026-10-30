@@ -788,12 +788,14 @@ async function loadSettings() {
   document.getElementById('setDir').value = s.downloadDir || '';
   document.getElementById('setFfmpegPath').value = s.ffmpegPath || '';
   document.getElementById('setYtdlpPath').value = s.ytdlpPath || '';
+  document.getElementById('setDenoPath').value = s.denoPath || '';
   document.getElementById('setYtdlpProxy').value = s.ytdlpProxy || '';
   document.getElementById('setToolProxy').value = s.toolProxy || '';
   document.getElementById('setNameTemplate').value = s.videoNameTemplate || '{title}';
   loadGopeedStatus();
   refreshFfmpegCard();
   refreshYtdlpCard();
+  refreshDenoCard();
 }
 async function saveSettings() {
   hideMsg('setMsg');
@@ -818,13 +820,14 @@ async function saveSettings() {
     quarkNoSave: document.getElementById('setQuarkNoSave').checked,
     ffmpegPath: document.getElementById('setFfmpegPath').value.trim(),
     ytdlpPath: document.getElementById('setYtdlpPath').value.trim(),
+    denoPath: document.getElementById('setDenoPath').value.trim(),
     ytdlpProxy: document.getElementById('setYtdlpProxy').value.trim(),
     toolProxy: document.getElementById('setToolProxy').value.trim(),
     videoNameTemplate: document.getElementById('setNameTemplate').value.trim() || '{title}',
     downloadDir: document.getElementById('setDir').value.trim()
   };
   const r = await api('/api/settings', 'PUT', s);
-  if (r.ok) { ffmpegState = undefined; ytdlpState = undefined; } // 路径可能已变，后端按新值重探，前端缓存同步失效
+  if (r.ok) { ffmpegState = undefined; ytdlpState = undefined; denoState = undefined; } // 路径可能已变，后端按新值重探，前端缓存同步失效
   showMsg('setMsg', r.ok ? '设置已保存并即时生效' : (r.message || '保存失败'), r.ok);
 }
 
@@ -1579,6 +1582,61 @@ async function ytdlpDoInstall(force) {
     btn.disabled = false;
     btn.textContent = oldText;
     refreshYtdlpCard();
+  }
+}
+// ---------- Deno（yt-dlp 的 JS 运行时；嵌在 yt-dlp 卡内的子块，照 yt-dlp 卡模式） ----------
+let denoState = undefined; // undefined=未拉取，否则为 {available, version, path, source}
+const DENO_SOURCE_TEXT = { manual: '手动指定路径', app: '本应用托管安装', path: '系统 PATH', system: '系统安装路径' };
+async function fetchDenoState(force) {
+  if (denoState !== undefined && !force) return denoState;
+  const r = await api('/api/youtube/deno');
+  denoState = r.ok ? r.data : { available: false };
+  return denoState;
+}
+async function refreshDenoCard() {
+  const stEl = document.getElementById('denoStatus');
+  if (!stEl) return;
+  const st = await fetchDenoState(true);
+  const box = document.getElementById('denoInstallBox');
+  const updBox = document.getElementById('denoUpdateBox');
+  if (st.available) {
+    stEl.textContent = `已检测到 Deno ${st.version || ''}（来源：${DENO_SOURCE_TEXT[st.source] || st.source || '未知'}）· ${st.path}`;
+    box.style.display = 'none';
+    if (updBox) updBox.style.display = '';
+  } else {
+    stEl.textContent = '未检测到 Deno';
+    box.style.display = '';
+    if (updBox) updBox.style.display = 'none';
+  }
+  // 手动路径填了但没生效时，后端会给出具体原因（路径不存在/无法运行等），原样展示
+  const diag = document.getElementById('denoManualDiag');
+  if (diag) {
+    if (st.manualHint) { diag.textContent = '手动路径未生效：' + st.manualHint; diag.style.display = ''; }
+    else diag.style.display = 'none';
+  }
+}
+async function denoInstall() { await denoDoInstall(false); }
+async function denoUpdate() { await denoDoInstall(true); }
+/** force=false：一键安装（已装则后端直接返回现状）；force=true：更新（强制重装到托管目录） */
+async function denoDoInstall(force) {
+  const btn = document.getElementById(force ? 'denoUpdateBtn' : 'denoInstallBtn');
+  btn.disabled = true;
+  const oldText = btn.textContent;
+  btn.textContent = force ? '正在更新…' : '正在下载安装…';
+  hideMsg('denoMsg');
+  try {
+    await saveSettings(); // 先把本页设置（含工具安装代理）落盘再安装，避免填了代理没保存就点安装
+    const r = await api('/api/youtube/deno/install', 'POST', force ? { force: true } : {});
+    if (r.ok) {
+      denoState = r.data;
+      showMsg('denoMsg', (force ? 'Deno 更新完成：' : 'Deno 安装完成：') + (r.data.version || '') + '（' + (r.data.path || '') + '）', true);
+    } else {
+      showMsg('denoMsg', r.message || (force ? '更新失败' : '安装失败'), false);
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+    refreshDenoCard();
   }
 }
 function setNameTpl(t) { document.getElementById('setNameTemplate').value = t; }

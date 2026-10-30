@@ -35,9 +35,33 @@ import java.util.concurrent.TimeUnit
  * 只认 Netscape 格式文件。[cookieFileFor] 负责转换并落盘到
  * {dataDir}/tools/yt-dlp/cookies.txt（权限收紧到仅属主可读、解析后不删、复用）。
  */
-class YtDlpSupport(private val dataDir: File) {
+class YtDlpSupport(
+    private val dataDir: File,
+    /**
+     * Deno 运行时可执行文件的惰性解析（构造注入，与全工程 provider 惯例一致）：
+     * 每次 run 调用时现取——解析成功返回 deno 的绝对路径，run 会显式追加
+     * `--js-runtimes deno:<路径>`（yt-dlp 自身靠 PATH 找 deno 在部分机器上
+     * 失效，真机实证）；解析不到返回 null，run 不带该参数、行为与旧版一致。
+     * 默认 null（无 Deno 集成时不传参）。
+     */
+    private val denoPathProvider: () -> String? = { null }
+) {
 
     private val managedDir: File get() = File(dataDir, "tools/yt-dlp")
+
+    /** 最近一次 run 捕获的 yt-dlp WARNING 行（已去首尾空白）；run 每次覆写，诊断用 */
+    @Volatile
+    private var lastRunWarnings: List<String> = emptyList()
+
+    /** 最近一次 run 实际携带的 Cookie 条数；null = 未携带（未保存/转换不出有效条目）。run 每次覆写 */
+    @Volatile
+    private var lastRunCookieCount: Int? = null
+
+    /** 最近一次 run 捕获的 WARNING 行（成功路径不消费，仅解析全档失败时由调用方挑相关行透出） */
+    fun lastWarnings(): List<String> = lastRunWarnings
+
+    /** 最近一次 run 实际携带的 Cookie 条数（null = 未携带），供解析失败指引区分「没带上」与「带了仍被拦」 */
+    fun lastCookieCount(): Int? = lastRunCookieCount
 
     @Volatile
     private var cached: YtDlpStatusResponse? = null
@@ -279,14 +303,23 @@ class YtDlpSupport(private val dataDir: File) {
         val exe = executable(customPath)
             ?: throw IllegalStateException("未检测到 yt-dlp，请到设置页一键安装")
         val cmd = mutableListOf(exe.absolutePath)
+        // JS 运行时显式传参：2026 版 yt-dlp 解析 YouTube 强制需要 Deno，且它
+        // 自身靠 PATH 探测 deno 在部分机器上失效（应用进程 PATH 不全）；应用
+        // 已定位到 deno 时每次调用都带上 --js-runtimes，探测不到则不带、照旧跑。
+        runCatching { denoPathProvider() }.getOrNull()?.takeIf { it.isNotBlank() }?.let { denoPath ->
+            cmd += "--js-runtimes"
+            cmd += "deno:$denoPath"
+        }
         if (proxy.isNotBlank()) {
             cmd += "--proxy"
             cmd += proxy.trim()
         }
+        lastRunCookieCount = null
         if (!cookieHeader.isNullOrBlank()) {
-            cookieFileFor(cookieHeader)?.let { f ->
+            cookieFileFor(cookieHeader)?.let { (f, count) ->
                 cmd += "--cookies"
                 cmd += f.absolutePath
+                lastRunCookieCount = count
             }
         }
         cmd += args
@@ -303,7 +336,14 @@ class YtDlpSupport(private val dataDir: File) {
             proc.destroyForcibly()
             throw IllegalStateException("解析超时（超过 ${timeoutSec} 秒），请稍后重试或检查代理设置")
         }
-        val text = String(outFuture.get(5, TimeUnit.SECONDS), Charsets.UTF_8)
+        val rawText = String(outFuture.get(5, TimeUnit.SECONDS), Charsets.UTF_8)
+        // 警告行单独捕获、并从返回文本中剥离：调用方为拿到警告已不再传
+        // --no-warnings，WARNING 行混在合并输出里若原样返回会污染 -J 的 JSON
+        // 提取；捕获的警告经 lastWarnings() 供解析全档失败时挑相关行透出。
+        val rawLines = rawText.lines()
+        lastRunWarnings = rawLines.map { it.trim() }.filter { it.startsWith("WARNING:") }
+        val text = rawLines.filterNot { it.trimStart().startsWith("WARNING:") }
+            .joinToString("\n")
         if (proc.exitValue() != 0) {
             // 失败文案取输出尾部：yt-dlp 失败时 stdout 会打一个 JSON 字面量 "null"
             // （-J 无结果时的占位），混在合并输出里会变成「…；null」的怪尾巴，先滤掉；
@@ -343,12 +383,24 @@ class YtDlpSupport(private val dataDir: File) {
      *   为域的会话 Cookie（如某些地区的 SID 变体）在 youtube.com 请求中本就会
      *   被浏览器合并发送，按 .youtube.com 落盘与复制来源一致。
      */
-    private fun cookieFileFor(cookieHeader: String): File? = synchronized(this) {
+    /**
+     * 生成 Cookie 文件并回带**有效条目数**（供解析失败指引注明本次到底带没带上
+     * Cookie、带了几条）：Netscape 原文按非注释条目行数计（「#HttpOnly_」前缀
+     * 行是导出工具写的真实条目、计入；「#」注释与空行不计）；头字符串按转换
+     * 出的 k=v 对数计。转换不出有效条目返回 null。
+     */
+    private fun cookieFileFor(cookieHeader: String): Pair<File, Int>? = synchronized(this) {
         val raw = cookieHeader.trim()
         if (raw.isBlank()) return null
         val dir = managedDir.apply { mkdirs() }
         val file = File(dir, "cookies.txt")
+        var entryCount = 0
         val content = if (raw.contains("# Netscape", ignoreCase = true)) {
+            entryCount = raw.lines().count { line ->
+                val t = line.trim()
+                t.isNotBlank() && (!t.startsWith("#") || t.startsWith("#HttpOnly_"))
+            }
+            if (entryCount <= 0) return null
             if (raw.endsWith("\n")) raw else raw + "\n"
         } else {
             val pairs = raw.split(';').mapNotNull { part ->
@@ -357,6 +409,7 @@ class YtDlpSupport(private val dataDir: File) {
                 if (eq <= 0) null else p.substring(0, eq).trim() to p.substring(eq + 1).trim()
             }.filter { it.first.isNotBlank() }
             if (pairs.isEmpty()) return null
+            entryCount = pairs.size
             buildString {
                 appendLine("# Netscape HTTP Cookie File")
                 appendLine("# 由 YunGet Web 从浏览器 Cookie 头字符串转换生成")
@@ -375,7 +428,7 @@ class YtDlpSupport(private val dataDir: File) {
             println("[yt-dlp] 写 Cookie 文件失败：${e.message}")
             return null
         }
-        file
+        file to entryCount
     }
 
     private fun tightenPermissions(file: File) {
@@ -452,12 +505,14 @@ class YtDlpSupport(private val dataDir: File) {
          */
         private const val PROBE_TIMEOUT_SEC = 10L
 
-        /** 常见安装路径（POSIX；与 FfmpegSupport.COMMON_PATHS 同清单、仅工具名不同） */
-        private val COMMON_PATHS = listOf(
-            "/opt/homebrew/bin/yt-dlp",
-            "/usr/local/bin/yt-dlp",
-            "/usr/bin/yt-dlp"
-        )
+        /** 常见安装路径（POSIX；与 FfmpegSupport 的同名清单同构、仅工具名不同；~/.local/bin 为用户级手动安装的常见落点） */
+        private val COMMON_PATHS: List<String>
+            get() = listOf(
+                "/opt/homebrew/bin/yt-dlp",
+                "/usr/local/bin/yt-dlp",
+                File(System.getProperty("user.home").orEmpty(), ".local/bin/yt-dlp").path,
+                "/usr/bin/yt-dlp"
+            )
 
         /** 手动路径填成目录时，在其中找可执行文件的名字顺序 */
         private val MANUAL_EXE_NAMES = listOf("yt-dlp", "yt-dlp_macos", "yt-dlp.exe")

@@ -151,6 +151,8 @@ data class SettingsData(
     val ytdlpPath: String = "",
     // yt-dlp 出站代理（YouTube 在部分网络必须走代理，如 http://127.0.0.1:7890）；留空 = 直连
     val ytdlpProxy: String = "",
+    // Deno 可执行文件路径（yt-dlp 解析 YouTube 需要的 JavaScript 运行时）；留空则按 托管安装 → PATH → 常见路径顺序自动探测
+    val denoPath: String = "",
     // 工具安装代理：ffmpeg / yt-dlp / Gopeed 三家「一键安装」下载官方源时共用
     // （GitHub 等官方源在部分网络直连不通、TLS 握手会被掐）；支持 http:// / https:// / socks5://；留空 = 直连
     val toolProxy: String = "",
@@ -382,6 +384,19 @@ data class YtDlpInstallRequest(
 data class YtDlpStatusResponse(
     val available: Boolean,
     /** yt-dlp 版本（如 2025.10.14）；不可用时为空 */
+    val version: String = "",
+    /** 实际命中的可执行文件路径；不可用时为空 */
+    val path: String = "",
+    /** 命中来源：manual（设置项路径）| app（应用托管安装）| path（系统 PATH）| system（常见安装路径）；不可用时为空 */
+    val source: String = "",
+    /** 手动路径无效原因（仅当设置了手动路径且该候选探测失败时非空）：路径不存在/目录下无可执行文件/文件无法运行/运行超时；未设置或手动路径有效时为 null */
+    val manualHint: String? = null
+)
+
+@Serializable
+data class DenoStatusResponse(
+    val available: Boolean,
+    /** Deno 版本（如 2.9.8）；不可用时为空 */
     val version: String = "",
     /** 实际命中的可执行文件路径；不可用时为空 */
     val path: String = "",

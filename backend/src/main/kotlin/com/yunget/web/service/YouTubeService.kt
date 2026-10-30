@@ -10,6 +10,7 @@ import com.yunget.web.model.YouTubePlaylistDownloadRequest
 import com.yunget.web.model.YouTubePlaylistDownloadResponse
 import com.yunget.web.model.YouTubeQualityDto
 import com.yunget.web.model.YouTubeSubtitleDto
+import com.yunget.web.model.DenoStatusResponse
 import com.yunget.web.model.YtDlpStatusResponse
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -80,7 +81,8 @@ private data class YtJson(
  * YouTube 解析（yt-dlp 托管工具路线）：yt-dlp 只做解析器（-J 拿元数据与直链），
  * 下载仍走自家 DownloadService；DASH 分轨复用 v1.0.29 的 ffmpeg 合轨模式。
  *
- * - 单视频：`-J --no-warnings --no-playlist`，后端按目标高度挑格式（见 [pick]）；
+ * - 单视频：`-J --no-playlist`（不加 --no-warnings，WARNING 由 YtDlpSupport
+ *   捕获剥离、全档失败时透出最相关一条），后端按目标高度挑格式（见 [pick]）；
  *   解析带 player_client 兜底链（默认 → android_vr → tv → web_safari），见 [runParseJson]；
  * - 播放列表（URL 含 list= 或 /playlist）：`-J --flat-playlist` 只列条目，
  *   下载时逐条再取完整 -J（顺序执行、逐条失败不中断）；
@@ -130,9 +132,19 @@ class YouTubeService(
         /** 兜底链全部失败时追加在错误主文案后的自救指引 */
         private const val RETRY_GUIDE =
             "（可尝试：到账号页保存 YouTube Cookie 后重试；在设置页更新 yt-dlp 到最新版；或检查工具代理是否可用）"
+
+        /** 解析失败且 Deno 未解析到时追加的指引（无 JS 运行时是「无可用格式」的一大主因） */
+        private const val DENO_MISSING_GUIDE =
+            "（未检测到 Deno 运行时也会导致无可用格式——到设置页一键安装 Deno 后重试）"
     }
 
-    private val ytdlp = YtDlpSupport(dataDir)
+    private val deno = DenoSupport(dataDir)
+
+    // yt-dlp 调用时显式传 Deno：provider 每次调用现解析（走 DenoSupport 的
+    // 缓存 status），保证设置页刚装好/刚改路径立刻生效，不必重启。
+    private val ytdlp = YtDlpSupport(dataDir) {
+        deno.executable(settings.denoPath)?.absolutePath
+    }
     private val ffmpeg = FfmpegSupport(dataDir)
     private val json = Json { ignoreUnknownKeys = true }
     private val muxScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -212,6 +224,16 @@ class YouTubeService(
         ytdlp.install(settings.ytdlpPath, settings.toolProxy, settings.ytdlpProxy, force)
 
     // ------------------------------------------------------------------
+    // Deno 工具状态 / 安装（yt-dlp 的 JS 运行时，定位与安装在 DenoSupport）
+    // ------------------------------------------------------------------
+
+    fun denoStatus(): DenoStatusResponse = deno.status(settings.denoPath)
+
+    /** 同步阻塞（下载二进制），路由层需包 Dispatchers.IO。安装下载走工具安装代理；force=true 为「更新」（强制重装） */
+    fun installDeno(force: Boolean = false): DenoStatusResponse =
+        deno.install(settings.denoPath, settings.toolProxy, force)
+
+    // ------------------------------------------------------------------
     // 解析
     // ------------------------------------------------------------------
 
@@ -282,7 +304,10 @@ class YouTubeService(
         val cookie = accounts.get(YOUTUBE_KEY)?.cookie?.takeIf { it.isNotBlank() }
         var lastError: Exception? = null
         for ((i, attempt) in PLAYER_CLIENT_ATTEMPTS.withIndex()) {
-            val args = mutableListOf("-J", "--no-warnings")
+            // 不再传 --no-warnings：WARNING 行是定位环境问题（如缺 JS 运行时）
+            // 的关键线索，由 YtDlpSupport.run 捕获并从返回文本中剥离（不污染
+            // JSON 提取），全档失败时挑最相关的一条透出到报错里。
+            val args = mutableListOf("-J")
             if (flatPlaylist) args += "--flat-playlist" else args += "--no-playlist"
             args += attempt.args
             args += url
@@ -310,7 +335,33 @@ class YouTubeService(
             }
         }
         val base = lastError?.message ?: "yt-dlp 解析失败"
-        throw IllegalStateException(base + RETRY_GUIDE)
+        throw IllegalStateException(buildString {
+            append(base)
+            // 警告透出：附上最近一次运行里最相关的 WARNING 行（原文自带
+            // 「WARNING:」前缀），让缺运行时/需 PO Token 这类环境问题在报错里自证
+            relevantWarning(ytdlp.lastWarnings())?.let { append("（yt-dlp 提示：").append(it).append("）") }
+            // Cookie 携带情况：区分「根本没带上」与「带了仍被机器人验证拦下」，
+            // 两者的下一步完全不同（前者去保存，后者多半是出口 IP 被风控）
+            val cookieCount = ytdlp.lastCookieCount()
+            if (cookieCount != null) {
+                append("（本次解析已携带登录 Cookie（$cookieCount 条），仍被 YouTube 拦截——大概率是当前出口 IP 被风控（机器人验证），建议更换代理节点，或在设置页为 yt-dlp 指定其它出站代理后重试）")
+            }
+            append(RETRY_GUIDE)
+            if (!deno.status(settings.denoPath).available) append(DENO_MISSING_GUIDE)
+        })
+    }
+
+    /**
+     * 从 yt-dlp 的 WARNING 行中挑最相关的一条透出：优先含 JavaScript runtime /
+     * deno / PO Token / impersonate 关键词的行（按出现顺序取第一条）；一条都
+     * 不含时退取第一条警告；没有警告返回 null（成功路径不消费此函数）。
+     * 单条截断 300 字防爆。
+     */
+    private fun relevantWarning(warnings: List<String>): String? {
+        if (warnings.isEmpty()) return null
+        val keys = listOf("javascript runtime", "deno", "po token", "impersonate")
+        val hit = warnings.firstOrNull { line -> keys.any { line.contains(it, ignoreCase = true) } }
+        return (hit ?: warnings.first()).take(300)
     }
 
     private fun toVideoInfo(j: YtJson): YtVideoInfo {
