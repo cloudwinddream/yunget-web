@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
@@ -90,6 +91,7 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
         { segmentClient },
         { streamClientOrCreate() },
         { config.ioBufferSize },
+        { config.bufferedSegmentWrite },
     )
     private val speedLimiter = SpeedLimiter { config.globalSpeedLimitBytesPerSec }
 
@@ -152,8 +154,16 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
                 completions[id]?.complete(Result.failure(e))
                 setState(id, request, TaskState.CANCELED)
             } catch (e: Exception) {
-                emit(TurboEvent.Failed(id, e.message ?: e.javaClass.simpleName))
-                updateProgress(id) { it.copy(state = TaskState.FAILED, error = e.message) }
+                // 【归因优先】0.2.3.0 让 SegmentDownloader 在分片层记录了"真实原因"
+                // （HTTP 状态码 / 连接被重置 / 只回了半截 body …），因为那里才拿得到
+                // 响应信息，异常冒到这一层时只剩一句泛化的 message（"failed to
+                // connect"），对排查没有任何帮助。
+                // takeWholeError 会**移除**记录，所以必须只调一次并复用结果。
+                val reason = downloader.takeWholeError(id)
+                    ?: e.message
+                    ?: e.javaClass.simpleName
+                emit(TurboEvent.Failed(id, reason))
+                updateProgress(id) { it.copy(state = TaskState.FAILED, error = reason) }
                 completions[id]?.complete(Result.failure(e))
             }
         }
@@ -178,15 +188,35 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
     /**
      * 恢复已暂停的任务（断点续传）。
      *
-     * 修复竞态：旧实现 pause 异步 cancelAndJoin，resume 可能在旧 job 真正退出前就启动新 job，
-     * 两个协程短暂并发写同一 chunkDir（分片文件互相覆盖）。现在启动前先 join 旧 job。
+     * ## 竞态：join 必须在 launch 之前**同步**完成
+     *
+     * 原实现把 `jobs.remove(id)?.cancelAndJoin()` 放在 `scope.launch` **内部**，于是：
+     *
+     * ```
+     * resume() → launch(协程尚未被调度) → putIfAbsent 同步执行 → 旧 job 还在表里
+     *          → 返回 false 并 cancel 掉刚 launch 的协程 → 续传永远启动不了
+     * ```
+     *
+     * 那个协程要等调度器给它时间才会跑到 `jobs.remove`，而 `putIfAbsent` 是同步的 ——
+     * 所以「join 旧 job」从来没有在 `putIfAbsent` 之前发生。
+     * 实测（`BuiltinBackendE2ETest`）：`pause` 后 300ms 调 `resume`，
+     * 任务**永远到不了终态**，端到端测试超时 60s。
+     *
+     * 现在顺序是：同步 join 掉旧 job → putIfAbsent 占位 → 再 launch。
+     * 于是 `putIfAbsent` 看到的一定是「没有活动 job」，`resume` 也就能如实返回成功。
      */
     fun resume(id: Long): Boolean {
         val req = requests[id] ?: return false
         completions.putIfAbsent(id, CompletableDeferred())
-        val job = scope.launch {
-            // 先确保旧 job 已彻底退出，避免两个下载协程同时写分片目录。
+
+        // 同步等待旧 job 退出：它会写下 PAUSED 并归还分片目录，之后才允许新 job 接手。
+        // 这里必须用 runBlocking 而不是 launch —— 正确性依赖「join 已经完成」，
+        // 而 launch 做不到同步保证，那正是这个竞态的来源。
+        runBlocking {
             jobs.remove(id)?.let { runCatching { it.cancelAndJoin() } }
+        }
+
+        val job = scope.launch {
             try {
                 awaitSlot(id)
                 if (coroutineContext[Job]?.isActive != true) return@launch
@@ -195,7 +225,15 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
             } catch (e: CancellationException) {
                 setState(id, req, TaskState.PAUSED)
             } catch (e: Exception) {
-                emit(TurboEvent.Failed(id, e.message ?: e.javaClass.simpleName))
+                // 同 start()：优先用分片层记录的真实原因
+                emit(
+                    TurboEvent.Failed(
+                        id,
+                        downloader.takeWholeError(id)
+                            ?: e.message
+                            ?: e.javaClass.simpleName,
+                    ),
+                )
                 completions[id]?.complete(Result.failure(e))
             }
         }
@@ -218,16 +256,32 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
         }
     }
 
-    /** 关闭引擎，取消所有任务并释放资源。 */
+    /**
+     * 关闭引擎，取消所有任务并释放资源。
+     *
+     * ## 为什么每个释放动作各自 `runCatching`
+     *
+     * 这里原先是一条裸顺序链，**第一个抛出的异常会截断后面全部清理**：
+     * `connectionPool.evictAll()` 不是"清空列表"这么无害 —— 它真的 close 每条空闲连接的 socket，
+     * 而关闭 TLS 连接要写 `close_notify`（一次网络写）。OkHttp 的 `Util.closeQuietly` 只吞
+     * `IOException`，**`NetworkOnMainThreadException` 会原样穿透**（Android 宿主在
+     * `ViewModel.onCleared()` 这类主线程回调里调本方法时就会遇到）。
+     * 结果：不仅崩到调用方，`segmentClient` 的 Dispatcher 线程池也**永远不会被关** ——
+     * 一次崩溃换来一份永久泄漏。
+     *
+     * 现在：先关两个线程池（纯内存操作，不会失败），再各自兜底地清连接池，
+     * 任何一个失败都不影响其余步骤。Android 宿主仍应在后台线程调用本方法（关 socket 是网络 I/O），
+     * 但即便误在主线程调用，也不会再截断清理链。
+     */
     fun shutdown() {
         scope.coroutineContext[Job]?.cancel()
         // 惰性客户端可能从未创建：没创建过就没什么可关的，别在这里把它唤醒。
         streamClientRef?.let { sc ->
-            sc.dispatcher.executorService.shutdown()
-            sc.connectionPool.evictAll()
+            runCatching { sc.dispatcher.executorService.shutdown() }
+            runCatching { sc.connectionPool.evictAll() }
         }
-        segmentClient.dispatcher.executorService.shutdown()
-        segmentClient.connectionPool.evictAll()
+        runCatching { segmentClient.dispatcher.executorService.shutdown() }
+        runCatching { segmentClient.connectionPool.evictAll() }
     }
 
     // ---------- 内部 ----------

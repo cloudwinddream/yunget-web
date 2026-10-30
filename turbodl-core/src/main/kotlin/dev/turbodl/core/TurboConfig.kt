@@ -126,7 +126,42 @@ data class TurboConfig(
      *
      * 关闭时行为与改造前完全一致（走常规合并，已验证 89 个测试全绿）。
      */
+    @Deprecated(
+        "已被「按偏移直写目标文件」取代（0.2.5.0）。直写同时消除了合并阶段与这份开关的全部风险，" +
+            "本字段保留只为不破坏既有调用方，引擎不再读取它。"
+    )
     val overlapMerge: Boolean = false,
+
+    /**
+     * 分片写入是否走缓冲流（P12 评估项，**默认 false**）。
+     *
+     * ## 为什么不加缓冲（实测结论，不是没做）
+     *
+     * `SegmentDownloader.writeSlice` 原本（以及默认）用裸 `RandomAccessFile` 直写。
+     * "裸直写会有系统调用开销"听起来像优化点，所以做了 A/B 实测
+     * （`SegmentWriteBufferTest`，16MB / 128 连接 / 64KB 分片 = 256 片、交错 3 轮取中位数）：
+     *
+     * | 写法 | 中位数 | 吞吐 | 样本 |
+     * |---|---|---|---|
+     * | 直写 | 2576ms | 6.2 MB/s | 2391 / 2576 / 2906 |
+     * | 缓冲写（64KB + 每块 flush） | 2584ms | 6.2 MB/s | 2419 / 2584 / 2700 |
+     *
+     * **差异 0.3%，落在噪声范围内** —— 没有可复现的收益。
+     *
+     * 【为什么这里学不到东西】回环的写路径几乎不阻塞（页缓存），既没有磁盘寻道也没有真实
+     * IO 等待，因此"减少 write 调用次数"省不出时间；而真实瓶颈在磁盘时，缓冲的收益又取决于
+     * 文件系统与存储介质，不是引擎能一概而论的。
+     *
+     * 【代价却是确定的】缓冲会把"已写入长度"的含义从"已落盘"变成"已交给 OS 缓冲"。
+     * 断点续传靠文件长度判断下了多少（见 `SegmentScheduler.verifyCoverage`），
+     * 所以开启后必须"每次回调前 flush" —— 那就等于每块一次 flush，把缓冲的意义抵消掉大半
+     * （上表的缓冲写就是这么实现的）。要真正做到"批量落盘 + 精确续传"，
+     * 得给分片加"已写入区间"的显式记录，那是 [overlapMerge] 同级的复杂度。
+     *
+     * 结论：**保持直写**。本开关留作"我知道自己在干什么"时的复测入口 ——
+     * 换到更快的链路或真实磁盘压力下，结论可能不同，届时先用 `SegmentWriteBufferTest` 对比再改默认值。
+     */
+    val bufferedSegmentWrite: Boolean = false,
 
     /**
      * 分段最小尺寸（字节，默认 64KB）—— 块大小的**下限**。
@@ -200,16 +235,40 @@ data class TurboConfig(
      * 背景：块数 = `连接数 × segmentsPerConnection`，是个**没有上限的乘法**：
      * 128 连接 → 512 块（被 minSegmentSize 压到 256 块，每块仅 64KB）。
      *
-     * ⚠️ **为什么默认关闭（曾短暂默认 128，已回退）**：
-     * 1. 收益只在**回环**上量到（分片 256→128 约 1.70×）。回环没有 RTT，每请求固定开销被低估，
-     *    但真实链路的**最佳块数**从未验证；
-     * 2. 更要命的是**它会吃掉工作窃取的余量**：128 线程 + 上限 128 ⇒ 恰好 1 块/线程，
-     *    慢连接一旦拖住就没有空闲块可供快连接窃取 —— 而 `SkewSweepTest` 证明
-     *    "有 1 条慢连接时多块比少块快 3.17 倍"。真实 CDN 恰恰是速度不均的。
-     *    用户实报 rc19 之后"速度与线程上升都变慢"，与此吻合。
+     * ## 实测（`FanoutCostTest`，16MB / 不限速回环 / 交错 3 轮取中位数）
      *
-     * 结论：**默认不限**，把它留作"我知道自己在干什么"时的手动旋钮。
-     * 若要用，请先在真实链路上对比（`RealLinkSweepTest`），并注意块数不得接近连接数。
+     * 用 `minSegmentSize` 独立拨动分片数，做成 2×2 正交矩阵，**把两个维度分开**：
+     *
+     * | 组 | 连接数 | 分片数 | 吞吐 | 峰值并发 |
+     * |---|---|---|---|---|
+     * | A | 128 | 256 | 6.4 MB/s | 53 |
+     * | B | 128 | 128 | 8.4 MB/s | 10 |
+     * | C | 64 | 256 | 10.4 MB/s | 13 |
+     * | D | 64 | 128 | **18.0 MB/s** | 9 |
+     * | E | 32 | 128 | 18.1 MB/s | 10 |
+     * | F | 16 | 64 | **31.1 MB/s** | 8 |
+     *
+     * 判读（`连接数 128→64` 平均收益 **1.88×**；`分片数 256→128` 平均 **1.52×**）：
+     *
+     * 1. **两个维度的影响相当，而且都不是唯一原因** —— 单独减一半连接或减一半分片，
+     *    都拿不回全部差距；只有两者**同时降**（D 组）才接近最优。
+     * 2. 曲线一路单调向上直到 16 连接（F 组 31.1 MB/s 是最快的），
+     *    所以"128 连接慢 4 倍"的主因不是分片数，而是**连接数本身在高位就开始亏**。
+     *
+     * ⚠️ **对旧结论的修正**：这条注释早先写"收益只在回环上量到（1.70×）"，
+     * 并据此认为分片数是主要矛盾。实测表明分片数只是一半，**连接数是另一半** ——
+     * 只改分片数上限解决不了高并发变慢。
+     *
+     * ## 为什么仍然默认 0（不限）
+     *
+     * 因为正确的修法不是"给分片数设上限"，而是**别让连接数停在 128 这种高位**：
+     * 那属于并发收敛的职责，已由 P10 的自适应并发承担（它会按实测吞吐把连接数降下来，
+     * 表里 D/E/F 组正是它该收敛到的区间）。给分片数单独设上限会与那个机制打架 ——
+     * 而且 `SkewSweepTest` 证明"有 1 条慢连接时多块比少块快 3.17 倍"，
+     * 上限设小了会吃掉工作窃取的余量。
+     *
+     * 所以：**默认不限，留作手动旋钮**；高并发变慢请先看自适应并发是否在工作，
+     * 而不是来调这个值。回环结论不能外推到真实链路（无 RTT，每请求开销被低估）。
      */
     val maxSegmentsPerTask: Int = 0,
 
@@ -232,8 +291,15 @@ data class TurboConfig(
     /** 连接超时（毫秒）。 */
     val connectTimeoutMs: Long = 15_000,
 
-    /** 读取超时（毫秒）。 */
-    val readTimeoutMs: Long = 60_000,
+    /**
+     * 读取超时（毫秒）。
+     *
+     * 【2026-10-28 60s → 30s】这是**单次 read** 的等待上限。服务器彻底不吐字节时，
+     * 客户端要等满这个值才拿到异常；60 秒对手机上的体感太长（用户以为卡死）。
+     * 30 秒仍未收到一个字节，基本可以断定这条连接已经废了。
+     * 逐连接的"停滞"由 [stallTimeoutMs] 更早发现并只掐掉那一条。
+     */
+    val readTimeoutMs: Long = 30_000,
 
     /** 默认 User-Agent（采用通用浏览器 UA，避免部分 CDN 对非浏览器 UA 直接拦截）。 */
     val userAgent: String =
@@ -246,11 +312,33 @@ data class TurboConfig(
     /**
      * 强制使用 HTTP/1.1（默认 true，专为多线程下载优化）。
      *
-     * 原因：HTTP/2 会把所有并发请求**多路复用到同一条 TCP 连接**上，
-     * 共享单个拥塞窗口与流控窗口——即使开 64/256 个分片，吞吐量仍等同单连接，
-     * 这是“开了很多线程却只跑出单线程速度”的典型原因（GitHub / 大多数 CDN 均启用 HTTP/2）。
-     * HTTP/1.1 下每个并发请求各自建立 TCP 连接，各自拥有独立拥塞窗口，
-     * 才能真正获得多连接加速（aria2 / IDM / XDM 同策略）。
+     * ## 机制前提（已验证）
+     *
+     * HTTP/2 会把并发请求**多路复用**到少数 TCP 连接上，共享拥塞/流控窗口。
+     * 实测（`HttpVersionComparisonTest`，GitHub Release 资产 / 19MB / 16 并发 Range）：
+     * **h1 开了 32 条连接，h2 只开 2 条** —— 塌缩确实发生。
+     * 而 h1 那一侧每并发请求各占一条连接（`SlicedConnectionCountTest` 实测 16 请求 = 16 条）。
+     *
+     * ## 但"h2 会更慢"这一条**不成立**（实测订正）
+     *
+     * 同一环境的吞吐：h2 **6.79 MB/s** vs h1 **2.84 MB/s** —— **h2 更快**，不是更慢。
+     * 原因是那次测量里真正的变量不是协议而是**连接数**：单连接基线就有 **6.16 MB/s**，
+     * 而 32 条 h1 连接反而只有 2.84 MB/s —— 那个 CDN 在**惩罚高并发**（每连接/聚合限速），
+     * 多开连接只是白付握手与限速代价。旧注释把"多连接没用"归因给 h2 的多路复用，是**归因错了**。
+     *
+     * ## 为什么默认值仍然保持 true
+     *
+     * 不是因为"h2 更慢"，而是因为**这个结论不能外推**：
+     *  - 上述差异来自单个 CDN 在特定网络下的行为，换一个 CDN 结论可能相反；
+     *  - h1 的**每连接独立拥塞窗口**在真实丢包链路上仍有价值（这正是 aria2/IDM 用 h1 的理由），
+     *    而回环与本地无丢包环境测不出这一项；
+     *  - 改变默认值需要**多个 CDN、带丢包的链路**上的对照证据，目前没有。
+     *
+     * 所以：保持 h1 默认（保守），但**不要再引用"h2 必然更慢"当作理由** —— 那是错的。
+     * 真正的自适应手段是 [adaptiveConcurrency]（按实测吞吐收敛并发），它对本问题有效，
+     * 且不依赖对协议的猜测。
+     *
+     * 复测方法：`_audit\_run_h2ab.bat`（会消耗约 38MB 真实流量）。
      *
      * 注意：当 [httpVersionPolicy] 为 AUTO 时，本字段仅影响“分片并发”链路（仍走 HTTP/1.1），
      * 而“整文件单流回退”链路允许协商 HTTP/2（单流场景 h2 未必更差且兼容性更好）。
@@ -266,7 +354,7 @@ data class TurboConfig(
      *
      * 为兼容旧版：未显式设置本字段时，若 [forceHttp1]=false 则等同 FORCE_HTTP2，否则为 AUTO。
      */
-    val httpVersionPolicy: HttpVersionPolicy = HttpVersionPolicy.AUTO,
+    val httpVersionPolicy: HttpVersionPolicy = HttpVersionPolicy.UNSET,
 
     /**
      * 每个主机（host）的最大并发分片数。<=0 表示不限（用 [maxConnectionsPerTask]）。
@@ -310,6 +398,18 @@ data class TurboConfig(
     val slowStartInitial: Int = 0,
 
     /**
+     * 基于任务总吞吐的并发收敛（默认开）。
+     *
+     * 在慢启动档位上先测稳定窗口吞吐，再试探更高并发；只有吞吐有明确提升才接受新档。
+     * 若总吞吐进入平台期或下降，则回到最后一个有效档位，并在稳定一段时间后低频回探。
+     *
+     * 不根据每连接吞吐低就降档：服务端按连接独立限速时，单连接速度本来就低，
+     * 增加连接仍可能提高总吞吐。若启用了全局限速，吞吐判定会自动停用，避免把用户限速误判成服务器平台期。
+     * 固定并发测量台可显式关闭此项。
+     */
+    val adaptiveConcurrency: Boolean = true,
+
+    /**
      * 预热并发度上限（默认 4）。
      *
      * 预热本质上是“提前建好 TCP/TLS 连接”，并不需要开很多：
@@ -345,12 +445,44 @@ data class TurboConfig(
     val trustWeakValidator: Boolean = false,
 
     /**
-     * 分片读写缓冲区大小（字节，默认 1MB）。
+     * 分片读写缓冲区大小的**上限**（字节，默认 1MB）。
      *
      * 缓冲区越小 → 单位时间内 read/write 与进度回调次数越多，高吞吐时开销显著：
      * 256KB 缓冲在 50MB/s 下每秒要跑 200 次完整回调链路。取 1MB 在内存与吞吐间平衡。
+     *
+     * ★ 这是**单连接的上限**，不是实际值：实际按 [ioBufferTotalBudgetBytes] 与并发数摊薄，
+     *   见 [effectiveIoBufferSize]。低并发时就是本值。
      */
     val ioBufferSize: Int = 1024 * 1024,
+
+    /**
+     * 全部在飞连接的读缓冲**总预算**（字节，默认 32MB）。
+     *
+     * ## 为什么必须有这个上限
+     *
+     * 旧实现是「每个连接固定 [ioBufferSize]（1MB）」—— 看起来很小，乘上连接数就不小了：
+     *
+     * | 连接数 | 缓冲总量 |
+     * |---|---|
+     * | 16（默认） | 16MB |
+     * | 64 | 64MB |
+     * | 128 | 128MB |
+     * | **256（引擎上限）** | **256MB** |
+     *
+     * 2026-10-10 真机事故：Android 默认堆就是 256MB，用户在 256 连接下下载
+     * → 256 个 1MB 缓冲**刚好等于整堆** → `OutOfMemoryError`。
+     * 缓冲都是活对象（正被下载协程引用），GC 回收不掉，于是堆占满、连 64 字节都分不出来。
+     * 崩溃现场落在 Okio 的 Watchdog 线程（它只是想关掉一个超时的 socket），
+     * **看起来像网络问题，实际是缓冲把堆吃光了**。
+     *
+     * 【为什么不是"把线程数降回去"】连接数是吞吐的关键手段（服务端按连接限速时，
+     * 总吞吐 ≈ 单连接上限 × 连接数）。砍连接数是拿吞吐换内存，而真正的问题是
+     * 内存花得不值：256 个连接每个独占 1MB 缓冲，绝大部分时间都是空着的。
+     * 按总量摊薄后，256 连接仍有 128KB/连接 —— 远高于读 socket 的性价比区间，
+     * 吞吐不受影响。
+     */
+    val ioBufferTotalBudgetBytes: Int = 32 * 1024 * 1024,
+
 
     /**
      * 进度上报最小间隔（毫秒，默认 200ms）0 = 不节流。
@@ -389,6 +521,19 @@ data class TurboConfig(
      * 因此额外做**任务级守护**：这么长时间内总下载字节数零增长，则判定卡死，
      * 主动 cancel 当前所有在飞请求，让分片进入重试链路（重新建连、可能命中其他 CDN 节点）。
      */
+    /**
+     * 单条连接"已经收到过数据、之后多久没有新字节"就判定停滞（毫秒）。
+     *
+     * ## 为什么仍取 45s（试过 20s，退回）
+     *
+     * 停滞检测的前提是**这一轮已经收到过数据**（一个字节都没来的情况交给 [readTimeoutMs]）。
+     * 即便如此，20s 在高并发下仍会误杀：128 连接压到一个需要排队的服务器上时，
+     * 某些连接会"先给一点、然后等服务器线程"，20 秒不足以让它们恢复 ——
+     * 实测表现为「分片 X 重试 6 次仍失败（IOException: Canceled）」，整个任务失败。
+     *
+     * 真正的"卡死"（一个字节都不来）由 [readTimeoutMs] 在 30 秒内识别，那条路径更快；
+     * 这里保留 45s 作为"半死不活连接"的兜底，代价小、不会误伤正常排队。
+     */
     val stallTimeoutMs: Long = 45_000,
 
     /**
@@ -426,8 +571,47 @@ data class TurboConfig(
         require(warmUpTimeoutMs >= 500) { "warmUpTimeoutMs 至少 500ms" }
         require(warmUpMaxParallel >= 1) { "warmUpMaxParallel 至少 1" }
         require(ioBufferSize >= 8 * 1024) { "ioBufferSize 至少 8KB" }
+        require(ioBufferTotalBudgetBytes >= ioBufferSize) {
+            "ioBufferTotalBudgetBytes 不能小于单连接缓冲上限 ioBufferSize" +
+                "（否则低并发时反而比旧行为更省，语义混乱）"
+        }
         require(progressIntervalMs >= 0) { "progressIntervalMs 不能为负" }
     }
+
+    /**
+     * 实际生效的单连接读缓冲大小：把 [ioBufferTotalBudgetBytes] 按**最坏情况的连接总数**摊开，
+     * 且不超过 [ioBufferSize]。
+     *
+     * ## 分母为什么是 maxConcurrentTasks × connections
+     *
+     * 预算是**整个进程**的，而连接来自两边相乘：同时跑的任务数 × 每个任务的连接数。
+     * 只按单个任务的连接数摊，多任务并行时仍会突破预算 —— 例如 5 个任务各 256 连接
+     * （App 里这两项都能设到）就是 1280 条连接，按 128KB/连接算要 160MB。
+     *
+     * 分母取 [maxConcurrentTasks]（**声明上限**，不是"此刻在跑几个"）是刻意的：
+     * 这样不需要跨任务协调、不会阻塞，也让上限是**可静态验证**的。
+     * 代价是"设了 5 并但它只跑 1 个"时缓冲比需要的略小，但仍在合理区间（见下）。
+     *
+     * ## 数值范围
+     *
+     * | 场景 | 单连接缓冲 | 总占用 |
+     * |---|---|---|
+     * | 16 连接 × 1 任务（App 默认） | 1MB（触上限） | 16MB |
+     * | 256 连接 × 1 任务 | 128KB | 32MB |
+     * | 256 连接 × 5 任务 | 26KB | 33MB |
+     *
+     * [MIN_IO_BUFFER_BYTES]（8KB）是保底：配置极端到摊薄结果低于它时取它，
+     * 此时**总占用会略超预算**（如 64 任务 × 256 连接 = 16384 连接 × 8KB = 128MB）。
+     * 这是有意的取舍 —— 宁愿在荒谬配置下稍微超一点，也不让缓冲小到只剩 syscall 开销。
+     * 而在任何**可达的**配置下（App 上限 5 任务 × 256 连接）总占用都稳定在预算内。
+     */
+    fun effectiveIoBufferSize(connections: Int): Int =
+        budgetedIoBufferSize(
+            totalBudgetBytes = ioBufferTotalBudgetBytes,
+            perConnectionCapBytes = ioBufferSize,
+            connections = connections,
+            concurrentTasks = maxConcurrentTasks,
+        )
 
     /**
      * 解析实际生效的 HTTP 版本策略（兼容旧的 [forceHttp1] 字段）。
@@ -435,13 +619,73 @@ data class TurboConfig(
      */
     val effectiveHttpVersionPolicy: HttpVersionPolicy
         get() = when (httpVersionPolicy) {
-            HttpVersionPolicy.AUTO -> if (forceHttp1) HttpVersionPolicy.AUTO else HttpVersionPolicy.FORCE_HTTP2
+            // 只有"没设置"时才回落到旧字段；显式选了 AUTO 就尊重 AUTO。
+            HttpVersionPolicy.UNSET ->
+                if (forceHttp1) HttpVersionPolicy.AUTO else HttpVersionPolicy.FORCE_HTTP2
             else -> httpVersionPolicy
         }
+
+    companion object {
+        /**
+         * 单连接读缓冲的硬下限（8KB）。
+         *
+         * 与 [ioBufferSize] 的校验下限同源：再往下就只剩系统调用与回调的开销了。
+         * [effectiveIoBufferSize] 的摊薄结果触底时取本值。
+         */
+        const val MIN_IO_BUFFER_BYTES = 8 * 1024
+
+        /**
+         * **预算摊薄的唯一实现**：按「最坏情况的连接总数」把总预算摊到单连接，
+         * 并夹在 [MIN_IO_BUFFER_BYTES, perConnectionCapBytes] 之间。
+         *
+         * ## 为什么提成静态函数而不是各自算
+         *
+         * 这段算法原先在**两个仓库里各写了一份**：引擎的 `TurboConfig.effectiveIoBufferSize`
+         * 与 App 兜底引擎的 `ChunkDownloader.ioBufferSizeFor`（0.2.0.8 修 OOM 时留下的）。
+         * 两份实现的**上下限参数不同**（引擎 1MB / App 256KB），所以不能简单共用一份配置，
+         * 但**摊薄公式必须只有一个** —— 否则改了一处另一处不会跟着改，
+         * 而这类不变量（"总占用 ≤ 预算"）出问题时是 OOM，不是可忽略的小偏差。
+         *
+         * App 侧现在调用本函数并只传自己的上限值，见 `ChunkDownloader.ioBufferSizeFor`。
+         *
+         * ## 分母为什么含 [concurrentTasks]
+         *
+         * 预算是**整个进程**的：真实连接数 = 并发任务数 × 每任务连接数。
+         * 只按单任务摊，多任务并行时仍会突破（5 任务 × 256 连接 = 1280 条）。
+         *
+         * @param totalBudgetBytes 全部在飞连接的总预算
+         * @param perConnectionCapBytes 单连接上限（低并发时就是这个值）
+         * @param connections 单任务的连接数；<=0 视为 1
+         * @param concurrentTasks 并发任务数；<=0 视为 1
+         */
+        fun budgetedIoBufferSize(
+            totalBudgetBytes: Int,
+            perConnectionCapBytes: Int,
+            connections: Int,
+            concurrentTasks: Int,
+        ): Int {
+            val cap = perConnectionCapBytes.coerceAtLeast(MIN_IO_BUFFER_BYTES)
+            val lanes = connections.coerceAtLeast(1).toLong() *
+                concurrentTasks.coerceAtLeast(1).toLong()
+            val shared = (totalBudgetBytes.toLong() / lanes).coerceAtMost(Int.MAX_VALUE.toLong())
+            return shared.toInt().coerceIn(MIN_IO_BUFFER_BYTES, cap)
+        }
+    }
 }
 
 /** HTTP 版本协商策略。 */
 enum class HttpVersionPolicy {
+    /**
+     * 未显式设置（默认值）。此时由旧的 [TurboConfig.forceHttp1] 推导。
+     *
+     * 【为什么需要这个值】此前默认值就是 [AUTO]，于是"显式选了 AUTO"和
+     * "根本没设置"无法区分，只能靠 forceHttp1 兜底 —— 结果是用户把
+     * 「强制 HTTP/1.1」关掉、策略选 AUTO，实际生效的却是 FORCE_HTTP2
+     * （全部链路允许 h2，多线程可能无加速）。选择被另一个开关悄悄改写，
+     * 这类"看起来改了其实没改"的问题极难排查。
+     */
+    UNSET,
+
     /** 分片并发走 HTTP/1.1，探测与整文件单流回退允许 HTTP/2。 */
     AUTO,
 

@@ -62,6 +62,14 @@ internal class SegmentDownloader(
     private val streamClientProvider: (() -> OkHttpClient)? = null,
     /** IO 缓冲区大小（字节）；默认 1MB。过小会在高吞吐时产生大量回调开销。 */
     private val bufferSizeProvider: () -> Int = { DEFAULT_BUFFER },
+    /**
+     * 分片写入是否走缓冲流（P12 开关）。
+     *
+     * 与 [bufferSizeProvider] 同样用 provider 而不是把整个 config 传进来：
+     * 本类只需要这一个布尔量，注入 config 会扩大它与配置结构的耦合面。
+     * 默认 false = 直写（实测结论见 [TurboConfig.bufferedSegmentWrite]）。
+     */
+    private val bufferedWriteProvider: () -> Boolean = { false },
 ) {
 
     private val client get() = clientProvider()
@@ -83,6 +91,50 @@ internal class SegmentDownloader(
      * CDN 直链且已过期，下一次尝试会自动回到原始 URL 重新解析，而不是抱着失效地址反复撞。
      */
     private val resolvedUrlByTask = ConcurrentHashMap<Long, String>()
+
+    /**
+     * 最近一次整文件下载失败的具体原因（按 taskId）。
+     *
+     * [downloadWhole] 的返回值是 `Boolean`，天然丢信息。上层（`BuiltinHttpBackend`）在
+     * `false` 时只能给一句笼统的「服务器不支持 Range、无响应或响应异常」——
+     * 而真正的原因可能是"连接被重置"、"声明长度大于实际"、"读超时"，
+     * 三者对用户意味着完全不同的下一步。这里把原因记下来供上层取用，用完即清。
+     */
+    private val failureByTask = ConcurrentHashMap<Long, String>()
+
+    /**
+     * 服务器给出的 `Retry-After`（毫秒，按 taskId）。
+     *
+     * 429/503 常常带这个头（RFC 9110 §10.2.3），值是"建议等多久"或一个 HTTP 日期。
+     * 忽略它只能用盲目的指数退避：等太短会继续被拒（白烧重试预算），等太长则白白拖慢。
+     * aria2 与 curl 都读这个头，这里对齐。
+     */
+    private val retryAfterByTask = ConcurrentHashMap<Long, Long>()
+
+    /** 取出（并清掉）服务器建议的重试等待；没有则返回 null。 */
+    fun takeRetryAfterMs(taskId: Long): Long? = retryAfterByTask.remove(taskId)
+
+    /**
+     * 解析 `Retry-After`：既支持秒数，也支持 HTTP 日期。
+     *
+     * @return 毫秒（已夹到 [0, 120s]）；无法解析返回 null。
+     */
+    private fun parseRetryAfter(value: String?): Long? {
+        val raw = value?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        raw.toLongOrNull()?.let { secs ->
+            // 秒数形式：0 是合法的（"立刻重试"）。
+            return (secs * 1000L).coerceIn(0L, MAX_RETRY_AFTER_MS)
+        }
+        val date = runCatching {
+            java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME
+                .parse(raw, java.time.Instant::from)
+        }.getOrNull() ?: return null
+        val delta = date.toEpochMilli() - System.currentTimeMillis()
+        return delta.coerceIn(0L, MAX_RETRY_AFTER_MS)
+    }
+
+    /** 取出（并清掉）最近一次整文件下载的失败原因；没有则返回 null。 */
+    fun takeWholeError(taskId: Long): String? = failureByTask.remove(taskId)
 
     /** 取本次分片实际应请求的地址：优先用已学习到的终址，否则回落到原始 URL。 */
     private fun urlFor(taskId: Long, original: String): String =
@@ -122,6 +174,19 @@ internal class SegmentDownloader(
 
         /** 非退化区间（从 0 到结尾）：用于复探服务器是否**真的**支持 Range。 */
         private const val RANGE_FROM_START = "bytes=0-"
+
+        /**
+         * 开启 [TurboConfig.bufferedSegmentWrite] 时的写缓冲大小（64KB）。
+         *
+         * 与读缓冲（按并发摊薄，最大 1MB）**不同量级是有意的**：写缓冲只是减少
+         * `write` 系统调用次数，64KB 已远超收益拐点；再大只会推迟落盘、放大中断时的损失。
+         * 而且每个在飞分片都会占一份，所以它同样受内存预算的约束。
+         */
+        private const val WRITE_BUFFER_BYTES = 64 * 1024
+
+        /** `Retry-After` 的上限：超过两分钟就不值得干等，宁可退避重投（可能换到别的节点）。 */
+        private const val MAX_RETRY_AFTER_MS = 120_000L
+
     }
 
     /**
@@ -195,6 +260,19 @@ internal class SegmentDownloader(
         val suggestedFileName: String? = null,
         /** Content-Type（可用于补全扩展名等，纯信息）。 */
         val contentType: String? = null,
+        /**
+         * UA 协商结果：被拦截时换上的那个 User-Agent；未协商（默认 UA 就通）时为 null。
+         *
+         * 见 [UA_FALLBACKS]。非 null 时调用方**必须**把它带进这个任务的后续所有请求
+         * （分片 / 整文件 / 续传指纹），否则协商白做 —— 分片仍会用默认 UA 撞同一堵墙。
+         */
+        val negotiatedUserAgent: String? = null,
+        /**
+         * 探测那一次请求的 HTTP 状态码；请求本身失败（超时/连接不上）时为 0。
+         *
+         * 只用于**判断要不要换 UA**（401/403/HTML 拦截页）与诊断，不参与下载决策。
+         */
+        val statusCode: Int = 0,
     ) {
         /**
          * 续传校验令牌：把「大小 + ETag + Last-Modified」压成一个字符串。
@@ -286,12 +364,17 @@ internal class SegmentDownloader(
         timeoutMs: Long = 0,
         /** Range 头的值。默认 `bytes=0-0`（最小探测）；复探时用 `bytes=0-`。 */
         rangeSpec: String = RANGE_MIN,
+        /** 覆盖 UA（UA 协商用）；null 表示沿用 [headers] 或配置里的默认值。 */
+        userAgentOverride: String? = null,
     ): ProbeResult =
         withContext(Dispatchers.IO) {
             val req = Request.Builder()
                 .url(url)
                 .header("Range", rangeSpec)
                 .apply { headers.forEach { (k, v) -> header(k, v) } }
+                // 协商用的 UA 要在 headers **之后**设置：headers 里带的那份不生效时，
+                // 这里的覆盖才是这次探测真正发出去的 UA。
+                .apply { if (userAgentOverride != null) header("User-Agent", userAgentOverride) }
                 // identity 在自定义头之后设置，确保总是生效（防止调用方传入 Accept-Encoding: gzip 覆盖）：
                 // 若 gzip 透明解压，实际写入字节会与 Content-Range 不一致 → 大小校验失败。
                 .header("Accept-Encoding", "identity")
@@ -318,13 +401,15 @@ internal class SegmentDownloader(
                                 .let { runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault(it) }
                         )
                     if (resp.header("Content-Type").orEmpty().contains("text/html", true)) {
-                        return@use ProbeResult(null, false, finalUrl, etag, lastMod, suggested, ctype)
+                        return@use ProbeResult(null, false, finalUrl, etag, lastMod, suggested, ctype,
+                            statusCode = resp.code)
                     }
                     when (resp.code) {
                         206 -> {
                             val total = resp.header("Content-Range")
                                 ?.substringAfter('/')?.toLongOrNull()
-                            ProbeResult(total, true, finalUrl, etag, lastMod, suggested, ctype)
+                            ProbeResult(total, true, finalUrl, etag, lastMod, suggested, ctype,
+                                statusCode = resp.code)
                         }
                         200 -> {
                             // 未返回 206：多数为不支持 Range；但若服务器声明 Accept-Ranges: bytes，
@@ -333,9 +418,11 @@ internal class SegmentDownloader(
                             val total = resp.header("Content-Length")?.toLongOrNull()
                             val acceptRanges = resp.header("Accept-Ranges")
                                 .orEmpty().contains("bytes", ignoreCase = true)
-                            ProbeResult(total, acceptRanges, finalUrl, etag, lastMod, suggested, ctype)
+                            ProbeResult(total, acceptRanges, finalUrl, etag, lastMod, suggested, ctype,
+                                statusCode = resp.code)
                         }
-                        else -> ProbeResult(null, false, finalUrl, etag, lastMod, suggested, ctype)
+                        else -> ProbeResult(null, false, finalUrl, etag, lastMod, suggested, ctype,
+                            statusCode = resp.code)
                     }
                 }
             } catch (e: CancellationException) {
@@ -347,6 +434,79 @@ internal class SegmentDownloader(
                 handle?.dispose()
             }
         }
+
+    /**
+     * 被拦截时的 UA 候选梯子（**降序尝试，第一个能过就是它**）。
+     *
+     * ## 为什么需要这个（真实网络实测，2026-10-18）
+     *
+     * 国内镜像站的反爬**按 UA 分档**，而且方向与直觉相反：**浏览器 UA 被拦，curl 类 UA 放行**。
+     * 同一条链接、同一个程序，只换 UA：
+     *
+     * | 站点 | 浏览器 UA | curl UA |
+     * |---|---|---|
+     * | 清华 | 403 + HTML | 206，正常下载 |
+     * | 北外 | 403 + HTML | 206 |
+     * | 中科大 | 200 + "Verifying your browser"（JS 挑战页） | 206 |
+     * | 南大 | 被拦 | 206 |
+     *
+     * 而 [TurboConfig.userAgent] 默认就是 Chrome 的浏览器 UA（那是为了应对"只认浏览器 UA"的
+     * CDN 才这么定的）。于是默认配置在这些站上**一个字节都下不了**，而 curl 跑同一链接飞快 ——
+     * 用户看到的"真实网络下怎么比 curl 慢这么多"，根子在这里。
+     *
+     * ## 顺序的依据
+     *
+     * 1. 先保持默认（浏览器 UA）不变 —— 绝大多数 CDN 与网盘直链吃这一套；
+     * 2. 再退到 `curl/x.y.z`：镜像站/开源基础设施最常见的白名单，也是本机 curl 实测能通的；
+     * 3. 最后退到 `aria2/x.y.z`：同样的基础设施类 UA，覆盖把 curl 单独拉黑的情况。
+     *
+     * 换 UA 只影响"我们怎么介绍自己"，不改变请求内容、不带 Cookie、不伪造别的头 ——
+     * 这不是绕过访问控制，而是换一个对方本来就允许的工具身份。
+     */
+    private val uaFallbacks: List<String> = listOf(
+        "curl/8.21.0",
+        "aria2/1.37.0",
+    )
+
+    /**
+     * UA 协商：默认 UA 被拦时，依次换 [uaFallbacks] 重探，**第一个能拿到 Range 的就采用**。
+     *
+     * ## 为什么做在探测阶段
+     *
+     * 拦截在探测那一次请求上就能看出来（403/HTML 挑战页，代价是一次 `bytes=0-0` 的极小请求）。
+     * 若等分片阶段才发现，等于让几十条连接各自撞一遍墙，再逐条重试 —— 既慢又把重试配额烧光。
+     *
+     * ## 只换能确定的
+     *
+     * 只有当探测**明确拿到 HTML（拦截页/挑战页）或 401/403** 时才换 UA。
+     * 超时、连接失败、5xx 一律不换 —— 那些是网络或服务端故障，换 UA 不会好，
+     * 只会白白多打几个请求、拖慢正常的失败路径。
+     *
+     * 用户自己显式指定过 UA（`headers["User-Agent"]`）时**不协商**：那是他的判断，不该被覆盖。
+     */
+    private suspend fun negotiateUserAgent(
+        url: String,
+        headers: Map<String, String>,
+        timeoutMs: Long,
+        initial: ProbeResult,
+    ): ProbeResult {
+        val explicit = headers.keys.any { it.equals("User-Agent", ignoreCase = true) }
+        if (explicit) return initial
+        // 只处理"被拦"这一类：HTML 响应，或授权类的 401/403。
+        val blocked = initial.contentType.orEmpty().contains("text/html", ignoreCase = true) ||
+            initial.statusCode == 401 || initial.statusCode == 403
+        if (!blocked) return initial
+        for (ua in uaFallbacks) {
+            val r = probe(url, headers, timeoutMs = timeoutMs, rangeSpec = RANGE_MIN, userAgentOverride = ua)
+            // 换到 UA 之后必须**真的能下**才算数：拿到 Range 支持，或至少不再是 HTML/401/403。
+            val stillBlocked = r.contentType.orEmpty().contains("text/html", ignoreCase = true) ||
+                r.statusCode == 401 || r.statusCode == 403
+            if (!stillBlocked && (r.supportsRange || (r.totalSize ?: -1L) > 0)) {
+                return r.copy(negotiatedUserAgent = ua)
+            }
+        }
+        return initial
+    }
 
     /**
      * 取 [start, start+len) 区间的字节，用于**续传内容指纹校验**（失败/不支持 Range 返回 null）。
@@ -413,16 +573,40 @@ internal class SegmentDownloader(
         retries: Int,
     ): ProbeResult {
         var last = ProbeResult(null, false, url)
+        // UA 协商只做一次（结论对一个域名是稳定的），协商出结果就贯穿整个任务。
+        var negotiated: String? = null
         // `bytes=0-` 复探**全局只做一次** —— 对同一个服务器，它不会改变结论，
         // 每轮重试都复探一次纯属浪费（旧实现在这里白发了一倍请求）。
         var reprobed = false
         repeat(retries + 1) { attempt ->
             // ① 最小探测（bytes=0-0）：代价最低，健康服务器回 206 即可确认支持分片。
-            val r = probe(url, headers, timeoutMs = timeoutMs, rangeSpec = RANGE_MIN)
+            // 已协商出 UA 时用它 —— 否则这一轮又会用默认 UA 撞同一堵墙。
+            val r = probe(url, headers, timeoutMs = timeoutMs, rangeSpec = RANGE_MIN,
+                userAgentOverride = negotiated)
             last = r
             if (r.supportsRange) return r
 
-            // ② 【快速失败】服务器回的是网页（HTML）→ 这不是"瞬时失败"，是**地址本身不可下载**。
+            // ② 【UA 协商】被拦（HTML 拦截页 / 401 / 403）时换 UA 再探。
+            //
+            // 【为什么必须在"快速失败"之前】真实网络实测：国内镜像站按 UA 分档拦截，
+            // 浏览器 UA 被拦、curl 类 UA 放行。默认 UA 是浏览器 UA，于是默认配置在这些站上
+            // 零字节失败，而 curl 跑同一链接飞快（见 [uaFallbacks] 的表）。
+            // 这里只多花最多 1~2 个 `bytes=0-0` 的极小请求，就能把"完全下不了"变成"正常下载"。
+            if (r.statusCode == 401 || r.statusCode == 403 ||
+                r.contentType.orEmpty().contains("text/html", ignoreCase = true)
+            ) {
+                val n = negotiateUserAgent(url, headers, timeoutMs, r)
+                if (n.negotiatedUserAgent != null) {
+                    negotiated = n.negotiatedUserAgent
+                    last = n
+                    if (n.supportsRange) return n
+                } else {
+                    // 协商没过：维持原有语义 —— HTML 是确定性结论，直接返回让上层报准确原因。
+                    if (r.contentType.orEmpty().contains("text/html", ignoreCase = true)) return r
+                }
+            }
+
+            // ②' 【快速失败】服务器回的是网页（HTML）→ 这不是"瞬时失败"，是**地址本身不可下载**。
             // 重试再多次也还是网页，只会让用户多等好几秒。直接返回，让上层给出准确原因。
             if (r.contentType.orEmpty().contains("text/html", ignoreCase = true)) return r
 
@@ -436,7 +620,10 @@ internal class SegmentDownloader(
             // aria2 的探测正是用 `bytes=0-` 而非 `bytes=0-0`。
             if (!reprobed && (r.totalSize ?: -1L) > 0) {
                 reprobed = true
-                val r2 = probe(url, headers, timeoutMs = timeoutMs, rangeSpec = RANGE_FROM_START)
+                // 复探**必须**带上协商出的 UA：否则「换 UA 通过了 → 复探又用回默认 UA → 再次被拦」，
+                // 前面那次协商白做，还会把结论误判成"不支持 Range"（真实镜像站上就是这么发生的）。
+                val r2 = probe(url, headers, timeoutMs = timeoutMs, rangeSpec = RANGE_FROM_START,
+                    userAgentOverride = negotiated)
                 if (r2.supportsRange) return r2
                 if (r2.contentType.orEmpty().contains("text/html", ignoreCase = true)) return r2
                 // 复探仍不支持：保留两次探测中信息更全的一份（大小/元数据）。
@@ -457,6 +644,233 @@ internal class SegmentDownloader(
             if (attempt < retries) delay(500L * (1L shl attempt))
         }
         return last
+    }
+
+    /**
+     * 下载一个分片并**按偏移直接写进目标文件**（不建临时分片文件）。
+     *
+     * 与 [downloadSegment] 的区别只有"写到哪里"：
+     *  - 旧路径：写 `seg_x_y.part`，下完还要 [PartMerger] 合并一遍；
+     *  - 本方法：调用方给一个 [writeAt]，直接落到目标文件的绝对偏移上。
+     *
+     * 为什么这件事值得单独一个方法（实测数据见 [SegmentStore] 的注释）：
+     * 16MB 切 512 片时，仅"创建 512 个文件"就要 627ms，而同样数据按偏移写一个文件只要 11ms。
+     * 高并发下这部分**就是**全部耗时，网络根本没成为限制。
+     *
+     * @param alreadyWritten 该分片已完成的字节数（来自进度记录）
+     * @param writeAt (绝对偏移, 缓冲, 起始, 长度) -> 实际写入字节数
+     * @param buffer 调用方复用的读缓冲 —— 每个分片新建一个 1MB 数组在高并发下是纯 GC 负担
+     * @param onProgress 每写入一段回调（用于更新进度记录与总进度），参数是**本次新增**字节数
+     */
+    suspend fun downloadSegmentInto(
+        taskId: Long,
+        url: String,
+        pieceStart: Long,
+        endProvider: () -> Long,
+        alreadyWritten: Long,
+        writeAt: (position: Long, buf: ByteArray, off: Int, len: Int) -> Int,
+        headers: Map<String, String>,
+        onProgress: suspend (newlyWritten: Long, totalWritten: Long) -> Unit,
+        buffer: ByteArray,
+        ifRange: String? = null,
+        /** 请求发出后把句柄交给调用方（卡死守护据此"只掐这一条"）。 */
+        onCallStarted: ((okhttp3.Call) -> Unit)? = null,
+        /**
+         * 本次尝试**自己的**失败原因（可选）。
+         *
+         * 【为什么必须单独回报】`failureByTask` 是任务级的**单槽**：128 条连接同时失败时，
+         * 它只会留下最后写进去的那一条。实测后果是错误信息指错人：
+         * 「分片 8978432-9043967 重试 6 次仍失败（IOException: Canceled）」——
+         * 那个 "Canceled" 其实是**别的**分片被连坐打断时写进去的，
+         * 耗尽重试的那一片真正的原因是读超时。调用方拿到本回调后，
+         * 就能把"这一片自己的原因"记在分片身上，最终报告才说的是实话。
+         */
+        onFailure: ((String) -> Unit)? = null,
+        /**
+         * 直接缓冲区写入口（可选）。给了就走零拷贝路径，没给回落到 [writeAt]。
+         *
+         * 之所以做成可选而不是必选：调用方（插件后端）可能只有 `File` 层面的写能力。
+         */
+        writeBufferAt: ((position: Long, src: java.nio.ByteBuffer) -> Int)? = null,
+        directBuffer: java.nio.ByteBuffer? = null,
+    ): SegmentResult {
+        fun reportFailure(reason: String) {
+            failureByTask[taskId] = reason
+            onFailure?.invoke(reason)
+        }
+        var end = endProvider()
+        var expected = end - pieceStart + 1
+        var done = alreadyWritten.coerceAtLeast(0)
+        if (done >= expected) return SegmentResult.OK
+        val from = pieceStart + done
+
+        val target = urlFor(taskId, url)
+        val req = Request.Builder()
+            .url(target)
+            .header("Range", "bytes=$from-$end")
+            .apply { if (!ifRange.isNullOrBlank()) header("If-Range", ifRange) }
+            .apply { headers.forEach { (k, v) -> header(k, v) } }
+            .header("Accept-Encoding", "identity")
+            .get().build()
+        val call = client.newCall(req)
+        activeCalls.getOrPut(taskId) { ConcurrentHashMap.newKeySet() }.add(call)
+        onCallStarted?.invoke(call)
+        val handle = coroutineContext[Job]?.invokeOnCompletion { call.cancel() }
+        return try {
+            call.execute().use { resp ->
+                if (resp.isSuccessful || resp.code == 416) {
+                    val finalUrl = resp.request.url.toString()
+                    if (finalUrl != target) resolvedUrlByTask[taskId] = finalUrl
+                }
+                if (resp.header("Content-Type").orEmpty().contains("text/html", true)) {
+                    forgetResolvedUrl(taskId)
+                    return@use SegmentResult.FAILED
+                }
+                when (val code = resp.code) {
+                    429, 503 -> {
+                        // 服务器说了"多久之后再来"就听它的：盲目退避要么继续被拒，要么白等。
+                        parseRetryAfter(resp.header("Retry-After"))
+                            ?.let { retryAfterByTask[taskId] = it }
+                        SegmentResult.THROTTLED
+                    }
+                    206 -> {
+                        val crStart = parseContentRangeStart(resp.header("Content-Range"))
+                        if (crStart != null && crStart != from) return@use SegmentResult.RANGE_IGNORED
+                        val body = resp.body ?: return@use SegmentResult.FAILED
+                        // 收尾托管可能已缩短区间：以**当前**末端为准，多读到的丢弃。
+                        end = endProvider()
+                        expected = end - pieceStart + 1
+                        if (done >= expected) return@use SegmentResult.OK
+                        val written = if (writeBufferAt != null && directBuffer != null) {
+                            copyToStoreDirect(
+                                body.byteStream(), pieceStart, done, expected - done,
+                                writeBufferAt, directBuffer, onProgress,
+                            )
+                        } else {
+                            require(buffer.isNotEmpty()) {
+                                "既没有 writeBufferAt 也没有读缓冲：无法写入"
+                            }
+                            copyToStore(
+                                body.byteStream(), pieceStart, done, expected - done,
+                                writeAt, buffer, onProgress,
+                            )
+                        }
+                        // done 必须跟着实际写入量推进：调用方靠它更新进度记录。
+                        done += written
+                        if (done < expected) {
+                            // `done` 已由 copyToStore 的 onProgress 推进到实际写入位置。
+                            reportFailure(
+                                "连接提前结束：分片 $pieceStart-${pieceStart + expected - 1} 只收到 " +
+                                    "$written / ${expected - alreadyWritten} 字节"
+                            )
+                            SegmentResult.FAILED
+                        } else SegmentResult.OK
+                    }
+                    200 -> SegmentResult.RANGE_IGNORED
+                    416 -> SegmentResult.OK
+                    else -> {
+                        if (code == 401 || code == 403 || code == 410) {
+                            forgetResolvedUrl(taskId)
+                            SegmentResult.AUTH_EXPIRED
+                        } else if (code in 500..599) {
+                            SegmentResult.THROTTLED
+                        } else {
+                            SegmentResult.FAILED
+                        }
+                    }
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: IOException) {
+            if (!coroutineContext.isActive) throw CancellationException("canceled", e)
+            reportFailure(describeIoFailure(e))
+            SegmentResult.FAILED
+        } finally {
+            activeCalls[taskId]?.remove(call)
+            handle?.dispose()
+        }
+    }
+
+    /**
+     * 读 socket → 按偏移写目标文件。
+     *
+     * @return 本次新写入的字节数
+     */
+    /**
+     * 读 socket → 按偏移写目标文件（**直接缓冲区**路径，省一次整块拷贝）。
+     *
+     * `Channels.newChannel(InputStream)` 会把 socket 的字节直接读进 [ByteBuffer]，
+     * 然后 [writeBufferAt] 把同一个缓冲区写给 FileChannel。中间不产生 `byte[]`，
+     * 也不触发 `FileChannel` 对堆缓冲的"复制到临时直接缓冲"。
+     */
+    private suspend fun copyToStoreDirect(
+        input: java.io.InputStream,
+        pieceStart: Long,
+        alreadyDone: Long,
+        expected: Long,
+        writeBufferAt: (position: Long, src: java.nio.ByteBuffer) -> Int,
+        buffer: java.nio.ByteBuffer,
+        onProgress: suspend (newlyWritten: Long, totalWritten: Long) -> Unit,
+    ): Long {
+        val src = java.nio.channels.Channels.newChannel(input)
+        var written = 0L
+        var totalWritten = alreadyDone
+        while (true) {
+            buffer.clear()
+            val n = src.read(buffer)
+            if (n <= 0) break
+            buffer.flip()
+            val allow = min(n.toLong(), expected - written)
+            if (allow <= 0) break
+            buffer.limit((buffer.position() + allow).toInt())
+            var pos = pieceStart + alreadyDone + written
+            while (buffer.hasRemaining()) {
+                val w = writeBufferAt(pos, buffer)
+                if (w <= 0) return written
+                pos += w
+            }
+            written += allow
+            totalWritten += allow
+            onProgress(allow, totalWritten)
+            if (written >= expected) break
+        }
+        return written
+    }
+
+    private suspend fun copyToStore(
+        input: java.io.InputStream,
+        pieceStart: Long,
+        alreadyDone: Long,
+        expected: Long,
+        writeAt: (position: Long, buf: ByteArray, off: Int, len: Int) -> Int,
+        buffer: ByteArray,
+        onProgress: suspend (newlyWritten: Long, totalWritten: Long) -> Unit,
+    ): Long {
+        var written = 0L
+        var totalWritten = alreadyDone
+        while (true) {
+            val n = input.read(buffer)
+            if (n <= 0) break
+            val allow = min(n.toLong(), expected - written)
+            if (allow <= 0) break
+            // 分段写：writeAt 可能一次没写完（理论上位置写会写满，但不假设）。
+            var off = 0
+            var left = allow.toInt()
+            var pos = pieceStart + alreadyDone + written
+            while (left > 0) {
+                val w = writeAt(pos, buffer, off, left)
+                if (w <= 0) return written
+                off += w
+                left -= w
+                pos += w
+            }
+            written += allow
+            totalWritten += allow
+            onProgress(allow, totalWritten)
+            if (written >= expected) break
+        }
+        return written
     }
 
     /**
@@ -509,6 +923,15 @@ internal class SegmentDownloader(
          * 故调用方需按 [strongIfRange] 的规则挑选。
          */
         ifRange: String? = null,
+        /**
+         * 本次分片读缓冲大小（字节）。**由调度器按并发数摊薄后传入**（见
+         * [TurboConfig.effectiveIoBufferSize]）：同一任务会同时跑 `workers` 个分片，
+         * 每个都按 [TurboConfig.ioBufferSize] 独占一个缓冲的话，
+         * 256 连接 = 256MB = Android 默认整堆（2026-10-10 真机 OOM 事故）。
+         *
+         * null 时回落到构造时注入的 [bufferSizeProvider]（整文件单流等低并发场景）。
+         */
+        bufferSize: Int? = null,
     ): SegmentResult {
         var end = endProvider()
         val existing = partFile.length()
@@ -562,8 +985,18 @@ internal class SegmentDownloader(
                         if (existing >= expected) return@use SegmentResult.OK
                         val written = writeSlice(
                             body.byteStream(), partFile, existing, expected - existing, onBytes,
+                            bufferSize,
+                            // P12 开关：默认直写（见 TurboConfig.bufferedSegmentWrite 的实测结论）。
+                            bufferedWriteProvider(),
                         )
-                        if (existing + written != expected) SegmentResult.FAILED else SegmentResult.OK
+                        if (existing + written != expected) {
+                            // 记录**具体差多少**：这是区分"服务器短读"与"本地写失败"的唯一线索。
+                            // 上层把这条拼进最终错误，用户才知道该重试还是该换源。
+                            failureByTask[taskId] =
+                                "连接提前结束：分片 $start-${start + expected - 1} 只收到 " +
+                                    "$written / ${expected - existing} 字节"
+                            SegmentResult.FAILED
+                        } else SegmentResult.OK
                     }
                     200 -> {
                         // 【P0-2 修复】200 = 服务器忽略/拒绝 Range，body 语义上是「整个资源」。
@@ -599,6 +1032,8 @@ internal class SegmentDownloader(
             throw e
         } catch (e: IOException) {
             if (!coroutineContext.isActive) throw CancellationException("canceled", e)
+            // 同上：把 IO 层的原因留给上层拼进最终错误。
+            failureByTask[taskId] = describeIoFailure(e)
             SegmentResult.FAILED
         } finally {
             activeCalls[taskId]?.remove(call)
@@ -615,6 +1050,8 @@ internal class SegmentDownloader(
         total: Long,
         onBytes: suspend (Long) -> Unit,
     ): Boolean = withContext(Dispatchers.IO) {
+        // 每次进入都先清掉上一次的原因，避免把上一轮的错误带给这一轮。
+        failureByTask.remove(taskId)
         val existing = outFile.length()
         // 整文件回退不做断点（避免与 Range 不支持的服务器语义冲突）：从 0 重写
         if (existing > 0) outFile.delete()
@@ -668,17 +1105,50 @@ internal class SegmentDownloader(
                         }
                     }
                 }
-                if (total > 0 && written < total) return@use false
+                if (total > 0 && written < total) {
+                    // 没抛异常但字节不够：服务器正常收尾，只是发少了。
+                    failureByTask[taskId] = "连接提前结束：只收到 $written / $total 字节"
+                    return@use false
+                }
                 true
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: IOException) {
             if (!coroutineContext.isActive) throw CancellationException("canceled", e)
+            // 【带回原因】以前这里直接 `false`，上层只能给一句
+            // 「整文件下载失败（服务器不支持 Range、无响应或响应异常）」——
+            // 而真实原因可能是「连接被重置」「读到一半 EOF（声明长度 > 实际）」「超时」。
+            // 这三类对用户意味着完全不同的下一步（重试 / 换源 / 等网络），
+            // 压成同一句话等于把可行动的信息扔掉。
+            failureByTask[taskId] = describeIoFailure(e)
             false
         } finally {
             activeCalls[taskId]?.remove(call)
             handle?.dispose()
+        }
+    }
+
+    /**
+     * 把整文件下载的 IO 异常翻译成一句能行动的话。
+     *
+     * 分类依据（都是实测过的真实形态，见 `_audit/fault_server.py` 的注入端点）：
+     * - `unexpected end of stream` / `EOF` → 服务器声明了长度但提前断开（短读）；
+     * - `Connection reset` / `SocketException` → 连接被中途重置（RST）；
+     * - `timeout` → 读超时（服务器不再发数据）；
+     * - 其余保留原文（`e::class.simpleName: message`），不做无根据的推断。
+     */
+    private fun describeIoFailure(e: IOException): String {
+        val raw = (e.message ?: "").lowercase()
+        val name = e::class.simpleName ?: "IOException"
+        return when {
+            "unexpected end of stream" in raw || "eof" in raw ->
+                "连接被提前关闭：服务器声明的长度与实际发出的字节不符（读到一半就断了）"
+            "connection reset" in raw || "socketexception" in raw || "broken pipe" in raw ->
+                "连接被对端重置"
+            "timeout" in raw || "timed out" in raw ->
+                "读取超时（服务器长时间没有发数据）"
+            else -> "$name: ${e.message ?: "无法读取响应体"}"
         }
     }
 
@@ -698,20 +1168,51 @@ internal class SegmentDownloader(
         seekPos: Long,
         expected: Long,
         onBytes: suspend (Long) -> Unit,
+        /** 按并发摊薄后的缓冲大小；null = 用 provider（见 [downloadSegment] 的说明）。 */
+        bufferSize: Int? = null,
+        /**
+         * 写入是否走 [BufferedOutputStream]（P12 评估项，默认 false）。
+         *
+         * 【为什么默认关闭】见 [TurboConfig.bufferedSegmentWrite] 的记录：实测在本机回环
+         * 128 连接档没有可复现的收益，而它会把"已写入长度"的含义从"已落盘"变成"已交给 OS 缓冲"，
+         * 与断点续传的语义耦合。开关留着是为了能在更快的链路上复测。
+         */
+        bufferedWrite: Boolean = false,
     ): Long {
         var written = 0L
         RandomAccessFile(partFile, "rw").use { raf ->
             raf.seek(seekPos)
-            val buf = ByteArray(bufferSizeProvider().coerceAtLeast(8 * 1024))
-            while (true) {
-                val n = input.read(buf)
-                if (n <= 0) break
-                val allow = min(n.toLong(), expected - written)
-                if (allow <= 0) break
-                raf.write(buf, 0, allow.toInt())
-                written += allow
-                onBytes(allow)
-                if (written >= expected) break
+            val buf = ByteArray(
+                (bufferSize ?: bufferSizeProvider()).coerceAtLeast(TurboConfig.MIN_IO_BUFFER_BYTES)
+            )
+            if (!bufferedWrite) {
+                while (true) {
+                    val n = input.read(buf)
+                    if (n <= 0) break
+                    val allow = min(n.toLong(), expected - written)
+                    if (allow <= 0) break
+                    raf.write(buf, 0, allow.toInt())
+                    written += allow
+                    onBytes(allow)
+                    if (written >= expected) break
+                }
+                return written
+            }
+            // 【flush 的时机就是 onBytes 的时机】先 flush 再回调，保证回调发生时
+            // 字节确实已经落到文件里 —— 断点续传读的是文件长度，若缓冲未刷就回调，
+            // 中途被杀会留下"进度说下了但文件没有"的缺口。
+            java.io.BufferedOutputStream(java.io.FileOutputStream(raf.fd), WRITE_BUFFER_BYTES).use { out ->
+                while (true) {
+                    val n = input.read(buf)
+                    if (n <= 0) break
+                    val allow = min(n.toLong(), expected - written)
+                    if (allow <= 0) break
+                    out.write(buf, 0, allow.toInt())
+                    out.flush()
+                    written += allow
+                    onBytes(allow)
+                    if (written >= expected) break
+                }
             }
         }
         return written

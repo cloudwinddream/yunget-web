@@ -42,20 +42,62 @@ internal object HttpClientFactory {
             else -> ProtocolPreference.H1_ONLY
         }
 
+    /**
+     * **分片链路**实际允许的协议列表（按优先级）。
+     *
+     * 提成公开函数是为了让"策略 → 实际协议"变成可断言的确定性行为：
+     * 此前只有 policy 枚举的映射被测试覆盖，协议列表是在 [build] 里内联算的，
+     * 于是"策略改对了但协议没跟着变"这类缺陷测不出来（P14 期间整理）。
+     *
+     * 默认（AUTO）下只有 h1：多分片并发要靠每个请求各自建连、各自拥有独立拥塞窗口
+     * （`SlicedConnectionCountTest` 实测 16 请求 = 16 条连接）。
+     */
+    internal fun segmentProtocolsFor(config: TurboConfig): List<Protocol> =
+        if (allowH2(config, ProtocolPreference.H1_ONLY)) {
+            listOf(Protocol.HTTP_2, Protocol.HTTP_1_1)
+        } else {
+            listOf(Protocol.HTTP_1_1)
+        }
+
+    /**
+     * **单流/探测链路**实际允许的协议列表（按优先级）。
+     *
+     * 单流没有"多连接被抹平"的问题，因此 AUTO 下允许协商 h2 ——
+     * 既兼容只支持 h2 的服务器，也不会因此损失并发收益。
+     */
+    internal fun streamProtocolsFor(config: TurboConfig): List<Protocol> =
+        if (allowH2(config, ProtocolPreference.ALLOW_H2)) {
+            listOf(Protocol.HTTP_2, Protocol.HTTP_1_1)
+        } else {
+            listOf(Protocol.HTTP_1_1)
+        }
+
+    /**
+     * 实际协议：由策略 + 链路偏好共同决定。
+     *  - FORCE_HTTP1：永远 h1；
+     *  - FORCE_HTTP2：允许 h2；
+     *  - AUTO：分片链路（H1_ONLY）走 h1，探测/单流链路（ALLOW_H2）允许 h2。
+     */
+    private fun allowH2(config: TurboConfig, preference: ProtocolPreference): Boolean =
+        when (config.effectiveHttpVersionPolicy) {
+            HttpVersionPolicy.FORCE_HTTP1 -> false
+            HttpVersionPolicy.FORCE_HTTP2 -> true
+            HttpVersionPolicy.AUTO -> preference == ProtocolPreference.ALLOW_H2
+            // effectiveHttpVersionPolicy 永不返回 UNSET（它在 getter 里已经解析掉了）。
+            // 这一支只是为了让 when 穷尽；落到这里说明解析逻辑被改坏了，按最保守处理。
+            HttpVersionPolicy.UNSET -> false
+        }
+
     fun build(config: TurboConfig, preference: ProtocolPreference): OkHttpClient {
         val dispatcher = Dispatcher().apply {
             // 满并发不被 OkHttp 默认的 per-host=5 锁死
             maxRequests = 1024
             maxRequestsPerHost = 1024
         }
-        // 实际协议：由策略 + 偏好共同决定。
-        //  - FORCE_HTTP1：永远 H1；
-        //  - FORCE_HTTP2：允许 h2；
-        //  - AUTO：分片链路（H1_ONLY）走 H1，探测/单流链路（ALLOW_H2）允许 h2。
-        val allowH2 = when (config.effectiveHttpVersionPolicy) {
-            HttpVersionPolicy.FORCE_HTTP1 -> false
-            HttpVersionPolicy.FORCE_HTTP2 -> true
-            HttpVersionPolicy.AUTO -> preference == ProtocolPreference.ALLOW_H2
+        val protocols = if (allowH2(config, preference)) {
+            listOf(Protocol.HTTP_2, Protocol.HTTP_1_1)
+        } else {
+            listOf(Protocol.HTTP_1_1)
         }
         val builder = OkHttpClient.Builder()
             .dispatcher(dispatcher)
@@ -75,12 +117,8 @@ internal object HttpClientFactory {
                     timeUnit = TimeUnit.SECONDS,
                 )
             )
-            // 协议：多分片并发默认只用 HTTP/1.1（HTTP/2 多路复用会把所有分片挤到一条 TCP 连接，
-            // 共享单个拥塞/流控窗口 → 多线程得不到加速）；单流/探测链路可允许 h2。
-            .protocols(
-                if (allowH2) listOf(Protocol.HTTP_2, Protocol.HTTP_1_1)
-                else listOf(Protocol.HTTP_1_1)
-            )
+            // 协议由 [allowH2]（策略 × 链路偏好）决定，见 segment/streamProtocolsFor 的说明。
+            .protocols(protocols)
             .connectTimeout(config.connectTimeoutMs, TimeUnit.MILLISECONDS)
             .readTimeout(config.readTimeoutMs, TimeUnit.MILLISECONDS)
             .writeTimeout(config.readTimeoutMs, TimeUnit.MILLISECONDS)
@@ -145,10 +183,10 @@ internal object HttpClientFactory {
             // （默认 15s）才轮到下一个。若解析同时给出 AAAA/A 而设备 IPv6 路由不通
             // （手机蜂窝网常见），首连接 = AAAA 超时 15s + A 成功 ≈ 15~30s，表现恰好是
             // “任何链接解析都要卡半分钟”。v4 优先让第一个地址就是可用地址；仅调序，不丢地址。
-            is DnsMode.System -> builder.dns(FamilyOrderedDns(Dns.SYSTEM))
-            is DnsMode.StaticHosts -> builder.dns(StaticHostsDns(mode.hosts))
-            is DnsMode.DoH -> builder.dns(FamilyOrderedDns(DohDns(mode.dohUrl)))
-            is DnsMode.Auto -> builder.dns(FamilyOrderedDns(DohDns(mode.endpoints)))
+            is DnsMode.System -> builder.dns(CachingDns(FamilyOrderedDns(Dns.SYSTEM)))
+            is DnsMode.StaticHosts -> builder.dns(CachingDns(StaticHostsDns(mode.hosts)))
+            is DnsMode.DoH -> builder.dns(CachingDns(FamilyOrderedDns(DohDns(mode.dohUrl))))
+            is DnsMode.Auto -> builder.dns(CachingDns(FamilyOrderedDns(DohDns(mode.endpoints))))
         }
     }
 
@@ -156,6 +194,68 @@ internal object HttpClientFactory {
     private class FamilyOrderedDns(private val delegate: Dns) : Dns {
         override fun lookup(hostname: String): List<InetAddress> =
             preferIpv4(delegate.lookup(hostname))
+    }
+
+    /**
+     * 带 TTL 的 DNS 缓存。
+     *
+     * ## 为什么必须有
+     *
+     * 下载一个文件要建几十条连接，而每条新连接都要解析一次域名。移动网络上
+     * 一次系统解析 50~200ms，**几十次就是几秒的纯粹等待**，而且全部发生在
+     * "连接建立"阶段 —— 用户感知就是"点了下载，半天不出速度"。
+     *
+     * OkHttp 自己不做 DNS 缓存（它只依赖 JVM/系统的解析缓存，Android 上时长不定、
+     * 有些 ROM 干脆不缓存）。aria2 有 `--async-dns` 与内置缓存，IDM 同理。
+     *
+     * ## 两类结果都缓存
+     *
+     * 失败也缓存（短 TTL）：域名解析不了时重试往往同样失败，若不缓存，
+     * 128 条连接会同时打满 DNS，把"解析慢"放大成"解析风暴"。负缓存 5 秒即可，
+     * 既能挡住风暴，又不会在 DNS 恢复后继续误报。
+     *
+     * ## 为什么用并发 Map 而不是 LRU
+     *
+     * 一个下载任务涉及的域名只有个位数；全局也就几十个。用无界但带容量上限的
+     * ConcurrentHashMap 足够，且避免了 LRU 的锁竞争（命中路径必须无锁，
+     * 否则高并发下缓存本身会变成瓶颈）。
+     */
+    private class CachingDns(
+        private val delegate: Dns,
+        private val positiveTtlMs: Long = 60_000,
+        private val negativeTtlMs: Long = 5_000,
+        private val maxEntries: Int = 256,
+    ) : Dns {
+
+        private class Entry(val addresses: List<InetAddress>?, val expiresAt: Long)
+
+        private val cache = java.util.concurrent.ConcurrentHashMap<String, Entry>()
+
+        override fun lookup(hostname: String): List<InetAddress> {
+            val now = System.currentTimeMillis()
+            cache[hostname]?.let { e ->
+                if (now < e.expiresAt) {
+                    // 命中的负缓存要真的抛错，否则上层会把"空列表"当成解析结果。
+                    return e.addresses ?: throw java.net.UnknownHostException(hostname)
+                }
+                cache.remove(hostname, e)
+            }
+            val resolved = runCatching { delegate.lookup(hostname) }.getOrNull()
+            if (resolved.isNullOrEmpty()) {
+                put(hostname, Entry(null, now + negativeTtlMs))
+                throw java.net.UnknownHostException(hostname)
+            }
+            put(hostname, Entry(resolved, now + positiveTtlMs))
+            return resolved
+        }
+
+        private fun put(host: String, e: Entry) {
+            // 容量保护：缓存不该成为无界内存。
+            if (cache.size >= maxEntries && !cache.containsKey(host)) {
+                cache.entries.firstOrNull()?.let { cache.remove(it.key) }
+            }
+            cache[host] = e
+        }
     }
 
     /** 把 IPv4 排到前面（稳定排序，族内相对顺序不变）。 */

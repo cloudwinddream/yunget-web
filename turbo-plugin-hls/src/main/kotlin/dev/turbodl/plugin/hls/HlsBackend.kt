@@ -74,8 +74,15 @@ class HlsBackend : DownloadBackend {
             preloadKeys(client, context, playlist.segments, keyCache)
             downloadSegments(client, context, playlist.segments, keyCache)
         } finally {
-            client.dispatcher.executorService.shutdown()
-            client.connectionPool.evictAll()
+            // 【逐句兜底，别用一条裸顺序链】两点理由：
+            // 1. `evictAll()` 会真的 close 每条空闲连接的 socket（TLS 还要写 close_notify），
+            //    在 Android 主线程上会抛 NetworkOnMainThreadException —— 而 OkHttp 的
+            //    `Util.closeQuietly` 只吞 IOException，RuntimeException 会原样穿透。
+            //    它抛出时后面那句就不执行，连接池清理被跳过。
+            // 2. **更严重的是 finally 抛出的异常会覆盖原始异常**：包括覆盖
+            //    CancellationException —— 用户点「暂停」会被记成任务 FAILED 而不是 PAUSED。
+            runCatching { client.dispatcher.executorService.shutdown() }
+            runCatching { client.connectionPool.evictAll() }
         }
     }
 
@@ -334,6 +341,9 @@ class HlsBackend : DownloadBackend {
     }
 
     private fun decryptAes128(input: File, output: File, key: ByteArray, iv: ByteArray) {
+        // AES-128-CBC 不是这里能挑的算法，是 HLS 规范定的（RFC 8216 §4.3.2.4：AES-128 加密段
+        // 一律 CBC + PKCS#7）。CBC 自身不提供完整性保护，这一点是真实的；但换成 GCM 就解不开
+        // 任何实际存在的加密流了 —— 互通性在这里压过"用更现代的算法"。
         val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
         cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
         val plain = cipher.doFinal(input.readBytes())
