@@ -593,6 +593,17 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
             }
         }
 
+        // Tracker 来源同步：抓取已启用官方源 + 自定义源并聚合落盘（逐源结果在响应里；
+        // 全部失败时旧聚合保留不清空、anySuccess=false，不算接口错误）
+        post("/gopeed/trackers/sync") {
+            try {
+                val r = withContext(Dispatchers.IO) { gopeed.syncTrackers() }
+                call.respond(ok(r))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "Tracker 同步失败"))
+            }
+        }
+
         get("/gopeed/tasks") {
             try {
                 call.respond(ok(withContext(Dispatchers.IO) { gopeed.listTasks() }))

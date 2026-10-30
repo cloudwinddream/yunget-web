@@ -2,6 +2,8 @@ package com.yunget.web.service
 
 import com.yunget.web.model.GopeedStatusResponse
 import com.yunget.web.model.GopeedTaskView
+import com.yunget.web.model.TrackerSourceResult
+import com.yunget.web.model.TrackerSyncResponse
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -12,6 +14,10 @@ import org.slf4j.LoggerFactory
 import java.io.File
 import java.net.Proxy
 import java.net.ServerSocket
+import java.net.URI
+import java.net.URLDecoder
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import java.util.zip.ZipInputStream
@@ -64,6 +70,9 @@ class GopeedService(
     /** 进程生命周期串行化（start/stop/install/uninstall 互斥；synchronized 可重入） */
     private val lifecycleLock = Any()
 
+    /** Tracker 同步串行化（避免并发同步互相覆盖聚合结果） */
+    private val trackerSyncLock = Any()
+
     /** 专用于 localhost 的客户端：**必须绕开系统代理**，否则本地请求会被代理走 */
     private val client: OkHttpClient by lazy {
         OkHttpClient.Builder()
@@ -112,6 +121,84 @@ class GopeedService(
 
         /** 内核可执行文件名：Windows 带 .exe，其余为裸名 */
         fun exeName(): String = if (osKey() == "windows") "gopeed.exe" else "gopeed"
+
+        // -----------------------------------------------------------------------------------------
+        // Tracker 聚合的纯函数（无 IO，可独立验证）
+        // -----------------------------------------------------------------------------------------
+
+        /** 官方来源：ngosang/trackerslist 的 best 列表 */
+        const val NGOSANG_TRACKERS_URL =
+            "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
+
+        /** 官方来源：XIU2/TrackersListCollection 的 best 列表 */
+        const val XIU2_TRACKERS_URL =
+            "https://raw.githubusercontent.com/XIU2/TrackersListCollection/master/best.txt"
+
+        /** 聚合列表条数上限（防自定义源塞入超大列表拖慢建任务与引擎解析） */
+        const val TRACKER_LIST_CAP = 500
+
+        /** 可接受的 Tracker 协议前缀（小写比对） */
+        private val TRACKER_PREFIXES = listOf("udp://", "http://", "https://", "ws://", "wss://")
+
+        /**
+         * 解析一个来源的文本：逐行 trim，跳过空行与 `#` 注释，
+         * 只保留以 udp/http/https/ws/wss 协议开头的行（原样保留，不改大小写）。
+         */
+        fun parseTrackerList(text: String): List<String> =
+            text.lineSequence()
+                .map { it.trim() }
+                .filter { it.isNotEmpty() && !it.startsWith("#") }
+                .filter { line -> TRACKER_PREFIXES.any { line.startsWith(it, ignoreCase = true) } }
+                .toList()
+
+        /** 跨源合并：按传入顺序拼接、去重保序，超过 [cap] 条截断 */
+        fun mergeTrackers(lists: List<List<String>>, cap: Int = TRACKER_LIST_CAP): List<String> {
+            val seen = LinkedHashSet<String>()
+            for (list in lists) for (t in list) {
+                if (seen.size >= cap) return seen.toList()
+                seen += t
+            }
+            return seen.toList()
+        }
+
+        /** 磁力链已有的 tr= 参数集合（URL 解码后的原文，用于去重比对） */
+        fun magnetExistingTrackers(magnet: String): Set<String> {
+            val q = magnet.substringAfter('?', "")
+            if (q.isEmpty()) return emptySet()
+            val out = LinkedHashSet<String>()
+            for (part in q.split('&')) {
+                val eq = part.indexOf('=')
+                if (eq <= 0) continue
+                if (!part.substring(0, eq).equals("tr", ignoreCase = true)) continue
+                val raw = part.substring(eq + 1)
+                out += runCatching { URLDecoder.decode(raw, StandardCharsets.UTF_8) }.getOrDefault(raw)
+            }
+            return out
+        }
+
+        /**
+         * 把聚合 Tracker 追加进磁力链：仅处理 magnet: 链接、聚合为空时原样返回；
+         * 与磁力链已有 tr（解码后比对，含聚合条目自身的解码形态）去重，
+         * 新增条目逐个以 `&tr=<URLEncoder 编码>` 拼到 URI 末尾。
+         */
+        fun augmentMagnet(magnet: String, trackers: List<String>): String {
+            if (trackers.isEmpty()) return magnet
+            if (!magnet.startsWith("magnet:", ignoreCase = true)) return magnet
+            val existing = magnetExistingTrackers(magnet).toMutableSet()
+            val toAdd = mutableListOf<String>()
+            for (t in trackers) {
+                val v = t.trim()
+                if (v.isEmpty()) continue
+                val decoded = runCatching { URLDecoder.decode(v, StandardCharsets.UTF_8) }.getOrDefault(v)
+                if (v in existing || decoded in existing) continue
+                existing += v
+                existing += decoded
+                toAdd += v
+            }
+            if (toAdd.isEmpty()) return magnet
+            val sep = if (magnet.contains('?')) "&" else "?"
+            return magnet + sep + toAdd.joinToString("&") { "tr=" + URLEncoder.encode(it, StandardCharsets.UTF_8) }
+        }
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -382,6 +469,91 @@ class GopeedService(
     }
 
     // ---------------------------------------------------------------------------------------------
+    // Tracker 来源同步与聚合（设置页「Tracker 服务器」）
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * 同步并聚合 Tracker：逐个抓取「已启用官方源 + 自定义源」（走工具安装代理，单源超时封顶 15s），
+     * 解析后跨源合并去重（上限 [TRACKER_LIST_CAP] 条）。
+     * - 部分成功：用成功源的结果更新聚合列表与时间戳并持久化；
+     * - 全部失败：**保留旧聚合列表与旧时间戳不清空**，仅在响应里逐源报告失败。
+     * 没有启用任何来源时抛友好错误。
+     */
+    fun syncTrackers(): TrackerSyncResponse = synchronized(trackerSyncLock) {
+        val s = downloads.settings
+        val sources = mutableListOf<Pair<String, String>>()
+        if (s.trackerNgosang) sources += "ngosang" to NGOSANG_TRACKERS_URL
+        if (s.trackerXiu2) sources += "XIU2" to XIU2_TRACKERS_URL
+        s.trackerCustomSources.map { it.trim() }.filter { it.isNotBlank() }
+            .forEach { url -> sources += sourceDisplayName(url) to url }
+        if (sources.isEmpty()) {
+            throw IllegalStateException("没有启用任何 Tracker 来源，请先勾选官方来源或添加自定义来源")
+        }
+        val client = trackerFetchClient()
+        val results = mutableListOf<TrackerSourceResult>()
+        val okLists = mutableListOf<List<String>>()
+        for ((name, url) in sources) {
+            try {
+                val list = fetchTrackerList(client, url)
+                results += TrackerSourceResult(name = name, url = url, ok = true, count = list.size)
+                okLists += list
+            } catch (e: Exception) {
+                val msg = e.message?.takeIf { it.isNotBlank() } ?: "抓取失败"
+                results += TrackerSourceResult(name = name, url = url, ok = false, error = msg)
+                log.warn("Tracker 来源抓取失败（{}）：{}", url, msg)
+            }
+        }
+        if (okLists.isEmpty()) {
+            // 全部失败：旧聚合原样保留，响应回带旧值让前端状态行与缓存不被误清
+            return@synchronized TrackerSyncResponse(
+                anySuccess = false,
+                count = s.trackerList.size,
+                syncedAt = s.trackerSyncedAt,
+                trackers = s.trackerList,
+                sources = results
+            )
+        }
+        val merged = mergeTrackers(okLists)
+        val now = System.currentTimeMillis()
+        // 持久化（updateSettings 整表落盘 + 即时生效）；downloadDir 用当前原始设置值，不经展示层解析
+        downloads.updateSettings(s.copy(trackerList = merged, trackerSyncedAt = now))
+        log.info("Tracker 同步完成：{} 个来源成功，聚合 {} 条", okLists.size, merged.size)
+        TrackerSyncResponse(
+            anySuccess = true,
+            count = merged.size,
+            syncedAt = now,
+            trackers = merged,
+            sources = results
+        )
+    }
+
+    /** 自定义来源的显示名：取 URL 的 host，取不到就用 URL 本身 */
+    private fun sourceDisplayName(url: String): String =
+        runCatching { URI(url).host }.getOrNull()?.takeIf { it.isNotBlank() } ?: url
+
+    /**
+     * 抓取专用客户端：基于工具安装代理的 API 客户端收紧超时
+     * （单源 connect 10s / read 15s / call 15s，避免某个源拖死整轮同步）。
+     * 代理地址本身不合法时 InstallHttp 会抛友好文案，记为整轮的一种失败形态——
+     * 此处不吞：让它冒泡成接口级错误，前端能直接看到要改代理。
+     */
+    private fun trackerFetchClient(): OkHttpClient =
+        InstallHttp.apiClient(downloads.settings.toolProxy).newBuilder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .callTimeout(15, TimeUnit.SECONDS)
+            .build()
+
+    private fun fetchTrackerList(client: OkHttpClient, url: String): List<String> {
+        val req = Request.Builder().url(url).header("User-Agent", UA).build()
+        client.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}")
+            return parseTrackerList(text)
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // 进程生命周期
     // ---------------------------------------------------------------------------------------------
 
@@ -536,12 +708,21 @@ class GopeedService(
     /**
      * 新建下载任务（磁力/BT 或 http 直链，Gopeed 本就都支持）。
      * 落盘目录固定为当前下载目录（`opts.path`)；[name] 给定时作为落盘名下发。
+     * 磁力链在此唯一的提交入口处合并设置里的聚合 Tracker（与链自带 tr 去重；非磁力链不动）。
      * @return 引擎任务 ID
      */
     fun createTask(url: String, name: String = ""): String {
         ensureRunning()
+        val finalUrl = augmentMagnet(url, downloads.settings.trackerList)
+        if (finalUrl != url) {
+            log.info(
+                "磁力链已合并聚合 Tracker：{} 条 → 追加 {} 个 tr 参数",
+                downloads.settings.trackerList.size,
+                finalUrl.split("&tr=").size - url.split("&tr=").size
+            )
+        }
         val saveDir = downloads.resolvedDownloadsDir().absolutePath
-        val req = JSONObject().apply { put("url", url) }
+        val req = JSONObject().apply { put("url", finalUrl) }
         val opts = JSONObject().apply {
             put("path", saveDir)
             if (name.isNotBlank()) put("name", name)

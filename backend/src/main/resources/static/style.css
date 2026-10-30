@@ -74,7 +74,9 @@ table.files tr.dir:hover td { background: #f6f9ff; }
 .setctl.grow { flex: 1; }
 .setctl.grow input[type=text] { flex: 1; width: auto; text-align: left; }
 .unit { font-size: 12.5px; color: #888; white-space: nowrap; }
-.pconn-grid { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+/* 紧凑响应式网格（v1.0.39）：原一平台一整行改为自动列数网格，单元格 minmax(160px,1fr)；
+   分组标题占满整行作瘦高分隔（见 .connlist .pgroup-title / .pconn-group 的 grid-column） */
+.pconn-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; }
 .pconn { display: inline-flex; align-items: center; gap: 6px; background: #f5f7fa; border: 1px solid #e3e8ef; border-radius: 999px; padding: 4px 5px 4px 12px; font-size: 13px; color: #444; }
 .pconn i { font-style: normal; }
 .pconn input[type=text] { width: 58px; text-align: center; border-radius: 999px; padding: 5px 4px; }
@@ -147,6 +149,15 @@ table.files tr.dir:hover td { background: #f6f9ff; }
 .connname { flex: 1; font-size: 14px; color: #333; }
 .connrow select { border: 1px solid #d5dae2; border-radius: 6px; padding: 7px 10px; font-size: 14px; background: #fff; }
 .connrow select:focus { outline: none; border-color: #1a73e8; }
+/* 连接数列表的紧凑网格形态（v1.0.39，仅作用于 #platformConnRows 的 .connlist 上下文）：
+   平台名小字在上、select 在下，整节高度约为原来的一半 */
+.connlist { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 2px 16px; }
+.connlist .pgroup-title { grid-column: 1 / -1; margin-top: 10px; }
+.connlist .pgroup-title:first-child { margin-top: 0; }
+.connlist .connrow { flex-direction: column; align-items: stretch; gap: 3px; padding: 5px 0; border-bottom: none; }
+.connlist .connname { flex: none; font-size: 12.5px; color: #555; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.connlist .connrow .setctl { justify-content: flex-start; }
+.connlist .connrow select { padding: 5px 8px; font-size: 13px; }
 
 /* 网盘文件（个人盘） */
 .crumb { display: flex; align-items: center; flex-wrap: wrap; gap: 2px; }
@@ -164,7 +175,8 @@ table.files tr.dir:hover td { background: #f6f9ff; }
 /* 设置页平台分组标题 */
 .pgroup-title { font-size: 12px; color: #8a929c; letter-spacing: 2px; margin: 14px 0 2px; padding-bottom: 4px; border-bottom: 1px solid #eef0f3; }
 .pgroup-title:first-child { margin-top: 2px; }
-.pconn-group { flex-basis: 100%; font-size: 12px; color: #8a929c; letter-spacing: 2px; margin-top: 4px; }
+.pconn-group { flex-basis: 100%; grid-column: 1 / -1; font-size: 12px; color: #8a929c; letter-spacing: 2px; margin-top: 4px; padding-bottom: 3px; border-bottom: 1px solid #eef0f3; }
+.pconn-grid .pconn { justify-content: space-between; }
 /* 个人盘平台切换（选中态与主按钮同蓝） */
 #drivePlatSwitch button.on { background: #1a73e8; color: #fff; }
 
@@ -177,3 +189,16 @@ table.files tr.dir:hover td { background: #f6f9ff; }
 /* YouTube 字幕多选区（v1.0.30） */
 .subs { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 4px 0; }
 .subck { font-size: 13px; display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+
+/* Gopeed Tracker 来源（v1.0.39）：官方来源可勾选卡 + 自定义来源列表（结构参考来源式 Tracker 管理 UI，浅色卡片风） */
+.trk-label { font-size: 12px; color: #8a929c; letter-spacing: 2px; margin: 12px 0 6px; }
+.src-cards { display: flex; flex-wrap: wrap; gap: 10px; }
+.src-card { display: flex; align-items: center; gap: 9px; flex: 1 1 180px; max-width: 300px; margin: 0; padding: 9px 14px; background: #fbfcfe; border: 1px solid #dfe5ee; border-radius: 8px; cursor: pointer; }
+.src-card:hover { border-color: #bcd2f5; }
+.src-card input[type=checkbox] { width: 16px; height: 16px; flex-shrink: 0; margin: 0; }
+.src-card .src-main { display: flex; flex-direction: column; min-width: 0; }
+.src-card .src-main b { font-size: 13.5px; font-weight: 600; color: #333; }
+.src-card .src-main i { font-style: normal; font-size: 12px; color: #8a929c; }
+.tracker-src-item { display: flex; align-items: center; gap: 8px; padding: 7px 2px; border-bottom: 1px dashed #eef1f5; font-size: 13px; }
+.tracker-src-item:last-child { border-bottom: none; }
+.tracker-src-item .u { flex: 1; min-width: 0; color: #444; word-break: break-all; }

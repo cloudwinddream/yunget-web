@@ -746,6 +746,61 @@ async function gopeedUninstall() {
   loadGopeedStatus();
 }
 
+// ---------- Gopeed Tracker 来源 ----------
+// 自定义来源与聚合结果的本地镜像：loadSettings 回填、保存设置整表提交时原样带回，
+// 聚合结果（trackerList/trackerSyncedAt）由服务端同步端点维护，前端不手工编辑、只镜像防误清
+let trackerCustomList = [];
+let trackerAggregateCache = [];
+let trackerSyncedAtCache = 0;
+function renderTrackerCustomList() {
+  const box = document.getElementById('trackerCustomList');
+  if (!box) return;
+  if (!trackerCustomList.length) { box.innerHTML = '<p class="hint" style="margin:6px 0 0">暂无自定义来源</p>'; return; }
+  box.innerHTML = trackerCustomList.map((u, i) =>
+    `<div class="tracker-src-item"><span class="u">${escapeHtml(u)}</span><button type="button" class="danger small" onclick="trackerDelSource(${i})">删除</button></div>`
+  ).join('');
+}
+function trackerAddSource() {
+  const input = document.getElementById('trackerCustomInput');
+  const url = input.value.trim();
+  hideMsg('trackerMsg');
+  if (!/^https?:\/\//i.test(url)) { showMsg('trackerMsg', '自定义来源需是 http:// 或 https:// 开头的 Tracker 列表 URL', false); return; }
+  if (trackerCustomList.includes(url)) { showMsg('trackerMsg', '这个来源已经添加过了', false); return; }
+  trackerCustomList.push(url);
+  input.value = '';
+  renderTrackerCustomList();
+  showMsg('trackerMsg', '已添加到自定义来源（点「同步并聚合」或「保存设置」后落盘）', true);
+}
+function trackerDelSource(i) {
+  trackerCustomList.splice(i, 1);
+  renderTrackerCustomList();
+}
+function renderTrackerStatus() {
+  const el = document.getElementById('trackerStatus');
+  if (!el) return;
+  el.textContent = trackerSyncedAtCache > 0
+    ? `上次同步：${new Date(trackerSyncedAtCache).toLocaleString()} · 共 ${trackerAggregateCache.length} 条 Tracker`
+    : '尚未同步过';
+}
+async function trackerSync() {
+  await saveSettings(); // 先把本页设置（来源开关/自定义来源）落盘再同步，沿用安装按钮的既有惯例
+  hideMsg('trackerMsg');
+  const btn = document.getElementById('trackerSyncBtn');
+  btn.disabled = true;
+  showMsg('trackerMsg', '正在抓取各来源并聚合，请稍候…', true);
+  const r = await api('/api/gopeed/trackers/sync', 'POST', {});
+  btn.disabled = false;
+  if (!r.ok) { showMsg('trackerMsg', r.message || '同步失败', false); return; }
+  const d = r.data;
+  // 以服务端当前生效聚合刷新本地镜像，避免随后保存设置时用旧值覆盖新聚合
+  if (Array.isArray(d.trackers)) trackerAggregateCache = d.trackers.slice();
+  if (typeof d.syncedAt === 'number') trackerSyncedAtCache = d.syncedAt;
+  renderTrackerStatus();
+  const detail = (d.sources || []).map(x => x.ok ? `${x.name} ${x.count} 条` : `${x.name} 失败（${x.error || '未知错误'}）`).join('；');
+  if (d.anySuccess) showMsg('trackerMsg', `同步完成，共聚合 ${d.count} 条 Tracker。${detail}`, true);
+  else showMsg('trackerMsg', `全部来源同步失败，已保留此前聚合的 ${d.count} 条。${detail}`, false);
+}
+
 // ---------- 设置 ----------
 // 设置页平台分组（组标题 + 组内条目渲染；存取仍走 platformConnections/platformConcurrentTasks 两张表）
 const PLATFORM_GROUPS = [
@@ -792,6 +847,13 @@ async function loadSettings() {
   document.getElementById('setYtdlpProxy').value = s.ytdlpProxy || '';
   document.getElementById('setToolProxy').value = s.toolProxy || '';
   document.getElementById('setNameTemplate').value = s.videoNameTemplate || '{title}';
+  document.getElementById('setTrackerNgosang').checked = s.trackerNgosang !== false;
+  document.getElementById('setTrackerXiu2').checked = s.trackerXiu2 !== false;
+  trackerCustomList = Array.isArray(s.trackerCustomSources) ? s.trackerCustomSources.slice() : [];
+  trackerAggregateCache = Array.isArray(s.trackerList) ? s.trackerList.slice() : [];
+  trackerSyncedAtCache = s.trackerSyncedAt || 0;
+  renderTrackerCustomList();
+  renderTrackerStatus();
   loadGopeedStatus();
   refreshFfmpegCard();
   refreshYtdlpCard();
@@ -824,6 +886,12 @@ async function saveSettings() {
     ytdlpProxy: document.getElementById('setYtdlpProxy').value.trim(),
     toolProxy: document.getElementById('setToolProxy').value.trim(),
     videoNameTemplate: document.getElementById('setNameTemplate').value.trim() || '{title}',
+    trackerNgosang: document.getElementById('setTrackerNgosang').checked,
+    trackerXiu2: document.getElementById('setTrackerXiu2').checked,
+    trackerCustomSources: trackerCustomList.slice(),
+    // 聚合结果与同步时间由服务端同步端点维护，这里原样带回，避免整表提交时被清掉
+    trackerList: trackerAggregateCache.slice(),
+    trackerSyncedAt: trackerSyncedAtCache,
     downloadDir: document.getElementById('setDir').value.trim()
   };
   const r = await api('/api/settings', 'PUT', s);

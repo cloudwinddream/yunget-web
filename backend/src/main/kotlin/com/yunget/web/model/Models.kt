@@ -158,7 +158,42 @@ data class SettingsData(
     val toolProxy: String = "",
     // 视频下载命名模板（仅作用于视频/YouTube 的标题生成型文件名，网盘保持原名）；
     // 变量：{title} 标题 {author} 作者 {id} 作品ID {platform} 平台 {quality} 清晰度 {date} 发布日期 {index} 序号（从 1 开始）
-    val videoNameTemplate: String = "{title}"
+    val videoNameTemplate: String = "{title}",
+    // Gopeed 磁力 Tracker 来源式聚合（设置页「Tracker 服务器」）：官方源开关 + 自定义源 URL 列表，
+    // 点「同步并聚合」后服务端抓取、合并去重，写入 trackerList 并记 trackerSyncedAt；
+    // trackerList / trackerSyncedAt 由同步端点维护（前端保存设置时原样带回，不手工编辑），
+    // 新建磁力任务时自动把 trackerList 合并进磁力链（与磁力链自带 tr 去重）
+    val trackerNgosang: Boolean = true,
+    val trackerXiu2: Boolean = true,
+    val trackerCustomSources: List<String> = emptyList(),
+    val trackerList: List<String> = emptyList(),
+    val trackerSyncedAt: Long = 0
+)
+
+/** Tracker 同步时单个来源的结果（成功给条数，失败给原因原文） */
+@Serializable
+data class TrackerSourceResult(
+    /** 来源显示名：官方源为 ngosang / XIU2，自定义源为其 URL 的 host（取不到时为 URL 本身） */
+    val name: String,
+    val url: String,
+    val ok: Boolean,
+    /** 该源解析出的条数（去重前）；失败时为 0 */
+    val count: Int = 0,
+    val error: String = ""
+)
+
+/** POST /api/gopeed/trackers/sync 的响应：聚合结果 + 逐源明细 */
+@Serializable
+data class TrackerSyncResponse(
+    /** 本次是否有至少一个来源同步成功（全部失败时聚合列表保留旧值不清空） */
+    val anySuccess: Boolean,
+    /** 当前生效的聚合 Tracker 总数（去重后；全部失败时为旧列表条数） */
+    val count: Int,
+    /** 当前生效聚合对应的同步时间戳（毫秒；全部失败时为旧值，未同步过为 0） */
+    val syncedAt: Long,
+    /** 当前生效的聚合列表全文（前端据此刷新本地缓存，避免随后保存设置时用旧值覆盖） */
+    val trackers: List<String> = emptyList(),
+    val sources: List<TrackerSourceResult> = emptyList()
 )
 
 @Serializable
