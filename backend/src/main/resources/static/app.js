@@ -1154,7 +1154,7 @@ async function ffmpegInstall() {
 }
 
 // ---------- 视频解析 ----------
-let curVideoSession = null, curVideoMedias = [];
+let curVideoSession = null, curVideoMedias = [], curVideoList = null;
 async function parseVideoLink(link) {
   const r = await api('/api/video/parse', 'POST', { link });
   if (!r.ok) { showMsg('parseMsg', r.message || '视频解析失败', false); return; }
@@ -1163,6 +1163,7 @@ async function parseVideoLink(link) {
   document.getElementById('youtubeCard').style.display = 'none';
   curVideoSession = r.data.sessionId;
   curVideoMedias = r.data.medias || [];
+  curVideoList = r.data.listInfo || null;
   document.getElementById('videoCard').style.display = 'block';
   document.getElementById('videoTitle').textContent = r.data.title || '视频';
   document.getElementById('videoPlat').textContent = r.data.platformName || r.data.platform || '';
@@ -1173,6 +1174,7 @@ async function parseVideoLink(link) {
   if (r.data.cover) { cover.src = r.data.cover; cover.style.display = 'block'; } else cover.style.display = 'none';
   await fetchFfmpegState();
   renderVideoList();
+  renderSeasonBox();
   showMsg('parseMsg', '解析成功', true);
 }
 function renderVideoList() {
@@ -1222,6 +1224,57 @@ async function downloadVideoSelected() {
       }
     }
   } finally { btn.disabled = false; }
+}
+
+// ---------- B站合集（所属列表：整单勾选批量下载，落「合集名」文件夹） ----------
+function renderSeasonBox() {
+  const box = document.getElementById('videoSeasonBox');
+  const info = curVideoList;
+  if (!info || !info.episodes || !info.episodes.length) { box.style.display = 'none'; return; }
+  box.style.display = 'block';
+  document.getElementById('videoSeasonTitle').textContent = `📺 所属合集：${info.title}（共 ${info.total} 集）`;
+  document.getElementById('videoSeasonFolder').textContent =
+    info.folder ? `批量下载将保存到下载目录的文件夹：${info.folder}` : '';
+  document.getElementById('videoSeasonList').innerHTML = info.episodes.map(e =>
+    `<div class="drow">
+      <input type="checkbox" class="sck" data-i="${e.index}" checked onchange="updateSeasonSel()">
+      <span class="dic">${e.index}</span>
+      <span class="dname">${escapeHtml(e.title)}${e.index === info.currentIndex ? ' <span class="badge on">本集</span>' : ''}</span>
+      <span class="dmeta">${e.duration > 0 ? fmtDuration(e.duration) : ''}</span>
+    </div>`).join('');
+  document.getElementById('videoSeasonResult').innerHTML = '';
+  updateSeasonSel();
+}
+function updateSeasonSel() {
+  const n = document.querySelectorAll('.sck:checked').length;
+  document.getElementById('seasonSelInfo').textContent = n ? `已选 ${n} 集` : '';
+  document.getElementById('seasonDlBtn').textContent = `下载所选 (${n})`;
+}
+function toggleSeasonAll(on) {
+  document.querySelectorAll('.sck').forEach(c => { c.checked = on; });
+  updateSeasonSel();
+}
+async function downloadSeasonSelected() {
+  const indexes = [...document.querySelectorAll('.sck:checked')].map(c => parseInt(c.dataset.i));
+  if (!indexes.length) { showMsg('videoMsg', '请先勾选要下载的集数', false); return; }
+  const btn = document.getElementById('seasonDlBtn');
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = '逐集解析提交中…';
+  try {
+    const r = await api('/api/video/list/download', 'POST', { sessionId: curVideoSession, indexes });
+    if (!r.ok) { showMsg('videoMsg', r.message || '合集下载提交失败', false); return; }
+    const results = r.data.results || [];
+    const okN = results.filter(x => x.ok).length;
+    showMsg('videoMsg',
+      `合集提交完成：成功 ${okN} / 失败 ${results.length - okN}，文件保存到文件夹「${r.data.folder || ''}」（逐集结果见下）`,
+      results.length - okN === 0);
+    document.getElementById('videoSeasonResult').innerHTML = results.map(x =>
+      x.ok
+        ? `<div class="hint" style="color:#137333">✓ 第 ${x.index} 集 ${escapeHtml(x.title)}${x.message ? '：' + escapeHtml(x.message) : ''}</div>`
+        : `<div class="hint" style="color:#b26a00">✗ 第 ${x.index} 集 ${escapeHtml(x.title)}：${escapeHtml(x.message || '失败')}</div>`
+    ).join('');
+  } finally { btn.disabled = false; btn.textContent = old; updateSeasonSel(); }
 }
 
 // ---------- GitHub 解析 ----------
@@ -1339,6 +1392,8 @@ async function downloadYoutube() {
 function renderYtPlaylist(d) {
   document.getElementById('ytVideoBox').style.display = 'none';
   document.getElementById('ytListBox').style.display = 'block';
+  document.getElementById('ytListFolder').textContent =
+    d.folder ? `将下载到文件夹：${d.folder}` : '';
   document.getElementById('ytListQuality').innerHTML =
     (d.qualities || []).map(q => `<option value="${q.height}">${escapeHtml(q.label)}</option>`).join('');
   document.getElementById('ytListSubsBox').innerHTML =

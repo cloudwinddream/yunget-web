@@ -222,7 +222,9 @@ class YouTubeService(
                 title = title,
                 qualities = PLAYLIST_TIERS,
                 entries = entries.map { YouTubeEntryDto(it.index, it.id, it.title, it.durationSec) },
-                formatsSummary = "共 ${entries.size} 个视频 · 下载时逐条按所选档位取最优格式"
+                formatsSummary = "共 ${entries.size} 个视频 · 下载时逐条按所选档位取最优格式",
+                // 列表批量下载的统一规则：成品落到「列表名」文件夹（与下载时同源计算）
+                folder = VideoNaming.folderName(title)
             )
         } else {
             val info = toVideoInfo(j)
@@ -407,13 +409,15 @@ class YouTubeService(
         val wantedIds = req.entryIds.toSet()
         val wanted = s.entries.filter { it.id in wantedIds }
         if (wanted.isEmpty()) throw IllegalArgumentException("请先勾选要下载的条目")
+        // 列表批量下载的统一规则：全部条目落到「播放列表名」文件夹
+        val folder = VideoNaming.folderName(s.playlistTitle)
         val results = mutableListOf<YouTubeEntryResultDto>()
         // 顺序执行：逐条取完整格式再入队，避免并发轰击 YouTube；单条失败不中断其余
         for (entry in wanted) {
             try {
                 val j = runParseJson("https://www.youtube.com/watch?v=${entry.id}", flatPlaylist = false)
                 val info = toVideoInfo(j)
-                val out = enqueueInfo(info, req.targetHeight, req.subLangs, req.includeAuto, index1 = entry.index + 1)
+                val out = enqueueInfo(info, req.targetHeight, req.subLangs, req.includeAuto, index1 = entry.index + 1, relPath = folder)
                 results += YouTubeEntryResultDto(
                     id = entry.id, title = entry.title,
                     ok = out.taskIds.isNotEmpty(),
@@ -429,13 +433,18 @@ class YouTubeService(
         return YouTubePlaylistDownloadResponse(results)
     }
 
-    /** 把一条视频按挑选结果入队（视频/音频/字幕），命名走模板；返回任务与提示 */
+    /**
+     * 把一条视频按挑选结果入队（视频/音频/字幕），命名走模板；返回任务与提示。
+     * [relPath] 非空时全部产物（合轨成品 / 分轨双文件 / 字幕）落到下载目录的该子
+     * 文件夹（列表批量下载的统一规则）；单视频下载传 "" 落根目录，行为不变。
+     */
     private suspend fun enqueueInfo(
         info: YtVideoInfo,
         targetHeight: Int,
         subLangs: List<String>,
         includeAuto: Boolean,
-        index1: Int
+        index1: Int,
+        relPath: String = ""
     ): EnqueueOutcome {
         val pick = pick(info, targetHeight)
         val vars = VideoNaming.Vars(
@@ -458,16 +467,16 @@ class YouTubeService(
                 if (canMux) {
                     val (outExt, faststart) = muxContainer(pick)
                     val finalName = "$base.$outExt"
-                    ids += enqueueMuxPair(v, a, finalName, faststart)
+                    ids += enqueueMuxPair(v, a, finalName, faststart, relPath)
                     notes += "分轨下载，完成后自动合轨为 $finalName"
                 } else {
-                    ids += enqueueTrack(v, "$base.${v.ext.ifBlank { "mp4" }}")
-                    ids += enqueueTrack(a, "$base.audio.${a.ext.ifBlank { "m4a" }}")
+                    ids += enqueueTrack(v, "$base.${v.ext.ifBlank { "mp4" }}", relPath)
+                    ids += enqueueTrack(a, "$base.audio.${a.ext.ifBlank { "m4a" }}", relPath)
                     notes += "未检测到 ffmpeg：音视频分轨以两个文件下载，需自行合轨（设置页可一键安装 ffmpeg）"
                 }
             }
-            v != null -> ids += enqueueTrack(v, "$base.${v.ext.ifBlank { "mp4" }}")
-            a != null -> ids += enqueueTrack(a, "$base.${a.ext.ifBlank { "m4a" }}")
+            v != null -> ids += enqueueTrack(v, "$base.${v.ext.ifBlank { "mp4" }}", relPath)
+            a != null -> ids += enqueueTrack(a, "$base.${a.ext.ifBlank { "m4a" }}", relPath)
         }
         // 字幕：与成品同基名，「基名.<lang>.vtt」；取不到轨的语言跳过并记进提示
         for (lang in subLangs.distinct()) {
@@ -483,7 +492,8 @@ class YouTubeService(
                 headers = emptyMap(),
                 size = -1,
                 platform = "video",
-                resumeKey = "youtube-sub-" + Integer.toHexString(sub.url.hashCode())
+                resumeKey = "youtube-sub-" + Integer.toHexString(sub.url.hashCode()),
+                relPath = relPath
             )
         }
         return EnqueueOutcome(ids, notes.joinToString("；"))
@@ -503,14 +513,15 @@ class YouTubeService(
     private fun sanitizeLangKey(lang: String): String =
         lang.replace(Regex("[^A-Za-z0-9._-]"), "_").ifBlank { "sub" }
 
-    private suspend fun enqueueTrack(f: YtFormat, fileName: String): Long =
+    private suspend fun enqueueTrack(f: YtFormat, fileName: String, relPath: String = ""): Long =
         downloadService.enqueue(
             url = f.url,
             fileName = fileName,
             headers = f.headers,
             size = f.size ?: -1,
             platform = "video",
-            resumeKey = "youtube-" + Integer.toHexString(f.url.hashCode())
+            resumeKey = "youtube-" + Integer.toHexString(f.url.hashCode()),
+            relPath = relPath
         )
 
     // ------------------------------------------------------------------
@@ -523,6 +534,8 @@ class YouTubeService(
         val videoName: String,
         val audioName: String,
         val faststart: Boolean,
+        /** 成品（含合轨失败保底的双文件）的目标子文件夹；"" = 下载目录根（单视频） */
+        val targetRelPath: String = "",
         val videoTaskId: AtomicLong = AtomicLong(-1),
         val audioTaskId: AtomicLong = AtomicLong(-1),
         val remaining: AtomicInteger = AtomicInteger(2)
@@ -530,12 +543,14 @@ class YouTubeService(
 
     private val muxJobs = ConcurrentHashMap<String, YtMuxJob>()
 
-    private suspend fun enqueueMuxPair(v: YtFormat, a: YtFormat, finalName: String, faststart: Boolean): List<Long> {
+    private suspend fun enqueueMuxPair(
+        v: YtFormat, a: YtFormat, finalName: String, faststart: Boolean, targetRelPath: String = ""
+    ): List<Long> {
         val groupId = UUID.randomUUID().toString()
         val rel = "$MUX_STAGING_DIR/$groupId"
         val vName = "v.${v.ext.ifBlank { "mp4" }}"
         val aName = "a.${a.ext.ifBlank { "m4a" }}"
-        val job = YtMuxJob(groupId, finalName, vName, aName, faststart)
+        val job = YtMuxJob(groupId, finalName, vName, aName, faststart, targetRelPath)
         muxJobs[groupId] = job
         val vId = downloadService.enqueue(
             url = v.url, fileName = vName, headers = v.headers, size = v.size ?: -1,
@@ -562,6 +577,9 @@ class YouTubeService(
 
     private fun runMux(job: YtMuxJob) {
         val base = downloadService.resolvedDownloadsDir()
+        // 成品目录：单视频为下载根；播放列表批量下载为「列表名」子文件夹（暂存目录不变）
+        val destDir = if (job.targetRelPath.isBlank()) base
+        else File(base, job.targetRelPath).apply { mkdirs() }
         val stagingDir = File(base, "$MUX_STAGING_DIR/${job.groupId}")
         val vFile = trackFile(job.videoTaskId.get(), stagingDir, job.videoName)
         val aFile = trackFile(job.audioTaskId.get(), stagingDir, job.audioName)
@@ -571,12 +589,12 @@ class YouTubeService(
                 "[yt-mux] 合轨前置条件不满足（组 ${job.groupId}：ffmpeg=${ffmpegFile != null} " +
                     "视频轨=${vFile.isFile} 音轨=${aFile.isFile}），改走双文件保底"
             )
-            fallbackKeepTracks(job, base, vFile, aFile)
+            fallbackKeepTracks(job, destDir, vFile, aFile)
             cleanupStaging(base, stagingDir)
             return
         }
-        val finalFile = uniqueFile(base, VideoNaming.sanitize(job.finalName))
-        val tmpOut = File(base, finalFile.nameWithoutExtension + ".muxing." + finalFile.extension)
+        val finalFile = uniqueFile(destDir, VideoNaming.sanitize(job.finalName))
+        val tmpOut = File(destDir, finalFile.nameWithoutExtension + ".muxing." + finalFile.extension)
         val logFile = File(stagingDir, "ffmpeg.log")
         val cmd = mutableListOf(
             ffmpegFile.absolutePath,
@@ -611,7 +629,7 @@ class YouTubeService(
             tmpOut.delete()
             val tail = runCatching { logFile.readText().takeLast(500) }.getOrDefault("")
             println("[yt-mux] 合轨失败（组 ${job.groupId}，退出码 $exit）$tail；改走双文件保底")
-            fallbackKeepTracks(job, base, vFile, aFile)
+            fallbackKeepTracks(job, destDir, vFile, aFile)
         }
         cleanupStaging(base, stagingDir)
     }
@@ -624,13 +642,13 @@ class YouTubeService(
         return if (sp != null) File(sp) else File(stagingDir, fallbackName)
     }
 
-    /** 合轨失败保底：两轨移到下载目录根（原名.video.<ext> / 原名.audio.<ext>），只移不删 */
-    private fun fallbackKeepTracks(job: YtMuxJob, base: File, vFile: File, aFile: File) {
+    /** 合轨失败保底：两轨移到成品目标目录（原名.video.<ext> / 原名.audio.<ext>），只移不删 */
+    private fun fallbackKeepTracks(job: YtMuxJob, destDir: File, vFile: File, aFile: File) {
         val stem = job.finalName.substringBeforeLast('.', job.finalName)
         val vExt = job.videoName.substringAfterLast('.', "mp4")
         val aExt = job.audioName.substringAfterLast('.', "m4a")
-        moveIfExists(vFile, uniqueFile(base, VideoNaming.sanitize("$stem.video.$vExt")))
-        moveIfExists(aFile, uniqueFile(base, VideoNaming.sanitize("$stem.audio.$aExt")))
+        moveIfExists(vFile, uniqueFile(destDir, VideoNaming.sanitize("$stem.video.$vExt")))
+        moveIfExists(aFile, uniqueFile(destDir, VideoNaming.sanitize("$stem.audio.$aExt")))
     }
 
     private fun moveIfExists(src: File, dest: File) {

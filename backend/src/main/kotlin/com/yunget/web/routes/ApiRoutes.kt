@@ -25,6 +25,7 @@ import com.yunget.web.model.PasswordLoginRequest
 import com.yunget.web.model.SettingsData
 import com.yunget.web.model.BilibiliLoginRequest
 import com.yunget.web.model.VideoDownloadRequest
+import com.yunget.web.model.VideoListDownloadRequest
 import com.yunget.web.model.VideoParseRequest
 import com.yunget.web.model.YouTubeDownloadRequest
 import com.yunget.web.model.YouTubePlaylistDownloadRequest
@@ -664,6 +665,16 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
                 call.respond(ok(mapOf("taskIds" to ids)))
             } catch (e: Exception) {
                 call.respond(fail(e.message ?: "提交下载失败"))
+            }
+        }
+
+        // B站合集批量下载：逐集顺序解析入队，成品落「合集名」文件夹；逐条结果聚合返回
+        post("/video/list/download") {
+            try {
+                val req = call.receive<VideoListDownloadRequest>()
+                call.respond(ok(video.downloadSeasonList(req.sessionId, req.indexes)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "合集下载提交失败"))
             }
         }
 

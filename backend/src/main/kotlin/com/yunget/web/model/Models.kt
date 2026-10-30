@@ -250,7 +250,57 @@ data class VideoParseResponse(
     val text: String = "",
     /** 非致命降级提示（解析器给出，可能为空） */
     val notice: String = "",
-    val medias: List<VideoMediaItemDto> = emptyList()
+    val medias: List<VideoMediaItemDto> = emptyList(),
+    /** 所属列表信息（目前仅 B站合集）；不属于列表或补查失败时为 null */
+    val listInfo: VideoListInfoDto? = null
+)
+
+@Serializable
+data class VideoListEpisodeDto(
+    /** 列表内全局序号（从 1 起，多小节已拉平） */
+    val index: Int,
+    val bvid: String,
+    val title: String,
+    /** 秒；0 = 未知 */
+    val duration: Int = 0
+)
+
+@Serializable
+data class VideoListInfoDto(
+    /** 列表类型：season = B站合集 */
+    val kind: String,
+    val id: Long,
+    val title: String,
+    /** 批量下载落盘的子文件夹名（已清洗，下载目录下的单层目录名） */
+    val folder: String = "",
+    val total: Int,
+    /** 当前视频在列表中的序号（1 起）；不在列表中为 0 */
+    val currentIndex: Int = 0,
+    val episodes: List<VideoListEpisodeDto> = emptyList()
+)
+
+@Serializable
+data class VideoListDownloadRequest(
+    val sessionId: String,
+    /** 要下载的集序号（对应 VideoListEpisodeDto.index）；空 = 全部 */
+    val indexes: List<Int> = emptyList()
+)
+
+@Serializable
+data class VideoListEntryResultDto(
+    val index: Int,
+    val bvid: String,
+    val title: String,
+    val ok: Boolean,
+    val message: String = "",
+    val taskIds: List<Long> = emptyList()
+)
+
+@Serializable
+data class VideoListDownloadResponse(
+    /** 实际落盘的文件夹名（下载目录下的子目录） */
+    val folder: String = "",
+    val results: List<VideoListEntryResultDto> = emptyList()
 )
 
 @Serializable
@@ -369,7 +419,9 @@ data class YouTubeParseResponse(
     /** 播放列表条目；单视频为空 */
     val entries: List<YouTubeEntryDto> = emptyList(),
     /** 格式概览文案（如「共 38 个格式 · 最高 2160p」） */
-    val formatsSummary: String = ""
+    val formatsSummary: String = "",
+    /** 播放列表批量下载落盘的子文件夹名（已清洗）；单视频为空 */
+    val folder: String = ""
 )
 
 @Serializable

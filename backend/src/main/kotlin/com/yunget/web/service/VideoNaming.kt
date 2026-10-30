@@ -70,6 +70,20 @@ object VideoNaming {
         return r
     }
 
+    /**
+     * 列表名 → 落盘子文件夹名（列表批量下载的统一规则：文件落到「下载目录/<列表名>/」）。
+     *
+     * 与文件名同一清洗口径：[sanitize] 把非法字符（含路径分隔符 / 与 \）一律换 "_"，
+     * 天然只剩单层目录名、防路径穿越；再去首尾的点（防 ".." 这类相对路径形态）与空白、
+     * 截断到 80 字符；原始为空或清洗后为空回退「未命名列表」。
+     */
+    fun folderName(rawTitle: String): String {
+        if (rawTitle.isBlank()) return "未命名列表"
+        var n = sanitize(rawTitle).trim().trim('.').trim()
+        if (n.length > 80) n = n.take(80).trim().trimEnd('.').trim()
+        return n.ifBlank { "未命名列表" }
+    }
+
     /** 与 DownloadService.sanitizeFileName 同规则（那份是 private，这里保持一致实现） */
     fun sanitize(name: String): String {
         var n = name.trim().ifBlank { "download" }
