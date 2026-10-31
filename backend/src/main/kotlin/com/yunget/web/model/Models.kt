@@ -124,8 +124,13 @@ data class TaskInfo(
     // 文件夹下载批次（普通单文件下载为空）
     val batchId: String = "",
     val batchName: String = "",
-    val relPath: String = ""
+    val relPath: String = "",
+    // 排队优先级（-1 低 / 0 普通 / 1 高）
+    val priority: Int = 0
 )
+
+@Serializable
+data class SetPriorityRequest(val priority: Int)
 
 @Serializable
 data class SettingsData(

@@ -45,7 +45,10 @@ data class TaskRecord(
     // 文件夹下载批次（普通单文件下载为空）
     val batchId: String = "",
     val batchName: String = "",
-    val relPath: String = ""
+    val relPath: String = "",
+    // 排队优先级（-1 低 / 0 普通 / 1 高）：只影响同网盘排队放行顺序，不抢占运行中任务；
+    // 旧 tasks.json 无此字段时靠默认值 0 自动兼容
+    val priority: Int = 0
 )
 
 /**
@@ -80,6 +83,11 @@ class DownloadService(dataDir: File) {
     private val retryJobs = ConcurrentHashMap<Long, kotlinx.coroutines.Job>()
     private val retryBaseline = ConcurrentHashMap<Long, Long>()
 
+    // 正在启动中的任务（startInternal 已登记、协程尚未结束）：防双开守卫 + 优先级闸门的「等待者」判定依据。
+    // 必须声明在 init 之前：init 的重启接管会同步调用 startInternal 并 add 本集合，
+    // Kotlin 按类体文本顺序初始化属性，声明晚于 init 时此处仍为 null 会 NPE（冒烟实证）。
+    private val starting = ConcurrentHashMap.newKeySet<Long>()
+
     var settings: SettingsData = loadSettings()
         private set
 
@@ -94,6 +102,13 @@ class DownloadService(dataDir: File) {
         scope.launch { client.events.collect { onEvent(it) } }
         // 重启恢复：上次关机时正等着自动重试的任务，重新排队
         tasks.values.filter { it.status == "retry_wait" }.forEach { scheduleRetry(it.id) }
+        // 重启恢复：上次关机时还在排队（等网盘槽位）的任务，重新进入闸门等待，
+        // 否则它们没有任何等待协程、永远不会被提升（只能暂停再继续唤醒）。
+        // 两段式：先把全员同步登记进 starting 再逐个启动，避免某个先被调度的协程在
+        // 高优先级任务登记之前就抢走首个名额（冒烟实证过 2 号抢跑 3 号）
+        val queuedAtBoot = tasks.values.filter { it.status == "queued" }
+        queuedAtBoot.forEach { starting.add(it.id) }
+        queuedAtBoot.forEach { startInternal(it.id, alreadyRegistered = true) }
     }
 
     // ---------- 配置 ----------
@@ -175,6 +190,7 @@ class DownloadService(dataDir: File) {
     private val platformRunning = mutableMapOf<String, Int>()
     // 持有槽位的任务（taskId -> platform）：release 按任务幂等，暂停/删除与启动竞态时不漏放
     private val platformHeld = ConcurrentHashMap<Long, String>()
+    // 在途守卫集合 starting 声明在本类前部（init 之前，原因见彼处注释）。
 
     private suspend fun acquirePlatformSlot(taskId: Long, platform: String): Boolean {
         // 等槽位期间被暂停/删除则直接退出（由调用方释放逻辑兜底，不占槽位）
@@ -183,7 +199,9 @@ class DownloadService(dataDir: File) {
             if (cur == null || cur.status == "paused") return false
             val ok = platformGateMutex.withLock {
                 val n = platformRunning.getOrDefault(platform, 0)
-                if (n < concurrentLimit(platform).coerceAtLeast(1)) {
+                // 放行条件：名额未满，且同网盘等待者中没有比自己更「资深」的
+                // （优先级更高，或同级且创建更早）——排队由自由抢答改为按档排序
+                if (n < concurrentLimit(platform).coerceAtLeast(1) && !hasSeniorWaiter(cur)) {
                     platformRunning[platform] = n + 1
                     platformHeld[taskId] = platform
                     true
@@ -193,6 +211,21 @@ class DownloadService(dataDir: File) {
             delay(400)
         }
     }
+
+    /**
+     * 是否存在比 [self] 更应先放行的同网盘等待者。等待者口径：同 platform 且在 [starting] 中——
+     * 该集合恰好标记「有活的提交前协程」的任务（含重启时被 init 接管的排队任务）；
+     * 不再叠加 status 判断：新入队任务在协程跑起来前状态还是默认的 downloading，
+     * 只认 status==queued 会让先建的任务在启动竞态里被后建的插队。
+     * 排序键：priority 高者先；同级 createdAt 早者先（同毫秒再比 id，保证确定性）。
+     */
+    private fun hasSeniorWaiter(self: TaskRecord): Boolean =
+        tasks.values.any { u ->
+            u.id != self.id && u.platform == self.platform && starting.contains(u.id) &&
+                (u.priority > self.priority ||
+                    (u.priority == self.priority &&
+                        (u.createdAt < self.createdAt || (u.createdAt == self.createdAt && u.id < self.id))))
+        }
 
     private suspend fun releasePlatformSlot(taskId: Long) {
         val p = platformHeld.remove(taskId) ?: return
@@ -269,36 +302,52 @@ class DownloadService(dataDir: File) {
         return id
     }
 
-    private fun startInternal(id: Long) {
-        if (turboIds.containsKey(id)) return
-        val task = tasks[id] ?: return
+    private fun startInternal(id: Long, alreadyRegistered: Boolean = false) {
+        if (turboIds.containsKey(id)) {
+            if (alreadyRegistered) starting.remove(id) // 预登记后未能启动：撤掉登记，勿留僵尸等待者
+            return
+        }
+        if (tasks[id] == null) {
+            if (alreadyRegistered) starting.remove(id)
+            return
+        }
+        // 在途守卫（同步占位）：已有一个协程在等槽位/提交时，后续触发直接作罢
+        if (!alreadyRegistered && !starting.add(id)) return
         scope.launch {
-            // 先标排队：分网盘并发闸门按网盘各自限流，拿到槽位才真正提交
-            tasks[id] = task.copy(status = "queued", error = "")
-            persistTasks()
-            if (!acquirePlatformSlot(id, task.platform)) return@launch
-            // 等槽位期间可能被暂停/删除：以最新状态为准，避免漏放槽位
-            val cur = tasks[id]
-            if (cur == null || cur.status == "paused") {
-                releasePlatformSlot(id)
-                return@launch
+            try {
+                // 先标排队：分网盘并发闸门按网盘各自限流，拿到槽位才真正提交。
+                // 用最新记录回写，避免把排队期间刚改的 priority 一并覆盖掉
+                val fresh = tasks[id] ?: return@launch
+                tasks[id] = fresh.copy(status = "queued", error = "")
+                persistTasks()
+                if (!acquirePlatformSlot(id, fresh.platform)) return@launch
+                // 等槽位期间可能被暂停/删除：以最新状态为准，避免漏放槽位
+                val cur = tasks[id]
+                if (cur == null || cur.status == "paused") {
+                    releasePlatformSlot(id)
+                    return@launch
+                }
+                tasks[id] = cur.copy(status = "downloading", error = "")
+                val out = File(tmpDir, "task_${id}.part")
+                val headers = headersCache[id] ?: cur.headers
+                // 分网盘连接数（照搬原版）：每个网盘单独设置，默认 32，迅雷固定 8
+                val request = DownloadRequest(
+                    url = cur.url,
+                    destination = out,
+                    headers = headers,
+                    knownSize = if (cur.total > 0) cur.total else -1,
+                    connectionsOverride = connectionsFor(cur.platform).coerceIn(1, 256),
+                    stableKey = cur.resumeKey.ifBlank { "web-$id" }
+                )
+                persistTasks()
+                val turboId = client.submit(request)
+                turboIds[id] = turboId
+                turboToTask[turboId] = id
+            } finally {
+                // 提交成功后由 turboIds 守卫接棒；其余退出路径（被暂停/删除/异常）
+                // 释放占位，允许之后 resume 重新拉起
+                starting.remove(id)
             }
-            tasks[id] = cur.copy(status = "downloading", error = "")
-            val out = File(tmpDir, "task_${id}.part")
-            val headers = headersCache[id] ?: task.headers
-            // 分网盘连接数（照搬原版）：每个网盘单独设置，默认 32，迅雷固定 8
-            val request = DownloadRequest(
-                url = task.url,
-                destination = out,
-                headers = headers,
-                knownSize = if (task.total > 0) task.total else -1,
-                connectionsOverride = connectionsFor(task.platform).coerceIn(1, 256),
-                stableKey = task.resumeKey.ifBlank { "web-$id" }
-            )
-            persistTasks()
-            val turboId = client.submit(request)
-            turboIds[id] = turboId
-            turboToTask[turboId] = id
         }
     }
 
@@ -319,10 +368,25 @@ class DownloadService(dataDir: File) {
     fun resume(id: Long) {
         val t = tasks[id] ?: return
         if (t.status == "completed") return
+        // 正在下载/合并的不要重入；在排队且已有等待协程时也不要重复拉起
+        // （startInternal 的在途守卫也会挡，这里提前返回避免无谓地清零重试计数）
+        if (t.status == "downloading" || t.status == "merging") return
+        if (t.status == "queued" && starting.contains(id)) return
         cancelRetry(id)
         // 手动继续：重试计数清零，给自动重试重新留额度
         tasks[id] = t.copy(autoRetry = 0)
         startInternal(id)
+    }
+
+    /** 设置排队优先级（-1 低 / 0 普通 / 1 高）。排队中改档下一轮闸门轮询即生效；
+     *  运行中改档只影响其下次排队，不抢占。任务不存在或档位越界抛 IllegalArgumentException。 */
+    fun setPriority(id: Long, priority: Int) {
+        if (priority !in -1..1) throw IllegalArgumentException("优先级只能是 -1（低）、0（普通）或 1（高）")
+        val t = tasks[id] ?: throw IllegalArgumentException("任务不存在")
+        if (t.priority != priority) {
+            tasks[id] = t.copy(priority = priority)
+            persistTasks()
+        }
     }
 
     /** 自动重试退避：第 n 次失败后等 1/2/4/8/10…分钟再续（限流窗口通常按分钟计） */
@@ -373,7 +437,8 @@ class DownloadService(dataDir: File) {
             downloaded = t.downloaded, total = t.total,
             speed = speeds[t.id] ?: 0L, etaMillis = etas[t.id] ?: -1L,
             error = t.error, createdAt = t.createdAt,
-            batchId = t.batchId, batchName = t.batchName, relPath = t.relPath
+            batchId = t.batchId, batchName = t.batchName, relPath = t.relPath,
+            priority = t.priority
         )
     }
 
@@ -499,6 +564,13 @@ class DownloadService(dataDir: File) {
         } catch (e: Exception) {
             tasks[id]?.let { tasks[id] = it.copy(status = "failed", error = "保存失败：${e.message}") }
             persistTasks()
+        } finally {
+            // 成功路径已在 try 内清理过一遍（均为幂等操作，这里重复调用无副作用）；
+            // 失败路径必须在这里兜底释放：否则网盘名额永久泄漏堵死整条队列，
+            // 且 turboIds 残留会让该任务之后永远无法再被启动
+            turboIds.remove(id)?.let { turboToTask.remove(it) }
+            speeds.remove(id); etas.remove(id)
+            releasePlatformSlot(id)
         }
     }
 

@@ -498,6 +498,10 @@ function renderTask(t) {
   if (t.status === 'downloading' || t.status === 'queued' || t.status === 'retry_wait') actions += `<button class="ghost small" onclick="taskOp(${t.id},'pause')">暂停</button>`;
   if (t.status === 'paused' || t.status === 'failed' || t.status === 'retry_wait') actions += `<button class="ghost small" onclick="taskOp(${t.id},'resume')">继续</button>`;
   actions += `<button class="danger small" onclick="taskDel(${t.id})">删除</button>`;
+  if (t.status !== 'completed') {
+    const p = t.priority || 0;
+    actions += `<span class="prio" title="排队优先级：同网盘排队时高档先行、同档先到先行，不抢占正在下载的任务"><span class="prio-lab">优先级</span><button class="ghost small ${p === 1 ? 'on' : ''}" onclick="taskPriority(${t.id},1)">高</button><button class="ghost small ${p === 0 ? 'on' : ''}" onclick="taskPriority(${t.id},0)">普通</button><button class="ghost small ${p === -1 ? 'on' : ''}" onclick="taskPriority(${t.id},-1)">低</button></span>`;
+  }
   d.innerHTML = `
       <div class="trow">
         <input type="checkbox" class="taskCk" data-id="${t.id}" ${selectedTasks.has(t.id) ? 'checked' : ''} onchange="taskCkChanged(this)">
@@ -632,6 +636,36 @@ async function delSelected(withFile) {
   loadTasks();
 }
 async function taskOp(id, op) { await api(`/api/tasks/${id}/${op}`, 'POST'); loadTasks(); }
+async function taskPriority(id, p) {
+  const r = await api(`/api/tasks/${id}/priority`, 'POST', { priority: p });
+  if (!r.ok) { showMsg('taskMsg', r.message || '设置优先级失败', false); return; }
+  loadTasks();
+}
+// 全局暂停/全部启动、所选暂停/继续：状态口径——可暂停=下载中/排队中/等待重试/合并中，可启动=已暂停/失败
+const PAUSABLE_STATES = ['downloading', 'queued', 'retry_wait', 'merging'];
+const RESUMABLE_STATES = ['paused', 'failed'];
+async function pauseAllTasks() {
+  const ids = Object.values(taskMap).filter(t => PAUSABLE_STATES.includes(t.status)).map(t => t.id);
+  if (!ids.length) { showMsg('taskMsg', '没有可暂停的任务', false); return; }
+  const r = await api('/api/tasks/batch-pause', 'POST', { ids });
+  showMsg('taskMsg', r.ok ? `已暂停 ${ids.length} 个任务` : (r.message || '暂停失败'), r.ok);
+  loadTasks();
+}
+async function resumeAllTasks() {
+  const ids = Object.values(taskMap).filter(t => RESUMABLE_STATES.includes(t.status)).map(t => t.id);
+  if (!ids.length) { showMsg('taskMsg', '没有可启动的任务（已暂停/失败）', false); return; }
+  const r = await api('/api/tasks/batch-resume', 'POST', { ids });
+  showMsg('taskMsg', r.ok ? `已启动 ${ids.length} 个任务` : (r.message || '启动失败'), r.ok);
+  loadTasks();
+}
+async function selectedTaskOp(op) {
+  const states = op === 'pause' ? PAUSABLE_STATES : RESUMABLE_STATES;
+  const ids = [...selectedTasks].map(id => taskMap[id]).filter(t => t && states.includes(t.status)).map(t => t.id);
+  if (!ids.length) { showMsg('taskMsg', op === 'pause' ? '所选任务中没有可暂停的' : '所选任务中没有可继续的（已暂停/失败）', false); return; }
+  const r = await api(`/api/tasks/batch-${op}`, 'POST', { ids });
+  showMsg('taskMsg', r.ok ? (op === 'pause' ? `已暂停 ${ids.length} 个任务` : `已启动 ${ids.length} 个任务`) : (r.message || '操作失败'), r.ok);
+  loadTasks();
+}
 async function taskDel(id) {
   // 单个删除：仅删除任务记录（文件保留；如需连文件删除，用复选框 +「删除所选（任务+文件）」）
   await api(`/api/tasks/${id}?deleteFile=false`, 'DELETE');

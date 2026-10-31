@@ -22,6 +22,7 @@ import com.yunget.web.model.FileItem
 import com.yunget.web.model.ParseRequest
 import com.yunget.web.model.ParseResponse
 import com.yunget.web.model.PasswordLoginRequest
+import com.yunget.web.model.SetPriorityRequest
 import com.yunget.web.model.SettingsData
 import com.yunget.web.model.BilibiliLoginRequest
 import com.yunget.web.model.VideoDownloadRequest
@@ -476,6 +477,20 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
                 ?: return@post call.respond(fail("任务不存在"))
             downloads.resume(id)
             call.respond(ok(mapOf("done" to true)))
+        }
+
+        post("/tasks/{id}/priority") {
+            val id = call.parameters["id"]?.toLongOrNull()
+                ?: return@post call.respond(fail("任务不存在"))
+            try {
+                val req = call.receive<SetPriorityRequest>()
+                downloads.setPriority(id, req.priority)
+                call.respond(ok(mapOf("done" to true)))
+            } catch (e: IllegalArgumentException) {
+                call.respond(fail(e.message ?: "优先级无效"))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "设置优先级失败"))
+            }
         }
 
         delete("/tasks/{id}") {
