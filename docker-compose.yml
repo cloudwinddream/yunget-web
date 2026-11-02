@@ -1,13 +1,35 @@
+# yunget-web Docker 部署（Docker Hub pull 模式，详见 DOCKER.md）
+#
+# 部署与升级都是同一条命令：docker compose pull && docker compose up -d
+# 镜像只含 JRE + 应用本体，账号/设置/任务/工具都在 ./data 卷里，升级不丢数据。
 services:
   yunget-web:
-    build: .
-    image: yunget-web:latest
+    # 官方镜像（多架构）。若你的 Docker Hub 用户名不是 cloudwinddream，改成自己的命名空间
+    image: cloudwinddream/yunget-web:latest
     container_name: yunget-web
     ports:
+      # 左边是宿主机端口：被占用或想换端口时只改左边，如 "18080:8080"
       - "8080:8080"
+    extra_hosts:
+      # 让容器里可以用 host.docker.internal 寻址宿主机（如代理跑在宿主机上时填它）；
+      # Linux 上的 Docker 需要这行显式映射，Docker Desktop 则原生自带、写了无害
+      - "host.docker.internal:host-gateway"
     volumes:
-      - ./data:/data   # 下载文件 / 账号凭证 / 任务记录持久化
+      # 全部持久化数据：settings/accounts/tasks/history 四个 json、续传状态，
+      # 以及应用托管的工具（tools/、gopeed/）。备份只需打包这个目录
+      - ./data:/data
+      # 下载成品目录：请在应用「设置」里把下载目录填成 /downloads，
+      # 成品就会直接落到宿主机的 ./downloads 里
+      - ./downloads:/downloads
     environment:
       - YUNGET_DATA_DIR=/data
       - PORT=8080
+      - TZ=Asia/Shanghai
+      # JVM 参数（堆上限 512MB 足够；实测应用空载约 95MB）
+      - JAVA_OPTS=-Xmx512m
+      # 旁路由/代理用户注意：下载引擎（含 YouTube 媒体文件）只认 JVM 系统代理，
+      # 应用设置里的两个代理管不到它。要让引擎走旁路由，把上一行换成这行并改 IP/端口：
+      # - JAVA_OPTS=-Xmx512m -Dhttp.proxyHost=192.168.1.2 -Dhttp.proxyPort=7890 -Dhttps.proxyHost=192.168.1.2 -Dhttps.proxyPort=7890
+    # 容器内存硬上限（防意外膨胀拖垮宿主机）；不需要可整行删掉
+    mem_limit: 768m
     restart: unless-stopped
