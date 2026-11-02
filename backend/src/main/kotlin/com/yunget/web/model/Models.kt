@@ -161,6 +161,11 @@ data class SettingsData(
     // 工具安装代理：ffmpeg / yt-dlp / Gopeed 三家「一键安装」下载官方源时共用
     // （GitHub 等官方源在部分网络直连不通、TLS 握手会被掐）；支持 http:// / https:// / socks5://；留空 = 直连
     val toolProxy: String = "",
+    // 工具自动更新：启动约 1 分钟后首检、之后每 24 小时一轮，检查 yt-dlp / Deno / Gopeed
+    // 官方新版并自动换新（走 ToolAutoUpdater）。铁律：只动应用托管安装的那份
+    // （来源为手动路径 / PATH / 系统路径的副本不碰、从未安装的不自动装）。
+    // ffmpeg 不在范围内——其静态构建源没有官方版本查询口、且极少更新，保留手动一键安装。
+    val autoUpdateTools: Boolean = true,
     // 视频下载命名模板（仅作用于视频/YouTube 的标题生成型文件名，网盘保持原名）；
     // 变量：{title} 标题 {author} 作者 {id} 作品ID {platform} 平台 {quality} 清晰度 {date} 发布日期 {index} 序号（从 1 开始）
     val videoNameTemplate: String = "{title}",
@@ -444,6 +449,29 @@ data class DenoStatusResponse(
     val source: String = "",
     /** 手动路径无效原因（仅当设置了手动路径且该候选探测失败时非空）：路径不存在/目录下无可执行文件/文件无法运行/运行超时；未设置或手动路径有效时为 null */
     val manualHint: String? = null
+)
+
+/** 工具自动更新：单个工具最近一轮检查的结果（内存态，见 ToolAutoUpdater） */
+@Serializable
+data class ToolAutoUpdateResult(
+    /** 工具标识：yt-dlp | deno | gopeed */
+    val tool: String,
+    /** 本地版本（探测到的当前版本）；未安装/探测失败时为空 */
+    val localVersion: String = "",
+    /** 官方最新版（GitHub Release tag，归一化前原文）；未查到时为空 */
+    val remoteVersion: String = "",
+    /** updated（已更新）| up-to-date（已是最新）| skipped（跳过，原因见 message）| failed（失败，下轮重试） */
+    val action: String,
+    val message: String = ""
+)
+
+/** GET /api/tools/auto-update 的响应：开关现值（现读设置）+ 最近一轮结果（内存态，重启后首检前为空） */
+@Serializable
+data class ToolAutoUpdateStatus(
+    val enabled: Boolean,
+    /** 最近一轮检查的完成时间（毫秒）；尚未跑过任何一轮为 0 */
+    val lastCheckAt: Long = 0,
+    val results: List<ToolAutoUpdateResult> = emptyList()
 )
 
 @Serializable

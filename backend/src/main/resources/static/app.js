@@ -881,6 +881,7 @@ async function loadSettings() {
   document.getElementById('setDenoPath').value = s.denoPath || '';
   document.getElementById('setYtdlpProxy').value = s.ytdlpProxy || '';
   document.getElementById('setToolProxy').value = s.toolProxy || '';
+  document.getElementById('setAutoUpdateTools').checked = s.autoUpdateTools !== false;
   document.getElementById('setNameTemplate').value = s.videoNameTemplate || '{title}';
   document.getElementById('setTrackerNgosang').checked = s.trackerNgosang !== false;
   document.getElementById('setTrackerXiu2').checked = s.trackerXiu2 !== false;
@@ -893,6 +894,7 @@ async function loadSettings() {
   refreshFfmpegCard();
   refreshYtdlpCard();
   refreshDenoCard();
+  loadAutoUpdateStatus();
 }
 async function saveSettings() {
   hideMsg('setMsg');
@@ -920,6 +922,7 @@ async function saveSettings() {
     denoPath: document.getElementById('setDenoPath').value.trim(),
     ytdlpProxy: document.getElementById('setYtdlpProxy').value.trim(),
     toolProxy: document.getElementById('setToolProxy').value.trim(),
+    autoUpdateTools: document.getElementById('setAutoUpdateTools').checked,
     videoNameTemplate: document.getElementById('setNameTemplate').value.trim() || '{title}',
     trackerNgosang: document.getElementById('setTrackerNgosang').checked,
     trackerXiu2: document.getElementById('setTrackerXiu2').checked,
@@ -1790,6 +1793,26 @@ async function refreshDenoCard() {
 }
 async function denoInstall() { await denoDoInstall(false); }
 async function denoUpdate() { await denoDoInstall(true); }
+
+// ---------- 工具自动更新（状态展示；开关在设置对象 autoUpdateTools，随整表保存） ----------
+async function loadAutoUpdateStatus() {
+  const el = document.getElementById('autoUpdateStatus');
+  const box = document.getElementById('autoUpdateResults');
+  if (!el || !box) return;
+  const r = await api('/api/tools/auto-update');
+  if (!r.ok) { el.textContent = '状态获取失败'; box.textContent = ''; return; }
+  const d = r.data || {};
+  if (d.enabled === false) el.textContent = '自动更新已关闭（打开上方开关并保存后，下一轮检查起生效）';
+  else if (!d.lastCheckAt) el.textContent = '尚未检查（启动约 1 分钟后首检，之后每 24 小时一轮）';
+  else el.textContent = '上次检查：' + new Date(d.lastCheckAt).toLocaleString();
+  const names = { 'yt-dlp': 'yt-dlp', 'deno': 'Deno', 'gopeed': 'Gopeed' };
+  const acts = { 'updated': '✅ 已更新', 'up-to-date': '✔ 已是最新', 'skipped': '⏭ 已跳过', 'failed': '⚠ 失败（下轮重试）' };
+  box.textContent = (d.results || []).map(x => {
+    let ver = '';
+    if (x.localVersion) ver = `（本地 ${x.localVersion}` + (x.remoteVersion && x.remoteVersion !== x.localVersion ? `，官方 ${x.remoteVersion}` : '') + '）';
+    return `${names[x.tool] || x.tool}：${acts[x.action] || x.action}${ver}${x.message ? ' — ' + x.message : ''}`;
+  }).join('\n');
+}
 /** force=false：一键安装（已装则后端直接返回现状）；force=true：更新（强制重装到托管目录） */
 async function denoDoInstall(force) {
   const btn = document.getElementById(force ? 'denoUpdateBtn' : 'denoInstallBtn');

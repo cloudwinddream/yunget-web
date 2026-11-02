@@ -8,6 +8,7 @@ import com.yunget.web.service.DownloadService
 import com.yunget.web.service.GopeedService
 import com.yunget.web.service.HistoryStore
 import com.yunget.web.service.NetdiskService
+import com.yunget.web.service.ToolAutoUpdater
 import com.yunget.web.service.VideoService
 import com.yunget.web.service.YouTubeService
 import io.ktor.http.HttpStatusCode
@@ -57,17 +58,21 @@ fun main() {
     val gopeed = GopeedService(dataDir, downloads)
     val video = VideoService(downloads, accounts, dataDir)
     val youtube = YouTubeService(downloads, accounts, dataDir)
+    // 工具自动更新调度（后台协程：启动约 60 秒后首检、每 24 小时一轮，只动应用托管工具）
+    val toolAutoUpdater = ToolAutoUpdater(downloads, youtube, gopeed)
+    toolAutoUpdater.start()
 
     Runtime.getRuntime().addShutdownHook(Thread {
+        runCatching { toolAutoUpdater.stop() }
         runCatching { downloads.shutdown() }
     })
 
     embeddedServer(Netty, port = port, host = "0.0.0.0") {
-        module(netdisk, downloads, gopeed, video, youtube)
+        module(netdisk, downloads, gopeed, video, youtube, toolAutoUpdater)
     }.start(wait = true)
 }
 
-fun Application.module(netdisk: NetdiskService, downloads: DownloadService, gopeed: GopeedService, video: VideoService, youtube: YouTubeService) {
+fun Application.module(netdisk: NetdiskService, downloads: DownloadService, gopeed: GopeedService, video: VideoService, youtube: YouTubeService, toolAutoUpdater: ToolAutoUpdater) {
     install(ContentNegotiation) {
         json(Json { ignoreUnknownKeys = true; explicitNulls = false; encodeDefaults = true })
     }
@@ -86,6 +91,6 @@ fun Application.module(netdisk: NetdiskService, downloads: DownloadService, gope
     routing {
         // 前端静态页
         staticResources("/", "static", index = "index.html")
-        apiRoutes(netdisk, downloads, gopeed, video, youtube)
+        apiRoutes(netdisk, downloads, gopeed, video, youtube, toolAutoUpdater)
     }
 }

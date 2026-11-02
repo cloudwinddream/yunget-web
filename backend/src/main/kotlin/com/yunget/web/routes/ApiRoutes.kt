@@ -42,6 +42,7 @@ import com.yunget.web.service.VideoService
 import com.yunget.web.service.YouTubeService
 import com.yunget.web.service.Platform
 import com.yunget.web.service.QrLoginService
+import com.yunget.web.service.ToolAutoUpdater
 import io.ktor.http.ContentDisposition
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
@@ -60,7 +61,7 @@ import io.ktor.server.routing.route
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed: GopeedService, video: VideoService, youtube: YouTubeService) {
+fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed: GopeedService, video: VideoService, youtube: YouTubeService, toolAutoUpdater: ToolAutoUpdater) {
     route("/api") {
 
         // ---------- 平台与账号 ----------
@@ -872,6 +873,16 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
                 call.respond(ok(st))
             } catch (e: Exception) {
                 call.respond(fail(e.message ?: "Deno 安装失败"))
+            }
+        }
+
+        // ---------- 工具自动更新（状态只读；开关在设置 autoUpdateTools，调度在 ToolAutoUpdater） ----------
+
+        get("/tools/auto-update") {
+            try {
+                call.respond(ok(toolAutoUpdater.status()))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "获取工具自动更新状态失败"))
             }
         }
 
