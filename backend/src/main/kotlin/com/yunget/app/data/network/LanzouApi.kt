@@ -891,7 +891,10 @@ class LanzouApi(
     /** 页面是否停在"请输入提取码"的表单上。 */
     internal fun isLockedSharePage(html: String): Boolean =
         html.contains("请输入密码") || html.contains("id=\"pwbox\"") ||
-            html.contains("input_password") || html.contains("密码不正确")
+            html.contains("input_password") || html.contains("密码不正确") ||
+            // 新版模板用 `function down_p(` 标记「这个分享要提取码」，页面上不再有中文提示
+            // （上游修复 #229）；漏了它新版密码页会被误判为无密码页，needsPwd 随之错位
+            html.contains("function down_p(")
 
     /** 记录 `Set-Cookie: name=value; Path=/...` 里的 name/value。 */
     private fun captureSetCookie(host: String, header: String) {

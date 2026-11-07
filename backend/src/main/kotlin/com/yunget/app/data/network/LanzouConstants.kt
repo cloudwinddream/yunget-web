@@ -56,9 +56,14 @@ object LanzouConstants {
     const val FOLDER_PREFIX = "d:"
     const val FILE_PREFIX = "f:"
 
-    /** 域名族：lanzou*、lan[zs]o[ux]，后缀 com/net/org/cn */
+    /**
+     * 域名族：lanzou*、lan[zs]o[ux]、lanzn，后缀 com/net/org/cn。
+     * ★ lanzn 是 2026-10 起在用的新族（上游 issue #197、修复 #228），漏了它 isLanzouHost
+     *   会把 lanzn.com 的分享链接判成非蓝奏（我们 ShareLinkParser 的平台判定与 LanzouApi
+     *   的跳转校验都只走这一处正则，是唯一闸门）。
+     */
     private val HOST_REGEX =
-        Regex("""^(?:[a-z0-9-]+\.)*(?:lanzou[a-z]?|lan[zs]o[ux])\.(?:com|net|org|cn)$""", RegexOption.IGNORE_CASE)
+        Regex("""^(?:[a-z0-9-]+\.)*(?:lanzou[a-z]?|lan[zs]o[ux]|lanzn)\.(?:com|net|org|cn)$""", RegexOption.IGNORE_CASE)
 
     fun isLanzouHost(host: String): Boolean = HOST_REGEX.matches(host)
 
