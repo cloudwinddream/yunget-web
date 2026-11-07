@@ -2,6 +2,7 @@ package com.yunget.web.service
 
 import com.yunget.web.model.SettingsData
 import com.yunget.web.model.TaskInfo
+import com.yunget.web.model.TrashItemResponse
 import dev.turbodl.core.DnsMode
 import dev.turbodl.core.DownloadRequest
 import dev.turbodl.core.ProxyMode
@@ -109,6 +110,14 @@ class DownloadService(dataDir: File) {
         val queuedAtBoot = tasks.values.filter { it.status == "queued" }
         queuedAtBoot.forEach { starting.add(it.id) }
         queuedAtBoot.forEach { startInternal(it.id, alreadyRegistered = true) }
+        // 回收站到期清理：启动先清一轮，之后每 24 小时一轮（清除删除超过 7 天的条目）
+        scope.launch {
+            runCatching { purgeExpiredTrash() }
+            while (true) {
+                delay(TRASH_SWEEP_INTERVAL_MS)
+                runCatching { purgeExpiredTrash() }
+            }
+        }
     }
 
     // ---------- 配置 ----------
@@ -241,6 +250,13 @@ class DownloadService(dataDir: File) {
         const val XUNLEI_CONNECTIONS = 8
         /** 参与并发统计的网盘 id（含 "" = 普通直链下载） */
         val PLATFORM_IDS = listOf("quark", "uc", "xunlei", "baidu", "pan123", "c139", "lanzou", "ilanzou", "guangya", "pan115", "video", "github", "")
+        /** 回收站目录名（位于下载目录内） */
+        const val TRASH_DIR_NAME = ".yunget-trash"
+        /** 回收站保留天数：超期条目由到期清理自动彻底删除 */
+        const val TRASH_RETENTION_DAYS = 7
+        const val TRASH_RETENTION_MS = TRASH_RETENTION_DAYS * 86_400_000L
+        /** 到期清理轮询间隔（启动一轮＋每 24 小时一轮） */
+        const val TRASH_SWEEP_INTERVAL_MS = 24L * 3600 * 1000
     }
 
     /** 恢复默认设置：回到 SettingsData() 初始值（各网盘连接数 32、迅雷固定 8 等）；
@@ -423,12 +439,186 @@ class DownloadService(dataDir: File) {
             if (deleteFile) {
                 tasks[id]?.savePath?.takeIf { it.isNotBlank() }?.let {
                     val f = File(it)
-                    if (f.delete()) cleanupEmptyParents(f)
+                    // 不再直删：断言通过才移入回收站（7 天内可恢复），断言不过只删记录不动文件
+                    if (moveFileToTrash(id, f)) cleanupEmptyParents(f)
                 }
             }
             tasks.remove(id)
             persistTasks()
         }
+    }
+
+    // ---------- 回收站（下载目录/.yunget-trash，保留 7 天） ----------
+
+    @Serializable
+    private data class TrashEntry(
+        val id: String,
+        val trashName: String,
+        val originalPath: String,
+        val fileName: String,
+        val size: Long,
+        val deletedAt: Long
+    )
+
+    private val trashLock = Any()
+
+    private fun trashDir(): File = File(resolvedDownloadsDir(), TRASH_DIR_NAME)
+    private fun trashIndexFile(dir: File): File = File(dir, "index.json")
+
+    private fun loadTrashIndex(dir: File): MutableList<TrashEntry> {
+        val f = trashIndexFile(dir)
+        if (!f.exists()) return mutableListOf()
+        return try {
+            json.decodeFromString<List<TrashEntry>>(f.readText()).toMutableList()
+        } catch (e: Exception) {
+            System.out.println("[trash] 清单读取失败，按空处理：${e.message}")
+            mutableListOf()
+        }
+    }
+
+    private fun saveTrashIndex(dir: File, entries: List<TrashEntry>) {
+        try {
+            dir.mkdirs()
+            val tmp = File(dir, "index.json.tmp")
+            tmp.writeText(json.encodeToString(entries))
+            tmp.renameTo(trashIndexFile(dir))
+        } catch (e: Exception) { e.printStackTrace() }
+    }
+
+    /**
+     * 删文件前的断言：目标 canonical 路径必须位于当前下载目录内、且是普通文件。
+     * 任一不满足都拒绝碰文件（只删任务记录）：防 savePath 异常时误删下载目录外的内容，
+     * 也是文件夹批次整批误删的最后一道闸。
+     */
+    private fun assertFileInDownloads(f: File): Boolean = try {
+        val root = resolvedDownloadsDir().canonicalFile
+        val c = f.canonicalFile
+        c.isFile && c.path.startsWith(root.path + File.separator)
+    } catch (e: Exception) { false }
+
+    /** 断言通过 → 移入回收站并登记清单，返回 true；断言不过/移动失败 → 打日志、返回 false（调用方只删记录）。 */
+    private fun moveFileToTrash(taskId: Long, f: File): Boolean {
+        if (!assertFileInDownloads(f)) {
+            System.out.println("[trash] 拒绝处理下载目录外或非普通文件（task=$taskId）：${f.path}，仅删除任务记录")
+            return false
+        }
+        return try {
+            val dir = trashDir().apply { mkdirs() }
+            val entryId = java.util.UUID.randomUUID().toString()
+            val trashName = "${entryId}_${f.name}"
+            val dest = File(dir, trashName)
+            if (!f.renameTo(dest)) {
+                f.copyTo(dest, overwrite = true)
+                f.delete()
+            }
+            val entry = TrashEntry(
+                id = entryId, trashName = trashName,
+                originalPath = f.canonicalPath, fileName = f.name,
+                size = dest.length(), deletedAt = System.currentTimeMillis()
+            )
+            synchronized(trashLock) {
+                val entries = loadTrashIndex(dir)
+                entries.add(entry)
+                saveTrashIndex(dir, entries)
+            }
+            true
+        } catch (e: Exception) {
+            System.out.println("[trash] 移入回收站失败（task=$taskId）：${f.path}：${e.message}，仅删除任务记录")
+            false
+        }
+    }
+
+    /** 回收站条目列表（按删除时间倒序，含剩余天数） */
+    fun listTrash(): List<TrashItemResponse> {
+        val dir = trashDir()
+        val now = System.currentTimeMillis()
+        val entries = synchronized(trashLock) { loadTrashIndex(dir) }
+        return entries.sortedByDescending { it.deletedAt }.map { e ->
+            TrashItemResponse(
+                id = e.id, fileName = e.fileName, originalPath = e.originalPath,
+                size = e.size, deletedAt = e.deletedAt,
+                remainingDays = (TRASH_RETENTION_DAYS - ((now - e.deletedAt) / 86_400_000L).toInt()).coerceAtLeast(0)
+            )
+        }
+    }
+
+    /** 恢复：移回原路径；原路径已被占用时按 uniqueFile 规则改名。返回最终落点绝对路径。 */
+    fun restoreTrash(entryId: String): String {
+        val dir = trashDir()
+        val entry = synchronized(trashLock) { loadTrashIndex(dir).firstOrNull { it.id == entryId } }
+            ?: throw IllegalArgumentException("回收站条目不存在")
+        val src = File(dir, entry.trashName)
+        if (!src.exists()) {
+            synchronized(trashLock) {
+                val entries = loadTrashIndex(dir)
+                entries.removeAll { it.id == entryId }
+                saveTrashIndex(dir, entries)
+            }
+            throw IllegalArgumentException("回收站中的文件已不存在，已移除该条目")
+        }
+        var dest = File(entry.originalPath)
+        dest.parentFile?.mkdirs()
+        if (dest.exists()) dest = uniqueFile(dest.parentFile ?: resolvedDownloadsDir(), dest.name)
+        if (!src.renameTo(dest)) {
+            src.copyTo(dest, overwrite = true)
+            src.delete()
+        }
+        synchronized(trashLock) {
+            val entries = loadTrashIndex(dir)
+            entries.removeAll { it.id == entryId }
+            saveTrashIndex(dir, entries)
+        }
+        return dest.absolutePath
+    }
+
+    /** 彻底删除单个条目（文件＋清单记录） */
+    fun purgeTrashItem(entryId: String): Boolean {
+        val dir = trashDir()
+        var removed = false
+        synchronized(trashLock) {
+            val entries = loadTrashIndex(dir)
+            val e = entries.firstOrNull { it.id == entryId }
+            if (e != null) {
+                File(dir, e.trashName).delete()
+                entries.removeAll { it.id == entryId }
+                saveTrashIndex(dir, entries)
+                removed = true
+            }
+        }
+        return removed
+    }
+
+    /** 清空回收站，返回清掉的条目数 */
+    fun clearTrash(): Int {
+        val dir = trashDir()
+        var n = 0
+        synchronized(trashLock) {
+            val entries = loadTrashIndex(dir)
+            entries.forEach { File(dir, it.trashName).delete(); n++ }
+            if (entries.isNotEmpty()) saveTrashIndex(dir, emptyList())
+        }
+        return n
+    }
+
+    /** 到期清理：deletedAt 超过 7 天的条目连文件带清单一并清掉，顺手清回收站内的空子目录。返回清掉的条目数 */
+    fun purgeExpiredTrash(): Int {
+        val dir = trashDir()
+        if (!dir.exists()) return 0
+        val now = System.currentTimeMillis()
+        var n = 0
+        synchronized(trashLock) {
+            val entries = loadTrashIndex(dir)
+            val expired = entries.filter { now - it.deletedAt > TRASH_RETENTION_MS }
+            if (expired.isNotEmpty()) {
+                expired.forEach { File(dir, it.trashName).delete(); n++ }
+                saveTrashIndex(dir, entries - expired.toSet())
+            }
+        }
+        dir.listFiles()?.filter { it.isDirectory }?.forEach { sub ->
+            if (sub.listFiles().isNullOrEmpty()) sub.delete()
+        }
+        if (n > 0) System.out.println("[trash] 到期清理：清除 $n 个超过 7 天的条目")
+        return n
     }
 
     fun list(): List<TaskInfo> = tasks.values.sortedByDescending { it.id }.map { t ->

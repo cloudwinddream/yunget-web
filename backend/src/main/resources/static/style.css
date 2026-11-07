@@ -21,6 +21,7 @@ button.btn:hover { background: #1565c0; }
 button.btn:disabled { background: #a9c3e8; cursor: not-allowed; }
 button.ghost { background: #fff; color: #1a73e8; border: 1px solid #1a73e8; border-radius: 6px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
 button.danger { background: #fff; color: #d32f2f; border: 1px solid #d32f2f; border-radius: 6px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
+button.danger:disabled { opacity: .45; cursor: not-allowed; }
 button.small { padding: 5px 10px; font-size: 12px; }
 .hint { font-size: 12.5px; color: #888; line-height: 1.7; }
 .hint code { background: #f0f2f5; padding: 1px 6px; border-radius: 4px; font-size: 12px; }

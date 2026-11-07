@@ -504,11 +504,47 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
 
         post("/tasks/batch-delete") {
             val req = call.receive<BatchDeleteRequest>()
+            // 后端闸门：大批量连文件删必须带 confirmAll（前端走完整批强确认才置位），
+            // 不许任何调用方绕过界面确认一把梭（文件夹批次误删事故的后端防线）
+            if (req.deleteFile && req.ids.size > 10 && !req.confirmAll) {
+                return@post call.respond(
+                    fail("将删除 ${req.ids.size} 个任务并同时删除文件，数量较多：请在界面上通过整批强确认后再执行，或减少单次删除数量")
+                )
+            }
             var n = 0
             req.ids.forEach { id ->
                 runCatching { downloads.delete(id, req.deleteFile); n++ }
             }
             call.respond(ok(mapOf("deleted" to n)))
+        }
+
+        // ---------- 回收站（删任务文件先进这里，保留 7 天可恢复） ----------
+        get("/trash") {
+            call.respond(ok(downloads.listTrash()))
+        }
+
+        post("/trash/{id}/restore") {
+            val id = call.parameters["id"] ?: return@post call.respond(fail("缺少条目 id"))
+            try {
+                val path = downloads.restoreTrash(id)
+                call.respond(ok(mapOf("path" to path)))
+            } catch (e: IllegalArgumentException) {
+                call.respond(fail(e.message ?: "恢复失败"))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "恢复失败"))
+            }
+        }
+
+        delete("/trash/{id}") {
+            val id = call.parameters["id"] ?: return@delete call.respond(fail("缺少条目 id"))
+            val removed = downloads.purgeTrashItem(id)
+            if (removed) call.respond(ok(mapOf("done" to true)))
+            else call.respond(fail("回收站条目不存在"))
+        }
+
+        post("/trash/clear") {
+            val n = downloads.clearTrash()
+            call.respond(ok(mapOf("cleared" to n)))
         }
 
         post("/tasks/batch-pause") {

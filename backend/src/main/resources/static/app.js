@@ -498,6 +498,7 @@ function renderTask(t) {
   if (t.status === 'downloading' || t.status === 'queued' || t.status === 'retry_wait') actions += `<button class="ghost small" onclick="taskOp(${t.id},'pause')">暂停</button>`;
   if (t.status === 'paused' || t.status === 'failed' || t.status === 'retry_wait') actions += `<button class="ghost small" onclick="taskOp(${t.id},'resume')">继续</button>`;
   actions += `<button class="danger small" onclick="taskDel(${t.id})">删除</button>`;
+  if (t.status === 'completed') actions += `<button class="danger small" onclick="taskDelFile(${t.id})">删除任务＋文件</button>`;
   if (t.status !== 'completed') {
     const p = t.priority || 0;
     actions += `<span class="prio" title="排队优先级：同网盘排队时高档先行、同档先到先行，不抢占正在下载的任务"><span class="prio-lab">优先级</span><button class="ghost small ${p === 1 ? 'on' : ''}" onclick="taskPriority(${t.id},1)">高</button><button class="ghost small ${p === 0 ? 'on' : ''}" onclick="taskPriority(${t.id},0)">普通</button><button class="ghost small ${p === -1 ? 'on' : ''}" onclick="taskPriority(${t.id},-1)">低</button></span>`;
@@ -568,14 +569,51 @@ async function batchOp(batchId, op) {
   if (ids.length) await api(`/api/tasks/batch-${op}`, 'POST', { ids });
   loadTasks();
 }
+// ---------- 整批删文件强确认弹窗 ----------
+// 弃原生 confirm：必须勾选「我知道会删除整批文件」后执行按钮才可用，防手滑一把梭删掉整批文件
+let strongDelResolve = null;
+function strongConfirmDelete(taskCount, fileCount, totalSize) {
+  return new Promise(res => {
+    strongDelResolve = res;
+    document.getElementById('strongDelText').innerHTML =
+      `将删除 <b>${fileCount}</b> 个已下载文件（共 <b>${fmtSize(totalSize)}</b>），连同 <b>${taskCount}</b> 个任务记录一并删除。<br>` +
+      `文件会先移入回收站，7 天内可在「设置 → 回收站」恢复；超过 7 天自动彻底清除。`;
+    const ck = document.getElementById('strongDelCk');
+    ck.checked = false;
+    document.getElementById('strongDelBtn').disabled = true;
+    document.getElementById('strongDelModal').style.display = 'flex';
+  });
+}
+function strongDelCkChanged() {
+  document.getElementById('strongDelBtn').disabled = !document.getElementById('strongDelCk').checked;
+}
+function strongDelOk() {
+  document.getElementById('strongDelModal').style.display = 'none';
+  if (strongDelResolve) { strongDelResolve(true); strongDelResolve = null; }
+}
+function strongDelCancel() {
+  document.getElementById('strongDelModal').style.display = 'none';
+  if (strongDelResolve) { strongDelResolve(false); strongDelResolve = null; }
+}
+/** 已完成（=有文件）任务的文件数与总大小，从 taskMap 的 TaskInfo 聚合 */
+function completedFileStats(tasks) {
+  const done = tasks.filter(t => t.status === 'completed');
+  return { count: done.length, size: done.reduce((a, t) => a + (t.total || 0), 0) };
+}
 async function batchDelete(batchId, withFile, btn) {
   const kids = Object.values(taskMap).filter(t => t.batchId === batchId);
   const ids = kids.map(t => t.id);
   if (!ids.length) return;
   const name = (kids[0] && kids[0].batchName) || '该批次';
-  if (withFile && !confirm(`删除「${name}」的 ${ids.length} 个任务记录，并同时删除已下载的文件？`)) return;
-  if (!withFile && !confirm(`仅删除「${name}」的 ${ids.length} 个任务记录（文件保留）？`)) return;
-  await api('/api/tasks/batch-delete', 'POST', { ids, deleteFile: !!withFile });
+  if (withFile) {
+    const st = completedFileStats(kids);
+    if (!await strongConfirmDelete(ids.length, st.count, st.size)) return;
+    const r = await api('/api/tasks/batch-delete', 'POST', { ids, deleteFile: true, confirmAll: true });
+    if (!r.ok) { showMsg('taskMsg', r.message || '删除失败', false); return; }
+  } else {
+    if (!confirm(`仅删除「${name}」的 ${ids.length} 个任务记录（文件保留）？`)) return;
+    await api('/api/tasks/batch-delete', 'POST', { ids, deleteFile: false });
+  }
   expandedBatches.delete(batchId);
   loadTasks();
 }
@@ -630,8 +668,21 @@ function updateSelCount() {
 async function delSelected(withFile) {
   if (!selectedTasks.size) return;
   const ids = [...selectedTasks];
-  if (withFile && !confirm(`删除所选 ${ids.length} 个任务记录，并同时删除服务器上的文件？`)) return;
-  await api('/api/tasks/batch-delete', 'POST', { ids, deleteFile: !!withFile });
+  if (withFile) {
+    // 与后端闸门配套：>10 个走强确认弹窗并带 confirmAll；≤10 个普通确认即可
+    if (ids.length > 10) {
+      const st = completedFileStats(ids.map(id => taskMap[id]).filter(Boolean));
+      if (!await strongConfirmDelete(ids.length, st.count, st.size)) return;
+      const r = await api('/api/tasks/batch-delete', 'POST', { ids, deleteFile: true, confirmAll: true });
+      if (!r.ok) { showMsg('taskMsg', r.message || '删除失败', false); return; }
+    } else {
+      if (!confirm(`删除所选 ${ids.length} 个任务记录，并同时删除服务器上的文件？\n文件会移入回收站，7 天内可在「设置 → 回收站」恢复。`)) return;
+      await api('/api/tasks/batch-delete', 'POST', { ids, deleteFile: true });
+    }
+  } else {
+    if (!confirm(`仅删除所选 ${ids.length} 个任务记录（文件保留）？`)) return;
+    await api('/api/tasks/batch-delete', 'POST', { ids, deleteFile: false });
+  }
   selectedTasks.clear();
   loadTasks();
 }
@@ -667,9 +718,58 @@ async function selectedTaskOp(op) {
   loadTasks();
 }
 async function taskDel(id) {
-  // 单个删除：仅删除任务记录（文件保留；如需连文件删除，用复选框 +「删除所选（任务+文件）」）
+  // 单个删除：仅删除任务记录（文件保留；连文件删可用行内「删除任务＋文件」或复选框批量）
   await api(`/api/tasks/${id}?deleteFile=false`, 'DELETE');
   loadTasks();
+}
+async function taskDelFile(id) {
+  // 已完成任务行内直达：删任务记录＋文件（文件进回收站，7 天内可恢复）
+  const t = taskMap[id];
+  const name = t ? t.fileName : '该任务的文件';
+  if (!confirm(`删除任务记录，并同时删除文件「${name}」？\n文件会移入回收站，7 天内可在「设置 → 回收站」恢复。`)) return;
+  const r = await api(`/api/tasks/${id}?deleteFile=true`, 'DELETE');
+  if (!r.ok) showMsg('taskMsg', r.message || '删除失败', false);
+  loadTasks();
+}
+
+// ---------- 回收站（设置页） ----------
+async function loadTrash() {
+  const box = document.getElementById('trashList');
+  if (!box) return;
+  const r = await api('/api/trash');
+  if (!r.ok) { box.innerHTML = '<div class="empty">回收站加载失败</div>'; return; }
+  const list = r.data || [];
+  if (!list.length) { box.innerHTML = '<div class="empty">回收站是空的</div>'; return; }
+  box.innerHTML = '';
+  list.forEach(e => {
+    const d = document.createElement('div');
+    d.className = 'task';
+    d.innerHTML = `
+      <div class="trow"><div class="tbody">
+        <div class="name">${escapeHtml(e.fileName)}</div>
+        <div class="meta"><span>${fmtSize(e.size)}</span><span>删除于 ${new Date(e.deletedAt).toLocaleString()}</span><span>剩余 ${e.remainingDays} 天</span></div>
+        <div class="meta" style="color:#999">${escapeHtml(e.originalPath)}</div>
+        <div class="actions"><button class="ghost small" onclick="trashRestore('${e.id}')">恢复</button><button class="danger small" onclick="trashPurge('${e.id}')">彻底删除</button></div>
+      </div></div>`;
+    box.appendChild(d);
+  });
+}
+async function trashRestore(id) {
+  const r = await api(`/api/trash/${encodeURIComponent(id)}/restore`, 'POST');
+  showMsg('trashMsg', r.ok ? `已恢复到：${r.data.path}` : (r.message || '恢复失败'), r.ok);
+  loadTrash();
+}
+async function trashPurge(id) {
+  if (!confirm('彻底删除该文件？此操作立即生效、不可恢复。')) return;
+  const r = await api(`/api/trash/${encodeURIComponent(id)}`, 'DELETE');
+  showMsg('trashMsg', r.ok ? '已彻底删除' : (r.message || '删除失败'), r.ok);
+  loadTrash();
+}
+async function trashClear() {
+  if (!confirm('清空回收站？里面的文件将被全部彻底删除，不可恢复。')) return;
+  const r = await api('/api/trash/clear', 'POST', {});
+  showMsg('trashMsg', r.ok ? `已清空回收站（${r.data.cleared} 个文件）` : (r.message || '清空失败'), r.ok);
+  loadTrash();
 }
 
 // ---------- Gopeed 磁力任务 ----------
@@ -895,6 +995,7 @@ async function loadSettings() {
   refreshYtdlpCard();
   refreshDenoCard();
   loadAutoUpdateStatus();
+  loadTrash();
 }
 async function saveSettings() {
   hideMsg('setMsg');

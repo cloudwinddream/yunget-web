@@ -220,7 +220,23 @@ data class CookieLoginRequest(val cookie: String)
 data class QrStatusResponse(val status: String, val nickname: String? = null, val message: String? = null)
 
 @Serializable
-data class BatchDeleteRequest(val ids: List<Long>, val deleteFile: Boolean = false)
+data class BatchDeleteRequest(
+    val ids: List<Long>,
+    val deleteFile: Boolean = false,
+    // 大批量（>10）连文件删时必须为 true：前端走过整批强确认弹窗后才置位，后端据此放行
+    val confirmAll: Boolean = false
+)
+
+/** 回收站条目（下载目录/.yunget-trash，保留 7 天） */
+@Serializable
+data class TrashItemResponse(
+    val id: String,
+    val fileName: String,
+    val originalPath: String,
+    val size: Long,
+    val deletedAt: Long,
+    val remainingDays: Int
+)
 
 @Serializable
 data class PasswordLoginRequest(val username: String, val password: String)
