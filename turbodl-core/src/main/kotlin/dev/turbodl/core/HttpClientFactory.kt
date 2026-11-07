@@ -28,7 +28,6 @@ import javax.net.ssl.X509TrustManager
  *  - TLS：可选忽略证书校验（抓包调试）。
  */
 internal object HttpClientFactory {
-
     /** 协议偏好：分片并发用 H1_ONLY；探测/单流回退可用 ALLOW_H2。 */
     enum class ProtocolPreference { H1_ONLY, ALLOW_H2 }
 
@@ -104,10 +103,33 @@ internal object HttpClientFactory {
             // 默认 UA 拦截器：若请求未显式携带 User-Agent，注入配置的通用浏览器 UA（避免部分 CDN 拦截）。
             .addInterceptor { chain ->
                 val req = chain.request()
-                val out = if (req.header("User-Agent").isNullOrBlank())
-                    req.newBuilder().header("User-Agent", config.userAgent).build()
-                else req
+                val out = req.newBuilder()
+                    .apply {
+                        if (req.header("User-Agent").isNullOrBlank()) {
+                            header("User-Agent", config.userAgent)
+                        }
+                        if (req.tag(RequestOrigin::class.java) == null) {
+                            tag(RequestOrigin::class.java, RequestOrigin(req.url.toString()))
+                        }
+                    }
+                    .build()
                 chain.proceed(out)
+            }
+            // OkHttp preserves most request headers across redirects. Origin
+            // credentials must not follow a redirect to a different scheme,
+            // host, or port; proxy credentials are handled separately.
+            .addNetworkInterceptor { chain ->
+                val current = chain.request()
+                val original = current.tag(RequestOrigin::class.java)?.url
+                    ?: chain.call().request().url.toString()
+                if (!MirrorHeaderPolicy.sameOrigin(original, current.url.toString())) {
+                    val cleaned = current.newBuilder()
+                        .headers(MirrorHeaderPolicy.stripOriginCredentials(current.headers))
+                        .build()
+                    chain.proceed(cleaned)
+                } else {
+                    chain.proceed(current)
+                }
             }
             .connectionPool(
                 ConnectionPool(
@@ -183,10 +205,43 @@ internal object HttpClientFactory {
             // （默认 15s）才轮到下一个。若解析同时给出 AAAA/A 而设备 IPv6 路由不通
             // （手机蜂窝网常见），首连接 = AAAA 超时 15s + A 成功 ≈ 15~30s，表现恰好是
             // “任何链接解析都要卡半分钟”。v4 优先让第一个地址就是可用地址；仅调序，不丢地址。
-            is DnsMode.System -> builder.dns(CachingDns(FamilyOrderedDns(Dns.SYSTEM)))
-            is DnsMode.StaticHosts -> builder.dns(CachingDns(StaticHostsDns(mode.hosts)))
-            is DnsMode.DoH -> builder.dns(CachingDns(FamilyOrderedDns(DohDns(mode.dohUrl))))
-            is DnsMode.Auto -> builder.dns(CachingDns(FamilyOrderedDns(DohDns(mode.endpoints))))
+            is DnsMode.System -> builder.dns(TimeoutDns(CachingDns(FamilyOrderedDns(Dns.SYSTEM))))
+            is DnsMode.StaticHosts -> builder.dns(TimeoutDns(CachingDns(StaticHostsDns(mode.hosts))))
+            is DnsMode.DoH -> builder.dns(TimeoutDns(CachingDns(FamilyOrderedDns(DohDns(mode.dohUrl)))))
+            is DnsMode.Auto -> builder.dns(TimeoutDns(CachingDns(FamilyOrderedDns(DohDns(mode.endpoints)))))
+        }
+    }
+
+    /**
+     * 给 DNS 解析加硬超时。
+     *
+     * 【为什么必须有】OkHttp 的 `connectTimeout` 只覆盖 TCP 建连，`readTimeout` 只覆盖
+     * 已建连后的读 —— **两者都不覆盖 DNS 解析**。系统解析器在弱网 / 换网 / 运营商
+     * 劫持时可能阻塞几十秒甚至更久，而分段调度的 watchdog 只在"本次尝试已经收到过
+     * 数据"之后才生效，于是整条连接可以在"还没解析完"的状态下无限挂着，用户看到
+     * 的就是"卡在 0% 不动、线程数也上不去"。
+     *
+     * 这里用一次性线程池把 `lookup` 包成有界等待，超时抛 [UnknownHostException]
+     * （IOException 子类），走正常的重试 / 换地址 / 换镜像路径。
+     */
+    private class TimeoutDns(
+        private val delegate: Dns,
+        private val timeoutMs: Long = 10_000L,
+    ) : Dns {
+        private val executor = java.util.concurrent.Executors.newCachedThreadPool { r ->
+            Thread(r, "turbodl-dns").apply { isDaemon = true }
+        }
+
+        override fun lookup(hostname: String): List<java.net.InetAddress> {
+            val future = executor.submit<List<java.net.InetAddress>> { delegate.lookup(hostname) }
+            return try {
+                future.get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            } catch (e: java.util.concurrent.TimeoutException) {
+                future.cancel(true)
+                throw java.net.UnknownHostException("DNS 解析超时（${timeoutMs}ms）：$hostname")
+            } catch (e: java.util.concurrent.ExecutionException) {
+                throw (e.cause as? java.io.IOException) ?: java.io.IOException(e.cause)
+            }
         }
     }
 

@@ -1,6 +1,7 @@
 package dev.turbodl.core
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -9,6 +10,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
@@ -32,6 +34,9 @@ internal enum class SegmentResult {
 
     /** 遇到 429 / 503：服务器过载信号 → 上层可下调并发。 */
     THROTTLED,
+
+    /** 来源声明的总大小与任务总大小不一致：这是另一个文件，不能继续使用该来源。 */
+    SOURCE_MISMATCH,
 
     /**
      * 授权/时效类失败（401 / 403 / 410）：**不是**"你太快了"的信号。
@@ -90,7 +95,22 @@ internal class SegmentDownloader(
      * 【自愈】失败时立即遗忘（见 [forgetResolvedUrl]）：若记住的是带签名、有时效的
      * CDN 直链且已过期，下一次尝试会自动回到原始 URL 重新解析，而不是抱着失效地址反复撞。
      */
-    private val resolvedUrlByTask = ConcurrentHashMap<Long, String>()
+    private val resolvedUrlByTask = ConcurrentHashMap<Long, ConcurrentHashMap<String, String>>()
+
+    /**
+     * 首请求单飞门。
+     *
+     * 跳过探测时，32/64 个 worker 会同时请求原始 URL，于是同一份 302
+     * 会被跟随几十次，既增加前端连接数也增加签名/限流风险。第一个 worker
+     * 负责拿到重定向终址，其余 worker 最多等一个小 RTT；之后直接复用终址。
+     * 门只按 task + 原始 URL 保存，任务释放时清除，不随分片数增长。
+     */
+    private val firstRequestGates =
+        ConcurrentHashMap<Pair<Long, String>, CompletableDeferred<Unit>>()
+    private val firstRequestOwners =
+        ConcurrentHashMap<Pair<Long, String>, Boolean>()
+    /** Tasks whose already-started segment phase has been terminated. */
+    private val cancelledSegmentTasks = ConcurrentHashMap.newKeySet<Long>()
 
     /**
      * 最近一次整文件下载失败的具体原因（按 taskId）。
@@ -138,15 +158,36 @@ internal class SegmentDownloader(
 
     /** 取本次分片实际应请求的地址：优先用已学习到的终址，否则回落到原始 URL。 */
     private fun urlFor(taskId: Long, original: String): String =
-        resolvedUrlByTask[taskId] ?: original
+        resolvedUrlByTask[taskId]?.get(original) ?: original
 
     /** 失败时遗忘已学习的终址，让下次尝试重新走原始 URL 解析（应对签名过期）。 */
-    private fun forgetResolvedUrl(taskId: Long) {
-        resolvedUrlByTask.remove(taskId)
+    private fun learnResolvedUrl(taskId: Long, original: String, finalUrl: String) {
+        if (finalUrl == original) return
+        resolvedUrlByTask.computeIfAbsent(taskId) { ConcurrentHashMap() }[original] = finalUrl
+    }
+
+    /**
+     * Forget one source's learned redirect. A task can have several mirror
+     * sources; forgetting the whole task made a refreshed primary redirect
+     * accidentally discard still-valid mirror entries.
+     */
+    private fun forgetResolvedUrl(taskId: Long, original: String? = null) {
+        if (original == null) {
+            resolvedUrlByTask.remove(taskId)
+            return
+        }
+        val entries = resolvedUrlByTask[taskId] ?: return
+        entries.remove(original)
+        if (entries.isEmpty()) resolvedUrlByTask.remove(taskId, entries)
     }
 
     fun cancelCalls(taskId: Long) {
+        cancelledSegmentTasks.add(taskId)
         resolvedUrlByTask.remove(taskId)
+        firstRequestGates.keys.filter { it.first == taskId }.forEach { key ->
+            firstRequestGates.remove(key)?.complete(Unit)
+            firstRequestOwners.remove(key)
+        }
         activeCalls.remove(taskId)?.forEach { runCatching { it.cancel() } }
     }
 
@@ -162,7 +203,12 @@ internal class SegmentDownloader(
      * 残留的请求也已随协程作用域一同取消。
      */
     fun releaseTask(taskId: Long) {
+        cancelledSegmentTasks.remove(taskId)
         resolvedUrlByTask.remove(taskId)
+        firstRequestGates.keys.filter { it.first == taskId }.forEach { key ->
+            firstRequestGates.remove(key)?.complete(Unit)
+            firstRequestOwners.remove(key)
+        }
         activeCalls.remove(taskId)
     }
 
@@ -218,28 +264,43 @@ internal class SegmentDownloader(
                 runCatching {
                     val req = Request.Builder()
                         .url(target)
+                        .tag(RequestOrigin::class.java, RequestOrigin(url))
                         .header("Range", "bytes=0-0")
                         .apply { headers.forEach { (k, v) -> header(k, v) } }
                         .header("Accept-Encoding", "identity")
                         .get().build()
                     val call = warmClient.newCall(req)
-                    // 读取并丢弃响应体，使连接完成并回到连接池复用（而非被弃置）。
-                    try {
-                        call.execute().use { resp ->
-                            // 顺便学习重定向终址，供后续预热请求与所有分片复用。
-                            if (taskId != null && (resp.isSuccessful || resp.code == 416)) {
-                                val finalUrl = resp.request.url.toString()
-                                if (finalUrl != target) resolvedUrlByTask[taskId] = finalUrl
-                            }
-                            resp.body?.byteStream()?.use { it.readBytes() }
+                    call.execute().use { resp ->
+                        // 顺便学习重定向终址，供后续预热请求与所有分片复用。
+                        if (taskId != null && (resp.isSuccessful || resp.code == 416)) {
+                            val finalUrl = resp.request.url.toString()
+                            learnResolvedUrl(taskId, url, finalUrl)
                         }
-                    } finally {
-                        if (!call.isCanceled()) runCatching { call.cancel() }
+                        val body = resp.body
+                        if (body == null) return@use
+                        // `bytes=0-0` 正常只返回 1 字节。若服务器忽略 Range
+                        // 返回 200，则**不能**把整文件读进内存：预热只是优化，
+                        // 更不能为了预热额外消耗一份完整流量。
+                        if (resp.code == 206) {
+                            body.byteStream().use { stream ->
+                                val sink = ByteArray(8 * 1024)
+                                var remaining = 8 * 1024
+                                while (remaining > 0) {
+                                    val n = stream.read(sink, 0, remaining)
+                                    if (n <= 0) break
+                                    remaining -= n
+                                }
+                            }
+                        } else {
+                            // 关闭而不是读取：该连接无法安全复用，但避免了
+                            // 服务器忽略 Range 时预热把整个文件下载一遍。
+                            body.close()
+                        }
                     }
                 }
             }
             warmOnce(url)
-            val learned = taskId?.let { resolvedUrlByTask[it] } ?: url
+            val learned = taskId?.let { urlFor(it, url) } ?: url
             val jobs = (1 until n).map {
                 async(Dispatchers.IO) { warmOnce(learned) }
             }
@@ -316,7 +377,16 @@ internal class SegmentDownloader(
          * 因此弱校验器**不足以支撑安全续传**：上层应据此丢弃旧分片（或做内容指纹校验）。
          */
         val isWeak: Boolean
-            get() = etag.isNullOrBlank() && lastModified.isNullOrBlank()
+            get() {
+                val hasStrongEtag =
+                    !etag.isNullOrBlank() &&
+                        !etag.startsWith("W/", ignoreCase = true)
+                // Last-Modified may accompany a weak ETag, but it is only a
+                // one-second timestamp and cannot prove byte identity. Content
+                // verification is still required whenever no strong ETag is
+                // available.
+                return !hasStrongEtag
+            }
     }
 
     /**
@@ -366,10 +436,13 @@ internal class SegmentDownloader(
         rangeSpec: String = RANGE_MIN,
         /** 覆盖 UA（UA 协商用）；null 表示沿用 [headers] 或配置里的默认值。 */
         userAgentOverride: String? = null,
+        /** Use the segment client so its pool can reuse the probe connection. */
+        useSegmentClient: Boolean = false,
     ): ProbeResult =
         withContext(Dispatchers.IO) {
             val req = Request.Builder()
                 .url(url)
+                .tag(RequestOrigin::class.java, RequestOrigin(url))
                 .header("Range", rangeSpec)
                 .apply { headers.forEach { (k, v) -> header(k, v) } }
                 // 协商用的 UA 要在 headers **之后**设置：headers 里带的那份不生效时，
@@ -382,13 +455,15 @@ internal class SegmentDownloader(
             // 关键：用 OkHttp 自己的 callTimeout 做**硬止时**。
             // 协程的 withTimeout 无法中断阻塞中的 call.execute()（服务器接受连接但不响应时，
             // connect+read 可叠加到近分钟），callTimeout 覆盖整个请求生命周期，能真正卡住。
+            val baseClient = if (useSegmentClient) client else streamClient
             val effClient = if (timeoutMs > 0)
-                client.newBuilder().callTimeout(timeoutMs, TimeUnit.MILLISECONDS).build()
-            else client
+                baseClient.newBuilder().callTimeout(timeoutMs, TimeUnit.MILLISECONDS).build()
+            else baseClient
             val call = effClient.newCall(req)
             val handle = coroutineContext[Job]?.invokeOnCompletion { call.cancel() }
+            var callCompleted = false
             try {
-                call.execute().use { resp ->
+                val result = call.execute().use { resp ->
                     // resp.request.url 是跟随所有 3xx 之后的最终地址（原始链接 302→CDN 临时直链）。
                     val finalUrl = resp.request.url.toString()
                     // 元数据均为“尽力而为”：拿不到不影响下载，仅用于续传校验与命名。
@@ -408,6 +483,12 @@ internal class SegmentDownloader(
                         206 -> {
                             val total = resp.header("Content-Range")
                                 ?.substringAfter('/')?.toLongOrNull()
+                            // bytes=0-0 is a one-byte response. Consume it so
+                            // closing the response does not force OkHttp to
+                            // discard a reusable HTTP/1.1 connection.
+                            if (rangeSpec == RANGE_MIN) {
+                                runCatching { resp.body?.byteStream()?.read() }
+                            }
                             ProbeResult(total, true, finalUrl, etag, lastMod, suggested, ctype,
                                 statusCode = resp.code)
                         }
@@ -425,12 +506,17 @@ internal class SegmentDownloader(
                             statusCode = resp.code)
                     }
                 }
+                callCompleted = true
+                // A successful probe must not cancel its Call. Cancel after a
+                // response caused OkHttp to close the socket and made the
+                // following segment pay for another DNS/TLS connection.
+                result
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 ProbeResult(null, false, url)
             } finally {
-                runCatching { if (!call.isCanceled()) call.cancel() }
+                if (!callCompleted) runCatching { call.cancel() }
                 handle?.dispose()
             }
         }
@@ -489,6 +575,7 @@ internal class SegmentDownloader(
         headers: Map<String, String>,
         timeoutMs: Long,
         initial: ProbeResult,
+        useSegmentClient: Boolean,
     ): ProbeResult {
         val explicit = headers.keys.any { it.equals("User-Agent", ignoreCase = true) }
         if (explicit) return initial
@@ -497,7 +584,14 @@ internal class SegmentDownloader(
             initial.statusCode == 401 || initial.statusCode == 403
         if (!blocked) return initial
         for (ua in uaFallbacks) {
-            val r = probe(url, headers, timeoutMs = timeoutMs, rangeSpec = RANGE_MIN, userAgentOverride = ua)
+            val r = probe(
+                url,
+                headers,
+                timeoutMs = timeoutMs,
+                rangeSpec = RANGE_MIN,
+                userAgentOverride = ua,
+                useSegmentClient = useSegmentClient,
+            )
             // 换到 UA 之后必须**真的能下**才算数：拿到 Range 支持，或至少不再是 HTML/401/403。
             val stillBlocked = r.contentType.orEmpty().contains("text/html", ignoreCase = true) ||
                 r.statusCode == 401 || r.statusCode == 403
@@ -526,6 +620,7 @@ internal class SegmentDownloader(
         val end = start + len - 1
         val req = Request.Builder()
             .url(url)
+            .tag(RequestOrigin::class.java, RequestOrigin(url))
             .header("Range", "bytes=$start-$end")
             .apply { headers.forEach { (k, v) -> header(k, v) } }
             // 与分片请求一致：禁止透明解压，否则比对的是压缩后的字节。
@@ -538,6 +633,13 @@ internal class SegmentDownloader(
             call.execute().use { resp ->
                 // 只认 206（精确区间）；start==0 时允许 200（部分服务器对 bytes=0- 回整文件）。
                 if (resp.code != 206 && !(resp.code == 200 && start == 0L)) return@use null
+                if (resp.code == 206) {
+                    val range = resp.header("Content-Range")?.let {
+                        Regex("""^bytes\s+(\d+)-(\d+)/(?:\d+|\*)$""", RegexOption.IGNORE_CASE).matchEntire(it.trim())
+                    } ?: return@use null
+                    if (range.groupValues[1].toLongOrNull() != start ||
+                        range.groupValues[2].toLongOrNull() != end) return@use null
+                }
                 val body = resp.body ?: return@use null
                 val buf = ByteArray(len)
                 var off = 0
@@ -571,6 +673,7 @@ internal class SegmentDownloader(
         headers: Map<String, String>,
         timeoutMs: Long,
         retries: Int,
+        useSegmentClient: Boolean = false,
     ): ProbeResult {
         var last = ProbeResult(null, false, url)
         // UA 协商只做一次（结论对一个域名是稳定的），协商出结果就贯穿整个任务。
@@ -581,8 +684,14 @@ internal class SegmentDownloader(
         repeat(retries + 1) { attempt ->
             // ① 最小探测（bytes=0-0）：代价最低，健康服务器回 206 即可确认支持分片。
             // 已协商出 UA 时用它 —— 否则这一轮又会用默认 UA 撞同一堵墙。
-            val r = probe(url, headers, timeoutMs = timeoutMs, rangeSpec = RANGE_MIN,
-                userAgentOverride = negotiated)
+            val r = probe(
+                url,
+                headers,
+                timeoutMs = timeoutMs,
+                rangeSpec = RANGE_MIN,
+                userAgentOverride = negotiated,
+                useSegmentClient = useSegmentClient,
+            )
             last = r
             if (r.supportsRange) return r
 
@@ -595,7 +704,7 @@ internal class SegmentDownloader(
             if (r.statusCode == 401 || r.statusCode == 403 ||
                 r.contentType.orEmpty().contains("text/html", ignoreCase = true)
             ) {
-                val n = negotiateUserAgent(url, headers, timeoutMs, r)
+                val n = negotiateUserAgent(url, headers, timeoutMs, r, useSegmentClient)
                 if (n.negotiatedUserAgent != null) {
                     negotiated = n.negotiatedUserAgent
                     last = n
@@ -622,8 +731,14 @@ internal class SegmentDownloader(
                 reprobed = true
                 // 复探**必须**带上协商出的 UA：否则「换 UA 通过了 → 复探又用回默认 UA → 再次被拦」，
                 // 前面那次协商白做，还会把结论误判成"不支持 Range"（真实镜像站上就是这么发生的）。
-                val r2 = probe(url, headers, timeoutMs = timeoutMs, rangeSpec = RANGE_FROM_START,
-                    userAgentOverride = negotiated)
+                val r2 = probe(
+                    url,
+                    headers,
+                    timeoutMs = timeoutMs,
+                    rangeSpec = RANGE_FROM_START,
+                    userAgentOverride = negotiated,
+                    useSegmentClient = useSegmentClient,
+                )
                 if (r2.supportsRange) return r2
                 if (r2.contentType.orEmpty().contains("text/html", ignoreCase = true)) return r2
                 // 复探仍不支持：保留两次探测中信息更全的一份（大小/元数据）。
@@ -673,6 +788,12 @@ internal class SegmentDownloader(
         onProgress: suspend (newlyWritten: Long, totalWritten: Long) -> Unit,
         buffer: ByteArray,
         ifRange: String? = null,
+        /**
+         * 期望的文件总大小（可选）。多镜像场景下用来识别"这个镜像其实是另一个文件"：
+         * 镜像返回的 `Content-Range` 总长与它不符时直接判这次尝试失败，
+         * 让调度器把这个来源拉黑并换源 —— 否则不同长度的镜像混用会产生静默损坏。
+         */
+        expectedTotal: Long = -1,
         /** 请求发出后把句柄交给调用方（卡死守护据此"只掐这一条"）。 */
         onCallStarted: ((okhttp3.Call) -> Unit)? = null,
         /**
@@ -693,20 +814,35 @@ internal class SegmentDownloader(
          */
         writeBufferAt: ((position: Long, src: java.nio.ByteBuffer) -> Int)? = null,
         directBuffer: java.nio.ByteBuffer? = null,
+        writeLock: Any = Any(),
     ): SegmentResult {
         fun reportFailure(reason: String) {
             failureByTask[taskId] = reason
             onFailure?.invoke(reason)
         }
+        if (taskId in cancelledSegmentTasks) return SegmentResult.FAILED
         var end = endProvider()
         var expected = end - pieceStart + 1
         var done = alreadyWritten.coerceAtLeast(0)
         if (done >= expected) return SegmentResult.OK
         val from = pieceStart + done
 
+        val gateKey = taskId to url
+        val gate = firstRequestGates.computeIfAbsent(gateKey) { CompletableDeferred() }
+        val isFirstRequest = firstRequestOwners.putIfAbsent(gateKey, true) == null
+        if (!isFirstRequest) {
+            // Bound the wait: a broken origin must not stall all workers behind
+            // the redirect learner. If it fails, they can retry the original URL.
+            withTimeoutOrNull(300) { gate.await() }
+        }
+        // failTask() may run while this worker is waiting for the redirect
+        // learner. Recheck before creating a Call so cancellation cannot race
+        // past an unregistered request.
+        if (taskId in cancelledSegmentTasks) return SegmentResult.FAILED
         val target = urlFor(taskId, url)
         val req = Request.Builder()
             .url(target)
+            .tag(RequestOrigin::class.java, RequestOrigin(url))
             .header("Range", "bytes=$from-$end")
             .apply { if (!ifRange.isNullOrBlank()) header("If-Range", ifRange) }
             .apply { headers.forEach { (k, v) -> header(k, v) } }
@@ -720,10 +856,10 @@ internal class SegmentDownloader(
             call.execute().use { resp ->
                 if (resp.isSuccessful || resp.code == 416) {
                     val finalUrl = resp.request.url.toString()
-                    if (finalUrl != target) resolvedUrlByTask[taskId] = finalUrl
+                    learnResolvedUrl(taskId, url, finalUrl)
                 }
                 if (resp.header("Content-Type").orEmpty().contains("text/html", true)) {
-                    forgetResolvedUrl(taskId)
+                    forgetResolvedUrl(taskId, url)
                     return@use SegmentResult.FAILED
                 }
                 when (val code = resp.code) {
@@ -735,7 +871,22 @@ internal class SegmentDownloader(
                     }
                     206 -> {
                         val crStart = parseContentRangeStart(resp.header("Content-Range"))
-                        if (crStart != null && crStart != from) return@use SegmentResult.RANGE_IGNORED
+                        // 【必须能解析】旧实现只拦"解析成功但偏移不对"，解析失败（null）时
+                        // 直接放行按请求偏移写入。代理或异常 CDN 返回一个没有 Content-Range 的
+                        // 206 时，body 可能从别的偏移开始，只要长度恰好等于请求区间，
+                        // 错误字节就会被静默写进目标文件。没有可验证的起点 = 这次响应不可信。
+                        if (crStart == null) return@use SegmentResult.RANGE_IGNORED
+                        if (crStart != from) return@use SegmentResult.RANGE_IGNORED
+                        // 多镜像防护：服务器自报的总长与本次任务的总长不一致 =
+                        // 这个"镜像"其实是另一个文件。写进去就是静默损坏，
+                        // 直接判这次尝试失败，让调度器换源。
+                        val crTotal = parseContentRangeTotal(resp.header("Content-Range"))
+                        if (expectedTotal > 0 && crTotal != null && crTotal != expectedTotal) {
+                            reportFailure(
+                                "镜像文件大小不一致：该来源 $crTotal 字节，本任务 $expectedTotal 字节",
+                            )
+                            return@use SegmentResult.SOURCE_MISMATCH
+                        }
                         val body = resp.body ?: return@use SegmentResult.FAILED
                         // 收尾托管可能已缩短区间：以**当前**末端为准，多读到的丢弃。
                         end = endProvider()
@@ -743,37 +894,59 @@ internal class SegmentDownloader(
                         if (done >= expected) return@use SegmentResult.OK
                         val written = if (writeBufferAt != null && directBuffer != null) {
                             copyToStoreDirect(
-                                body.byteStream(), pieceStart, done, expected - done,
-                                writeBufferAt, directBuffer, onProgress,
+                                body.byteStream(), pieceStart, done,
+                                endProvider, writeBufferAt, directBuffer, writeLock, onProgress,
                             )
                         } else {
                             require(buffer.isNotEmpty()) {
                                 "既没有 writeBufferAt 也没有读缓冲：无法写入"
                             }
                             copyToStore(
-                                body.byteStream(), pieceStart, done, expected - done,
-                                writeAt, buffer, onProgress,
+                                body.byteStream(), pieceStart, done,
+                                endProvider, writeAt, buffer, writeLock, onProgress,
                             )
                         }
                         // done 必须跟着实际写入量推进：调用方靠它更新进度记录。
                         done += written
-                        if (done < expected) {
+                        // The end can shrink while this request is streaming (tail
+                        // assist). Re-read it instead of judging against the stale
+                        // value captured when the response headers arrived.
+                        val expectedNow = (endProvider() - pieceStart + 1).coerceAtLeast(0)
+                        if (done < expectedNow) {
                             // `done` 已由 copyToStore 的 onProgress 推进到实际写入位置。
                             reportFailure(
-                                "连接提前结束：分片 $pieceStart-${pieceStart + expected - 1} 只收到 " +
-                                    "$written / ${expected - alreadyWritten} 字节"
+                                "连接提前结束：分片 $pieceStart-${pieceStart + expectedNow - 1} 只收到 " +
+                                    "$written / ${expectedNow - alreadyWritten} 字节"
                             )
                             SegmentResult.FAILED
                         } else SegmentResult.OK
                     }
                     200 -> SegmentResult.RANGE_IGNORED
-                    416 -> SegmentResult.OK
+                    416 -> {
+                        val actualTotal = parseContentRangeTotal(resp.header("Content-Range"))
+                        if (expectedTotal > 0 && actualTotal != null && actualTotal != expectedTotal) {
+                            forgetResolvedUrl(taskId, url)
+                            reportFailure(
+                                "HTTP 416：来源文件大小已变为 $actualTotal 字节，本任务期望 $expectedTotal 字节",
+                            )
+                        } else {
+                            reportFailure(
+                                "HTTP 416：请求区间 $from-$end 尚未完成，" +
+                                    "在已写入 $done/${expectedNowFor416(pieceStart, endProvider)} 字节时被服务器拒绝",
+                            )
+                        }
+                        SegmentResult.FAILED
+                    }
                     else -> {
                         if (code == 401 || code == 403 || code == 410) {
-                            forgetResolvedUrl(taskId)
+                            forgetResolvedUrl(taskId, url)
                             SegmentResult.AUTH_EXPIRED
                         } else if (code in 500..599) {
-                            SegmentResult.THROTTLED
+                            // 普通 5xx（500/501/505…）不是"你太快了"，不该触发并发背压。
+                            // 旧实现把所有 5xx 都归为 THROTTLED：既错误地降并发、又消耗
+                            // 限流重试预算，最终报出"持续被限流"这种误导性错误。
+                            reportFailure("HTTP $code")
+                            SegmentResult.FAILED
                         } else {
                             SegmentResult.FAILED
                         }
@@ -787,6 +960,9 @@ internal class SegmentDownloader(
             reportFailure(describeIoFailure(e))
             SegmentResult.FAILED
         } finally {
+            if (isFirstRequest) {
+                gate.complete(Unit)
+            }
             activeCalls[taskId]?.remove(call)
             handle?.dispose()
         }
@@ -808,32 +984,64 @@ internal class SegmentDownloader(
         input: java.io.InputStream,
         pieceStart: Long,
         alreadyDone: Long,
-        expected: Long,
+        limitEndProvider: () -> Long,
         writeBufferAt: (position: Long, src: java.nio.ByteBuffer) -> Int,
         buffer: java.nio.ByteBuffer,
+        writeLock: Any,
         onProgress: suspend (newlyWritten: Long, totalWritten: Long) -> Unit,
     ): Long {
         val src = java.nio.channels.Channels.newChannel(input)
         var written = 0L
         var totalWritten = alreadyDone
         while (true) {
+            val remainingBeforeRead =
+                (limitEndProvider() - pieceStart + 1) - alreadyDone - written
+            if (remainingBeforeRead <= 0) break
             buffer.clear()
             val n = src.read(buffer)
             if (n <= 0) break
             buffer.flip()
-            val allow = min(n.toLong(), expected - written)
-            if (allow <= 0) break
-            buffer.limit((buffer.position() + allow).toInt())
-            var pos = pieceStart + alreadyDone + written
-            while (buffer.hasRemaining()) {
-                val w = writeBufferAt(pos, buffer)
-                if (w <= 0) return written
-                pos += w
+            var consumed = 0
+            while (consumed < n) {
+                val remainingNow =
+                    (limitEndProvider() - pieceStart + 1) - alreadyDone - written
+                if (remainingNow <= 0) break
+                val allow = min((n - consumed).toLong(), remainingNow).toInt()
+                val before = buffer.position()
+                buffer.limit(before + allow)
+                while (buffer.hasRemaining()) {
+                    var w = 0
+                    synchronized(writeLock) {
+                        val remainingAtWrite =
+                            (limitEndProvider() - pieceStart + 1) - alreadyDone - written
+                        if (remainingAtWrite > 0) {
+                            val currentLimit = min(
+                                buffer.limit(),
+                                buffer.position() + remainingAtWrite.toInt(),
+                            )
+                            buffer.limit(currentLimit)
+                            if (buffer.hasRemaining()) {
+                                val pos = pieceStart + alreadyDone + written
+                                w = writeBufferAt(pos, buffer)
+                                if (w > 0) {
+                                    written += w
+                                    totalWritten += w
+                                }
+                            }
+                        }
+                    }
+                    if (w <= 0) return written
+                }
+                val committed = buffer.position() - before
+                consumed += committed
+                if (committed > 0) onProgress(committed.toLong(), totalWritten)
+                if (committed < allow) {
+                    // The segment shrank while this read was in flight. Drop
+                    // the unassigned tail; the new owner will request it.
+                    break
+                }
             }
-            written += allow
-            totalWritten += allow
-            onProgress(allow, totalWritten)
-            if (written >= expected) break
+            if (consumed < n) break
         }
         return written
     }
@@ -842,33 +1050,58 @@ internal class SegmentDownloader(
         input: java.io.InputStream,
         pieceStart: Long,
         alreadyDone: Long,
-        expected: Long,
+        limitEndProvider: () -> Long,
         writeAt: (position: Long, buf: ByteArray, off: Int, len: Int) -> Int,
         buffer: ByteArray,
+        writeLock: Any,
         onProgress: suspend (newlyWritten: Long, totalWritten: Long) -> Unit,
     ): Long {
         var written = 0L
         var totalWritten = alreadyDone
         while (true) {
+            val remainingBeforeRead =
+                (limitEndProvider() - pieceStart + 1) - alreadyDone - written
+            if (remainingBeforeRead <= 0) break
             val n = input.read(buffer)
             if (n <= 0) break
-            val allow = min(n.toLong(), expected - written)
-            if (allow <= 0) break
-            // 分段写：writeAt 可能一次没写完（理论上位置写会写满，但不假设）。
-            var off = 0
-            var left = allow.toInt()
-            var pos = pieceStart + alreadyDone + written
-            while (left > 0) {
-                val w = writeAt(pos, buffer, off, left)
-                if (w <= 0) return written
-                off += w
-                left -= w
-                pos += w
+            var consumed = 0
+            while (consumed < n) {
+                val remainingNow =
+                    (limitEndProvider() - pieceStart + 1) - alreadyDone - written
+                if (remainingNow <= 0) break
+                val allow = min((n - consumed).toLong(), remainingNow).toInt()
+                // 分段写：writeAt 可能一次没写完（理论上位置写会写满，但不假设）。
+                var off = consumed
+                var left = allow
+                while (left > 0) {
+                    var w = 0
+                    synchronized(writeLock) {
+                        val remainingAtWrite =
+                            (limitEndProvider() - pieceStart + 1) - alreadyDone - written
+                        if (remainingAtWrite > 0) {
+                            val writeLen = min(left.toLong(), remainingAtWrite).toInt()
+                            val pos = pieceStart + alreadyDone + written
+                            w = writeAt(pos, buffer, off, writeLen)
+                            if (w > 0) {
+                                written += w
+                                totalWritten += w
+                            }
+                        }
+                    }
+                    if (w <= 0) break
+                    off += w
+                    left -= w
+                }
+                val committed = allow - left
+                consumed += committed
+                if (committed > 0) onProgress(committed.toLong(), totalWritten)
+                if (committed < allow) {
+                    // The segment shrank while this read was in flight. Drop
+                    // the unassigned tail; the new owner will request it.
+                    break
+                }
             }
-            written += allow
-            totalWritten += allow
-            onProgress(allow, totalWritten)
-            if (written >= expected) break
+            if (consumed < n) break
         }
         return written
     }
@@ -943,6 +1176,7 @@ internal class SegmentDownloader(
         val target = urlFor(taskId, url)
         val req = Request.Builder()
             .url(target)
+            .tag(RequestOrigin::class.java, RequestOrigin(url))
             .header("Range", "bytes=$from-$end")
             .apply { if (!ifRange.isNullOrBlank()) header("If-Range", ifRange) }
             .apply { headers.forEach { (k, v) -> header(k, v) } }
@@ -958,12 +1192,12 @@ internal class SegmentDownloader(
                 // 只在响应可用时记（成功或 416），避免把错误页/拦截页的地址当成终址。
                 if (resp.isSuccessful || resp.code == 416) {
                     val finalUrl = resp.request.url.toString()
-                    if (finalUrl != target) resolvedUrlByTask[taskId] = finalUrl
+                    learnResolvedUrl(taskId, url, finalUrl)
                 }
                 if (resp.header("Content-Type").orEmpty().contains("text/html", true)) {
                     // 网页错误页常见于「签名直链已过期/被拦截」→ 遗忘终址，
                     // 让下一次尝试回到原始 URL 重新解析，而不是抱着失效地址反复撞。
-                    forgetResolvedUrl(taskId)
+                    forgetResolvedUrl(taskId, url)
                     return@use SegmentResult.FAILED
                 }
                 when (val code = resp.code) {
@@ -1010,7 +1244,13 @@ internal class SegmentDownloader(
                         // （若服务器真回了小于请求区间的 200，那多半是代理篡改/错误页，重试比猜测语义更安全。）
                         SegmentResult.RANGE_IGNORED
                     }
-                    416 -> SegmentResult.OK  // Range 越界：通常该分片已完成
+                    416 -> {
+                        forgetResolvedUrl(taskId, url)
+                        failureByTask[taskId] =
+                            "HTTP 416：$from-$end 仍有 ${expected - existing} 字节未完成，" +
+                                "服务器却声明区间不可满足"
+                        SegmentResult.FAILED
+                    }
                     else -> {
                         // 401/403/410 是「授权/时效」类信号：记住的 CDN 直链很可能已过期，
                         // 遗忘它 → 下次重新走原始 URL 解析（自愈），而不是一直撞同一个失效地址。
@@ -1018,7 +1258,7 @@ internal class SegmentDownloader(
                         // 单独归为 AUTH_EXPIRED（而非 FAILED）：403 **不是**"并发太高"的信号，
                         // 若混进普通失败会触发背压降并发 —— 既解决不了 403，又白掉速度。
                         if (code == 401 || code == 403 || code == 410) {
-                            forgetResolvedUrl(taskId)
+                            forgetResolvedUrl(taskId, url)
                             SegmentResult.AUTH_EXPIRED
                         } else if (code in 500..599) {
                             SegmentResult.THROTTLED
@@ -1050,6 +1290,8 @@ internal class SegmentDownloader(
         total: Long,
         onBytes: suspend (Long) -> Unit,
     ): Boolean = withContext(Dispatchers.IO) {
+        // Range handling may hand off to this fallback after cancelCalls().
+        cancelledSegmentTasks.remove(taskId)
         // 每次进入都先清掉上一次的原因，避免把上一轮的错误带给这一轮。
         failureByTask.remove(taskId)
         val existing = outFile.length()
@@ -1057,6 +1299,7 @@ internal class SegmentDownloader(
         if (existing > 0) outFile.delete()
         val req = Request.Builder()
             .url(url)
+            .tag(RequestOrigin::class.java, RequestOrigin(url))
             .apply { headers.forEach { (k, v) -> header(k, v) } }
             .header("Accept-Encoding", "identity")
             .get().build()
@@ -1090,6 +1333,12 @@ internal class SegmentDownloader(
                 val expected = if (total > 0) total else -1L
                 var written = 0L
                 RandomAccessFile(outFile, "rw").use { raf ->
+                    // 【必须显式截断】上面的 `outFile.delete()` 在 Windows 上经常失败
+                    // （目标文件此时还被 SegmentStore 的 FileChannel 持有着），而 delete()
+                    // 的返回值又被忽略。只 seek(0) 不截断的话，新内容比旧文件短时
+                    // 旧尾部会被原样保留；当 total<=0 时最终大小直接取文件长度，
+                    // 于是"下载成功"的文件里混着上一次的旧字节。
+                    raf.setLength(0)
                     raf.seek(0)
                     body.byteStream().use { input ->
                         val buf = ByteArray(bufferSizeProvider().coerceAtLeast(8 * 1024))
@@ -1161,6 +1410,16 @@ internal class SegmentDownloader(
         val spec = value.substringBefore('/').trim().removePrefix("bytes").trim()
         return spec.substringBefore('-').trim().toLongOrNull()
     }
+
+    /** 从 `Content-Range: bytes 0-99/12345` 里取总长度；`*` 或格式异常返回 null。 */
+    private fun parseContentRangeTotal(value: String?): Long? {
+        if (value.isNullOrBlank()) return null
+        val total = value.substringAfter('/', "").trim()
+        return total.toLongOrNull()
+    }
+
+    private fun expectedNowFor416(pieceStart: Long, endProvider: () -> Long): Long =
+        (endProvider() - pieceStart + 1).coerceAtLeast(0)
 
     private suspend fun writeSlice(
         input: java.io.InputStream,

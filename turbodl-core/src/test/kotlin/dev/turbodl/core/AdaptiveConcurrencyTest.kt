@@ -76,7 +76,7 @@ class AdaptiveConcurrencyTest {
         PER_CONNECTION("每连接 96KB/s"),
 
         /** 全任务聚合 256KB/s（不报错、不限并发）—— 加连接没有收益。 */
-        TASK_AGGREGATE("任务聚合 256KB/s"),
+        TASK_AGGREGATE("任务聚合 4MB/s"),
     }
 
     /**
@@ -99,7 +99,7 @@ class AdaptiveConcurrencyTest {
 
         private companion object {
             const val PER_CONNECTION_BPS = 96_000L
-            const val TASK_AGGREGATE_BPS = 256_000L
+            const val TASK_AGGREGATE_BPS = 4_000_000L
         }
 
         init {
@@ -150,7 +150,10 @@ class AdaptiveConcurrencyTest {
             }
         }
 
-        fun stop() = server.stop(0)
+        fun stop() {
+            server.stop(0)
+            (server.executor as? java.util.concurrent.ExecutorService)?.shutdownNow()
+        }
     }
 
     /** 把 n 字节的发送许可按速率摊开；同一实例被多请求共享即「聚合」语义。 */
@@ -199,15 +202,15 @@ class AdaptiveConcurrencyTest {
                 stallTimeoutMs = 0,
             )
         )
-        val tailMax = AtomicInteger(0)
+        val tailSamples = java.util.concurrent.CopyOnWriteArrayList<Int>()
         val tailStartAt = AtomicLong(0)
         val collector = launch {
             client.progress.collect { map ->
                 map.values.forEach { p ->
-                    if (p.state == TaskState.DOWNLOADING &&
+                    if (p.state == TaskState.DOWNLOADING && p.percent in 0..89 &&
                         tailStartAt.get() > 0 && System.currentTimeMillis() >= tailStartAt.get()
                     ) {
-                        tailMax.updateAndGet { max(it, p.activeConnections) }
+                        tailSamples.add(p.activeConnections)
                     }
                 }
             }
@@ -222,8 +225,8 @@ class AdaptiveConcurrencyTest {
                     knownSize = payload.size.toLong(),
                 )
             )
-            // 前 5 秒是慢启动与基线测量期，之后才算稳态
-            tailStartAt.set(t0 + 5_000)
+            // 启动与初始测量期：DOWNWARD 模式立即以设定并发启动，2.5 秒后即进入稳态采样
+            tailStartAt.set(t0 + 2_500)
             val res = client.await(id)
             if (res.isFailure) error = res.exceptionOrNull()?.message ?: "failed"
             else if (!out.readBytes().contentEquals(payload)) error = "内容不一致"
@@ -240,22 +243,25 @@ class AdaptiveConcurrencyTest {
             error = error,
             ms = System.currentTimeMillis() - t0,
             bytes = payload.size.toLong(),
-            tailConnections = tailMax.get(),
+            tailConnections = tailSamples.takeLast(10).sorted().let {
+                if (it.isEmpty()) 0 else it[it.size / 2]
+            },
             requests = srv.rangeRequests.get(),
         )
     }
 
     @Test
-    fun `per-connection cap rejects descent and keeps concurrency`() = runBlocking {
+    fun `short per-connection-limited file keeps the configured concurrency`() = runBlocking {
         val port = freeSafePort() ?: run {
             println("[ADAPT] 安全端口全部占用，跳过（8791-8850）")
             return@runBlocking
         }
-        // 8 连接 × 4 × 64KB = 2MB 起，取 4MB 让分片数（64）远多于连接数（8）
-        val payload = ByteArray(4 * 1024 * 1024) { ((it * 17 + 5) % 256).toByte() }
+        // 8 连接 × 4 × 64KB = 2MB 起，取 6MB 留出足够的稳态采样窗口
+        val payload = ByteArray(6 * 1024 * 1024) { ((it * 17 + 5) % 256).toByte() }
 
-        // 每连接 96KB/s：8 连接 ≈ 768KB/s，4 连接只有约 384KB/s。
-        // 控制器一定会试着把 8 探到 4（找「够用的最低档」），那会让吞吐腰斩 → **必须被拒**。
+        // 6MB 小于 DOWNWARD 的 64MB 学习门限。短任务必须直接保持用户并发，
+        // 不能为了一个还没完成的基线预览把连接数先降下来。
+        // 真正的“每连接限速拒绝下探”由 AdaptiveConcurrencyControllerTest 的纯策略用例覆盖。
         val run = runDownload(Model.PER_CONNECTION, 8, payload, port, adaptive = true)
 
         assertTrue(run.ok, "每连接限速下应完成下载：${run.error}")
@@ -272,8 +278,9 @@ class AdaptiveConcurrencyTest {
             println("[ADAPT] 安全端口全部占用，跳过（8791-8850）")
             return@runBlocking
         }
-        // 16 连接 × 4 × 64KB = 4MB：分片数（64）是连接数的 4 倍，足够控制器在非收尾期采样
-        val payload = ByteArray(4 * 1024 * 1024) { ((it * 29 + 11) % 256).toByte() }
+        // DOWNWARD 只在完成至少 64MB 稳态传输后才学习；小文件直接结束会把
+        // “没有采样窗口”误判成“自适应失效”。
+        val payload = ByteArray(96 * 1024 * 1024) { ((it * 29 + 11) % 256).toByte() }
 
         // 聚合封顶 256KB/s：16 连接能提供的带宽远高于它，多开连接不换来任何吞吐。
         val off = runDownload(Model.TASK_AGGREGATE, 16, payload, port, adaptive = false)

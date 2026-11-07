@@ -1,7 +1,7 @@
 package dev.turbodl.core
 
 /** 下载任务定义（提交给引擎的输入）。 */
-data class DownloadRequest(
+data class DownloadRequest @JvmOverloads constructor(
     /** 下载 URL（HTTP/HTTPS）。 */
     val url: String,
 
@@ -13,6 +13,14 @@ data class DownloadRequest(
 
     /** 已知文件大小（字节）；<=0 表示未知，由引擎探测。 */
     val knownSize: Long = -1,
+
+    /**
+     * 可选的最终文件 SHA-256（64 位十六进制，大小写均可）。
+     *
+     * 校验在目标文件写完后、任务标记为完成前执行。失败时任务进入 FAILED，
+     * 并丢弃本次续传侧车，避免下一次重试跳过已经确认错误的字节。
+     */
+    val expectedSha256: String? = null,
 
     /** 覆盖本任务的连接数；null 使用全局配置。范围仍受 1..256 限制。 */
     val connectionsOverride: Int? = null,
@@ -36,6 +44,47 @@ data class DownloadRequest(
      * 在事件回调（[TurboEvent]）中原样拿回，无需自建 roomId→业务信息映射。
      */
     val tags: Map<String, String> = emptyMap(),
+
+    /**
+     * 同一份文件的其他来源（镜像）。
+     *
+     * 引擎会把这些 URL 和 [url] 一起放进来源池：先各跑一小段实测速度，
+     * 之后按实测速度把分片派给更快的来源；某个来源连续失败时自动进入
+     * 退避窗口并把分片切到其他来源。
+     *
+     * 【必须真的指向同一份文件】引擎在探测阶段会核对大小：与主 URL 大小不一致的
+     * 镜像会被直接剔除。不同大小的镜像混用会产生静默损坏，所以这一条是硬校验。
+     *
+     * 留空 = 只有 [url] 一个来源，行为与旧版完全一致。
+     * 跨源镜像默认只继承非凭据请求头；Cookie、Authorization、API key
+     * 等敏感头不会自动发送到不同 scheme/host/port 的镜像。
+     *
+     * 该字段放在构造器末尾，并用 [JvmOverloads] 保留旧版尾部省略参数的
+     * JVM 构造器，避免升级 SDK 时既有调用方触发 NoSuchMethodError。
+     */
+    val mirrors: List<String> = emptyList(),
+) {
+    init {
+        require(
+            expectedSha256 == null ||
+                expectedSha256.matches(Regex("^[0-9a-fA-F]{64}$"))
+        ) {
+            "expectedSha256 必须是 64 位十六进制 SHA-256"
+        }
+    }
+}
+
+/** Action when the built-in HTTP backend cannot check existing resume data. */
+enum class UnverifiableResumePolicy {
+    /** Preserve the historical behavior, which can reuse unverifiable data. */
+    ALLOW,
+    /** Fail the task and retain the existing file and resume data. */
+    FAIL,
+}
+
+/** Existing resume data could not be checked; it has been retained. */
+class ResumeVerificationException : IllegalStateException(
+    "Cannot verify existing download progress; retained for a later retry"
 )
 
 /** 任务状态。 */
@@ -48,6 +97,19 @@ enum class TaskState {
     PAUSED,        // 暂停（保留断点）
     FAILED,        // 失败
     CANCELED,      // 取消
+}
+
+/**
+ * 自适应并发的搜索方向。
+ *
+ * 这是 SDK 的策略开关，不绑定任何宿主：
+ * - [UPWARD]：从较小并发开始，实测吞吐持续提升才扩档，适合保守的通用下载器。
+ * - [DOWNWARD]：先从用户设定的并发上限起跑，再按实测吞吐向下收敛，适合
+ *   网盘/大文件等“线程数必须立刻可用”的宿主。
+ */
+enum class AdaptiveConcurrencyMode {
+    UPWARD,
+    DOWNWARD,
 }
 
 /** 实时进度快照。 */

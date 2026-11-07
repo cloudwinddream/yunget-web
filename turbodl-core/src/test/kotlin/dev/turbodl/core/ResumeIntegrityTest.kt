@@ -138,6 +138,17 @@ class ResumeIntegrityTest {
         error("暂停未生效")
     }
 
+    private fun durableBytes(out: File, dir: File, key: String): Long {
+        val chunkDir = File(dir, stableKeyDirectoryName(key))
+        val state = SegmentStore(out, File(chunkDir, "progress.tdlp"), SIZE.toLong())
+        state.open()
+        return try {
+            state.peek(SIZE.toLong())?.sumOf { it.written } ?: 0L
+        } finally {
+            state.close()
+        }
+    }
+
     // ------------------------------------------------------------------ 1
     @Test
     fun `暂停后继续 不重下已完成部分 且内容一致`() = runBlocking {
@@ -155,7 +166,9 @@ class ResumeIntegrityTest {
             waitPaused(client, id1)
 
             val sentFirst = srv.bytesSent.get()
+            val durable = durableBytes(out, dir, key)
             assertTrue(sentFirst < SIZE, "暂停前不应已经下完（已发 $sentFirst）")
+            assertTrue(durable >= SIZE / 16, "暂停后至少应耐久保存 1/16 文件，实际 $durable")
 
             srv.bytesSent.set(0)
             val id2 = client.submit(DownloadRequest(url, out, stableKey = key))
@@ -166,8 +179,8 @@ class ResumeIntegrityTest {
             assertEquals(sha(data), shaOf(out), "最终内容必须与源一致")
             // 允许少量重叠（最后一个未完成分片会重下），但绝不能接近整包
             assertTrue(
-                sentSecond < SIZE - sentFirst / 2,
-                "第二次又发了 $sentSecond 字节，而已落盘约 $sentFirst —— 像是从头下",
+                sentSecond < SIZE - durable / 2,
+                "第二次又发了 $sentSecond 字节，耐久进度 $durable（服务端已发 $sentFirst）—— 像是从头下",
             )
             println("[resume] 首次发=$sentFirst 续传发=$sentSecond 总计=${sentFirst + sentSecond}")
         } finally {
@@ -199,6 +212,7 @@ class ResumeIntegrityTest {
             c1.shutdown()
             delay(300)
             val sentFirst = srv.bytesSent.get()
+            val durable = durableBytes(out, dir, key)
 
             srv.bytesSent.set(0)
             val c2 = TurboClient(cfg(dir, 8))
@@ -209,8 +223,12 @@ class ResumeIntegrityTest {
             assertEquals(sha(data), shaOf(out), "内容必须一致")
             val sentSecond = srv.bytesSent.get()
             assertTrue(
-                sentSecond < SIZE - sentFirst / 2,
-                "重提后发了 $sentSecond，已落盘约 $sentFirst —— 进度没有被沿用",
+                durable >= SIZE / 8,
+                "首次至少应耐久保存 1/8 文件，实际 $durable 字节",
+            )
+            assertTrue(
+                sentSecond < SIZE - durable / 2,
+                "重提后发了 $sentSecond，耐久进度 $durable（服务端已发 $sentFirst）—— 进度没有被有效沿用",
             )
             println("[kill-resume] 首次发=$sentFirst 重提发=$sentSecond")
         } finally {
@@ -249,7 +267,7 @@ class ResumeIntegrityTest {
     @Test
     fun `目标文件被删后 必须干净重来`() = runBlocking {
         val data = payload(71)
-        val srv = Srv(data)
+        val srv = Srv(data, chunkDelayMs = 10)
         val dir = workDir("gone")
         val key = "k-gone"
         val out = File.createTempFile("ri4", ".bin").apply { deleteOnExit() }
@@ -277,11 +295,50 @@ class ResumeIntegrityTest {
         }
     }
 
+    /**
+     * 强校验器场景：服务器给出稳定 ETag，用户删掉目标文件后重下。
+     *
+     * 这是 `ensureLength()` 引入后的关键回归：若先预写目标文件末尾的 1 字节，
+     * `SegmentStore.destCovers()` 会误以为旧进度仍然覆盖磁盘，随后直接跳过已记录分片，
+     * 产出一个"长度正确但中间全是洞"的文件。强 ETag 不会触发弱校验指纹，
+     * 因此这是最容易漏测、也最危险的一条路径。
+     */
+    @Test
+    fun `强ETag下目标文件被删 也必须重新下载`() = runBlocking {
+        val data = payload(73)
+        val srv = Srv(data, etag = "\"stable-v1\"", chunkDelayMs = 10)
+        val dir = workDir("gone-etag")
+        val key = "k-gone-etag"
+        val out = File.createTempFile("ri4b", ".bin").apply { deleteOnExit() }
+        val url = "http://127.0.0.1:${srv.port}/f.bin"
+        try {
+            val c1 = TurboClient(cfg(dir, 4))
+            val id = c1.submit(DownloadRequest(url, out, stableKey = key))
+            waitBytes(c1, id, SIZE / 4L)
+            c1.pause(id); waitPaused(c1, id); c1.shutdown()
+            assertTrue(out.delete(), "前提：目标文件确实被删")
+
+            srv.bytesSent.set(0)
+            val c2 = TurboClient(cfg(dir, 4))
+            val r = c2.await(c2.submit(DownloadRequest(url, out, stableKey = key)))
+            c2.shutdown()
+            assertTrue(r.isSuccess, "应成功：${r.exceptionOrNull()?.message}")
+            assertEquals(sha(data), shaOf(out), "文件被删后不得复用旧进度，否则会出现空洞")
+            assertTrue(
+                srv.bytesSent.get() >= SIZE,
+                "强 ETag 下目标文件被删也必须重下满 ${SIZE} 字节（实际 ${srv.bytesSent.get()}）",
+            )
+        } finally {
+            runCatching { srv.stop() }
+            runCatching { dir.deleteRecursively() }; runCatching { out.delete() }
+        }
+    }
+
     // ------------------------------------------------------------------ 5
     @Test
     fun `侧车损坏不崩溃 按全新任务处理`() = runBlocking {
         val data = payload(83)
-        val srv = Srv(data)
+        val srv = Srv(data, chunkDelayMs = 10)
         val dir = workDir("corrupt")
         val key = "k-corrupt"
         val out = File.createTempFile("ri5", ".bin").apply { deleteOnExit() }

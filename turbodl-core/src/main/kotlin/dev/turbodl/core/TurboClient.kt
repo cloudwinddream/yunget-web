@@ -7,7 +7,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -17,11 +16,19 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
+import java.io.InputStream
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.withContext
 
 /**
  * TurboDL 下载引擎入口（SDK 门面）。
@@ -46,12 +53,22 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
 
     /** 运行时热更新配置（限速、并发等即时生效；已在跑的任务连接数不回缩）。 */
     fun updateConfig(newConfig: TurboConfig) {
+        if (closed.get()) return
         this.config = newConfig
+        val oldSegment = segmentClient
         segmentClient = HttpClientFactory.build(newConfig, HttpClientFactory.ProtocolPreference.H1_ONLY)
+        retireClient(oldSegment)
         // 只重建已创建过的 h2 客户端：未创建说明从未走过整文件回退，
         // 保持"未创建"状态即可，别为了更新配置把它提前唤醒（白付一次 build）。
         if (streamClientRef != null) {
+            val oldStream = streamClientRef
             streamClientRef = HttpClientFactory.build(newConfig, HttpClientFactory.ProtocolPreference.ALLOW_H2)
+            oldStream?.let { retireClient(it) }
+        }
+        // Raising maxConcurrentTasks should wake queued tasks immediately.
+        scope.launch {
+            slotLock.withLock { grantSlotsLocked() }
+            connectionBudget.limitChanged()
         }
     }
 
@@ -94,9 +111,11 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
         { config.bufferedSegmentWrite },
     )
     private val speedLimiter = SpeedLimiter { config.globalSpeedLimitBytesPerSec }
+    private val connectionBudget = ConnectionBudget { config.maxTotalConnections }
 
     /** Built-in HTTP backend; always available so core works standalone. */
-    private val builtinBackend: DownloadBackend = BuiltinHttpBackend(downloader)
+    private val builtinBackend: DownloadBackend =
+        BuiltinHttpBackend(downloader, connectionBudget = connectionBudget)
 
     /**
      * Optional backend resolver. Null unless the optional plugin runtime installs one
@@ -110,14 +129,30 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
     var backendResolver: BackendResolver? = null
 
     /** Resolve the backend for a request: plugin resolver first, then built-in fallback. */
-    private fun backendFor(request: DownloadRequest): DownloadBackend =
-        backendResolver?.resolve(request) ?: builtinBackend
+    private fun backendFor(request: DownloadRequest, policy: UnverifiableResumePolicy): DownloadBackend {
+        val resolver = backendResolver ?: return builtinBackend
+        if (policy == UnverifiableResumePolicy.FAIL) {
+            val checked = resolver as? CheckedBackendResolver
+                ?: throw UnsupportedOperationException("Resolver does not support checked backend selection")
+            return checked.resolveChecked(request) ?: builtinBackend
+        }
+        return resolver.resolve(request) ?: builtinBackend
+    }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val idGen = AtomicLong(0)
 
     private val _events = MutableSharedFlow<TurboEvent>(extraBufferCapacity = 256)
     val events: SharedFlow<TurboEvent> = _events.asSharedFlow()
+    /**
+     * Single-consumer staging queue for [events].
+     *
+     * The old implementation launched one coroutine per event. Those coroutines
+     * have no ordering guarantee, so a Completed event could be delivered before
+     * the StateChanged(COMPLETED) that produced it. Channel send order is atomic;
+     * one collector then forwards events to the SharedFlow in that order.
+     */
+    private val eventQueue = BoundedEventQueue()
 
     private val _progress = MutableStateFlow<Map<Long, TaskProgress>>(emptyMap())
     val progress: StateFlow<Map<Long, TaskProgress>> = _progress.asStateFlow()
@@ -125,34 +160,113 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
     private val jobs = ConcurrentHashMap<Long, Job>()
     private val completions = ConcurrentHashMap<Long, CompletableDeferred<Result<File>>>()
     private val requests = ConcurrentHashMap<Long, DownloadRequest>()
+    private val resumePolicies = ConcurrentHashMap<Long, UnverifiableResumePolicy>()
+    private val taskWorkDirs = ConcurrentHashMap<Long, File>()
+    /**
+     * Completed/failed tasks stay queryable for a bounded window, but an SDK
+     * process may run for days and submit thousands of tasks. Keeping every
+     * progress entry and completion forever is an unbounded leak.
+     */
+    private val terminalIds = ConcurrentLinkedQueue<Long>()
+    private val terminalSet = ConcurrentHashMap.newKeySet<Long>()
+    private val terminalCount = AtomicInteger(0)
+    private val terminalLock = Any()
+    private val resumingTasks = mutableSetOf<Long>()
+    private val maxRetainedTerminalTasks = 256
 
-    /** 并发任务槽。 */
-    private val activeCount = AtomicInteger(0)
+    private val closed = AtomicBoolean(false)
+    private val pauseRequested = ConcurrentHashMap.newKeySet<Long>()
+    /**
+     * Namespace for tasks without a caller-provided stableKey.
+     *
+     * Internal task ids start at 1 for every TurboClient. Without a namespace,
+     * two clients sharing the default workDir would both use `task_1` and race
+     * on the same sidecar/identity files. Resume across client lifetimes already
+     * requires stableKey, so a per-client namespace is the safe default.
+     */
+    private val unkeyedNamespace = java.util.UUID.randomUUID().toString()
+
+    init {
+        scope.launch {
+            eventQueue.consume { event ->
+                _events.emit(event)
+            }
+        }
+    }
+    private val pauseCleanup = ConcurrentHashMap<Long, Job>()
+    private val cancelRequested = ConcurrentHashMap.newKeySet<Long>()
+    private val cancelCleanup = ConcurrentHashMap<Long, Job>()
+
+    /**
+     * 公平任务槽。
+     *
+     * 旧实现先读 `activeCount` 再在协程里自增，多个 submit 可以同时通过检查，
+     * 实际并发会超过 [TurboConfig.maxConcurrentTasks]。这里用锁保护“计数 + FIFO
+     * 等待队列”，并在配置调大时立即唤醒等待者。
+     */
+    private class SlotWaiter {
+        val deferred = CompletableDeferred<Unit>()
+        @Volatile var granted = false
+    }
+
+    private val slotLock = Mutex()
+    private val slotWaiters = java.util.ArrayDeque<SlotWaiter>()
+    private var activeSlots = 0
 
     /** 提交下载任务，立即入队并异步开始。返回任务 id。 */
-    fun submit(request: DownloadRequest): Long {
+    fun submit(request: DownloadRequest): Long = submit(request, UnverifiableResumePolicy.ALLOW, null)
+
+    /** Override the resume-work root for this task without changing the request ABI. */
+    fun submit(request: DownloadRequest, workDir: File): Long =
+        submit(request, UnverifiableResumePolicy.ALLOW, workDir)
+
+    /** Select behavior when HTTP resume verification cannot be performed.
+     * FAIL is supported by the built-in HTTP backend; other backends reject it.
+     * Successful sampling is not a full-file integrity check; use an expected SHA-256 when available.
+     */
+    fun submit(request: DownloadRequest, policy: UnverifiableResumePolicy): Long =
+        submit(request, policy, null)
+
+    fun submit(request: DownloadRequest, policy: UnverifiableResumePolicy, workDir: File?): Long {
+        check(!closed.get()) { "TurboClient 已关闭" }
         val id = idGen.incrementAndGet()
         requests[id] = request
+        resumePolicies[id] = policy
+        if (workDir != null) taskWorkDirs[id] = workDir
         completions[id] = CompletableDeferred()
         emit(TurboEvent.Created(id, request))
         setState(id, request, TaskState.QUEUED)
+        // Registering can race with shutdown(): shutdown iterates the current
+        // completion map, so a task added after that sweep would otherwise
+        // leave its await() pending forever.
+        if (closed.get()) {
+            completions.remove(id)
+            requests.remove(id)
+            resumePolicies.remove(id)
+            taskWorkDirs.remove(id)
+            _progress.update { it - id }
+            throw IllegalStateException("TurboClient 已关闭")
+        }
 
         val job = scope.launch {
             try {
-                awaitSlot(id)
+                awaitSlot()
                 if (coroutineContext[Job]?.isActive != true) return@launch
-                activeCount.incrementAndGet()
                 try {
-                    runTask(id, request)
+                    runTaskWithLease(id, request, policy)
                 } finally {
-                    activeCount.decrementAndGet()
+                    releaseSlot()
                     // 释放任务级的下载器状态（在飞 Call 登记 + 已学到的重定向终址）。
                     // 不释放的话每完成一个任务就留两条永不回收的条目 → 长跑进程无界增长。
                     downloader.releaseTask(id)
                 }
             } catch (e: CancellationException) {
                 completions[id]?.complete(Result.failure(e))
-                setState(id, request, TaskState.CANCELED)
+                setState(
+                    id,
+                    request,
+                    if (pauseRequested.remove(id)) TaskState.PAUSED else TaskState.CANCELED,
+                )
             } catch (e: Exception) {
                 // 【归因优先】0.2.3.0 让 SegmentDownloader 在分片层记录了"真实原因"
                 // （HTTP 状态码 / 连接被重置 / 只回了半截 body …），因为那里才拿得到
@@ -162,12 +276,19 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
                 val reason = downloader.takeWholeError(id)
                     ?: e.message
                     ?: e.javaClass.simpleName
+                setState(id, request, TaskState.FAILED)
+                updateProgress(id) { it.copy(error = reason) }
                 emit(TurboEvent.Failed(id, reason))
-                updateProgress(id) { it.copy(state = TaskState.FAILED, error = reason) }
                 completions[id]?.complete(Result.failure(e))
+            } finally {
+                jobs.remove(id, coroutineContext[Job])
             }
         }
         jobs[id] = job
+        // A tiny task can finish before the map write above. Do not retain a
+        // completed Job forever; the finally in the coroutine may already have
+        // run before this entry became visible.
+        if (job.isCompleted) jobs.remove(id, job)
         return id
     }
 
@@ -177,12 +298,23 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
 
     /** 暂停任务（保留断点）。 */
     fun pause(id: Long) {
+        if (closed.get()) return
+        if (cancelRequested.contains(id) || cancelCleanup.containsKey(id)) return
+        val request = requests[id] ?: return
+        val current = progress.value[id]?.state
+        if (current == TaskState.COMPLETED || current == TaskState.FAILED || current == TaskState.CANCELED) return
+        pauseRequested.add(id)
         downloader.cancelCalls(id)
         val job = jobs.remove(id)
-        scope.launch {
+        val cleanup = scope.launch {
             job?.let { runCatching { it.cancelAndJoin() } }
-            requests[id]?.let { setState(id, it, TaskState.PAUSED) }
+            if (!cancelRequested.contains(id)) {
+                setNonTerminalState(id, TaskState.PAUSED)
+            }
+            pauseCleanup.remove(id, coroutineContext[Job])
         }
+        pauseCleanup[id] = cleanup
+        if (cleanup.isCompleted) pauseCleanup.remove(id, cleanup)
     }
 
     /**
@@ -206,54 +338,115 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
      * 于是 `putIfAbsent` 看到的一定是「没有活动 job」，`resume` 也就能如实返回成功。
      */
     fun resume(id: Long): Boolean {
-        val req = requests[id] ?: return false
-        completions.putIfAbsent(id, CompletableDeferred())
+        if (closed.get()) return false
+        val (req, policy) = synchronized(terminalLock) {
+            val request = requests[id] ?: return false
+            val selectedPolicy = resumePolicies[id] ?: return false
+            if (!resumingTasks.add(id)) return false
+            if (terminalSet.remove(id) && terminalIds.remove(id)) {
+                terminalCount.decrementAndGet()
+            }
+            request to selectedPolicy
+        }
+
+        try {
 
         // 同步等待旧 job 退出：它会写下 PAUSED 并归还分片目录，之后才允许新 job 接手。
         // 这里必须用 runBlocking 而不是 launch —— 正确性依赖「join 已经完成」，
         // 而 launch 做不到同步保证，那正是这个竞态的来源。
         runBlocking {
+            cancelCleanup.remove(id)?.let { runCatching { it.join() } }
+            pauseCleanup.remove(id)?.let { runCatching { it.join() } }
             jobs.remove(id)?.let { runCatching { it.cancelAndJoin() } }
         }
+        if (closed.get()) return false
+        cancelRequested.remove(id)
+        // A paused task completed its old Deferred with CancellationException.
+        // Replace it only after the old job is gone so await() after resume()
+        // observes the resumed task, not the stale pause result.
+        pauseRequested.remove(id)
+        completions[id] = CompletableDeferred()
+        setState(id, req, TaskState.QUEUED)
 
         val job = scope.launch {
             try {
-                awaitSlot(id)
+                awaitSlot()
                 if (coroutineContext[Job]?.isActive != true) return@launch
-                activeCount.incrementAndGet()
-                try { runTask(id, req) } finally { activeCount.decrementAndGet(); downloader.releaseTask(id) }
+                try { runTaskWithLease(id, req, policy) } finally { releaseSlot(); downloader.releaseTask(id) }
             } catch (e: CancellationException) {
-                setState(id, req, TaskState.PAUSED)
+                // 【必须完成 Deferred】旧实现这里只 setState(PAUSED)，不完成 completions[id]：
+                // resume() 之后调 pause()，正在 await(id) 的调用方会**永久挂起**
+                // （start() 那条路径是对的，resume() 这条漏了）。
+                completions[id]?.complete(Result.failure(e))
+                setState(
+                    id,
+                    req,
+                    if (pauseRequested.remove(id)) TaskState.PAUSED else TaskState.CANCELED,
+                )
             } catch (e: Exception) {
                 // 同 start()：优先用分片层记录的真实原因
-                emit(
-                    TurboEvent.Failed(
-                        id,
-                        downloader.takeWholeError(id)
-                            ?: e.message
-                            ?: e.javaClass.simpleName,
-                    ),
-                )
+                val reason = downloader.takeWholeError(id)
+                    ?: e.message
+                    ?: e.javaClass.simpleName
+                setState(id, req, TaskState.FAILED)
+                updateProgress(id) { it.copy(error = reason) }
+                emit(TurboEvent.Failed(id, reason))
                 completions[id]?.complete(Result.failure(e))
+            } finally {
+                jobs.remove(id, coroutineContext[Job])
             }
         }
         // 若已有活动 job，不重复启动（新 job 会在上方 join 阶段自行退出）。
         val prev = jobs.putIfAbsent(id, job)
         if (prev != null) { job.cancel(); return false }
+        if (job.isCompleted) jobs.remove(id, job)
         return true
+        } finally {
+            synchronized(terminalLock) {
+                resumingTasks.remove(id)
+                if (progress.value[id]?.state?.isTerminal() == true) rememberTerminal(id)
+            }
+        }
     }
+
+    /**
+     * Cooperative variant of [resume] for Android/UI coroutines.
+     *
+     * The legacy method is intentionally kept synchronous for binary and
+     * behavioral compatibility. Hosts running on a main thread must use this
+     * method instead: it moves the legacy join onto [Dispatchers.IO] and
+     * suspends the caller rather than blocking its thread. A future state
+     * machine can replace the internal bridge without changing this API.
+     */
+    suspend fun resumeAsync(id: Long): Boolean =
+        withContext(Dispatchers.IO) { resume(id) }
 
     /** 取消任务并清理临时分片。deleteOutput=true 同时删除已保存的目标文件。 */
     fun cancel(id: Long, deleteOutput: Boolean = false) {
+        if (closed.get()) return
+        if (requests[id] == null || cancelCleanup.containsKey(id)) return
+        cancelRequested.add(id)
+        pauseRequested.remove(id)
         downloader.cancelCalls(id)
         val job = jobs.remove(id)
-        scope.launch {
+        val pausedCleanup = pauseCleanup.remove(id)
+        val cleanup = scope.launch {
+            // A pause may still be joining the old job and setting PAUSED.
+            // Finish that transition first, otherwise it can overwrite CANCELED.
+            pausedCleanup?.let { runCatching { it.cancelAndJoin() } }
             job?.let { runCatching { it.cancelAndJoin() } }
             chunkDirOf(id).deleteRecursively()
-            if (deleteOutput) requests[id]?.destination?.delete()
+            requests[id]?.destination?.let { destination ->
+                clearTurbodlFileIdentity(destination)
+                if (deleteOutput) destination.delete()
+            }
             requests[id]?.let { setState(id, it, TaskState.CANCELED) }
             completions[id]?.complete(Result.failure(CancellationException("canceled")))
+            cancelRequested.remove(id)
+            cancelCleanup.remove(id, coroutineContext[Job])
         }
+        cancelCleanup[id] = cleanup
+        if (cleanup.isCompleted) cancelCleanup.remove(id, cleanup)
     }
 
     /**
@@ -274,7 +467,20 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
      * 但即便误在主线程调用，也不会再截断清理链。
      */
     fun shutdown() {
+        if (!closed.compareAndSet(false, true)) return
+        eventQueue.close()
         scope.coroutineContext[Job]?.cancel()
+        // Callers may create a replacement client and reopen the same stableKey
+        // immediately. Wait for active jobs to execute their finally blocks
+        // (including stable-key lease release), but keep the wait bounded.
+        val activeJobs = jobs.values.toList()
+        runBlocking {
+            withTimeoutOrNull(5_000) {
+                activeJobs.forEach { job ->
+                    runCatching { job.cancelAndJoin() }
+                }
+            }
+        }
         // 惰性客户端可能从未创建：没创建过就没什么可关的，别在这里把它唤醒。
         streamClientRef?.let { sc ->
             runCatching { sc.dispatcher.executorService.shutdown() }
@@ -282,19 +488,73 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
         }
         runCatching { segmentClient.dispatcher.executorService.shutdown() }
         runCatching { segmentClient.connectionPool.evictAll() }
+        val cancellation = CancellationException("TurboClient 已关闭")
+        completions.values.forEach { it.complete(Result.failure(cancellation)) }
     }
 
     // ---------- 内部 ----------
 
-    private suspend fun awaitSlot(id: Long) {
-        while (coroutineContext[Job]?.isActive == true &&
-            activeCount.get() >= config.maxConcurrentTasks
-        ) {
-            delay(200)
+    private suspend fun awaitSlot() {
+        var waiter: SlotWaiter? = null
+        slotLock.withLock {
+            if (activeSlots < config.maxConcurrentTasks) {
+                activeSlots++
+            } else {
+                waiter = SlotWaiter().also { slotWaiters.addLast(it) }
+            }
+        }
+        val queued = waiter ?: return
+        try {
+            queued.deferred.await()
+        } catch (e: CancellationException) {
+            slotLock.withLock { slotWaiters.remove(queued) }
+            // The waiter may have been granted between cancellation and cleanup.
+            if (queued.granted) releaseSlot()
+            throw e
         }
     }
 
-    private suspend fun runTask(id: Long, request: DownloadRequest) {
+    /** Return a task slot and grant the oldest waiter(s) allowed by current config. */
+    private suspend fun releaseSlot() {
+        slotLock.withLock {
+            activeSlots = (activeSlots - 1).coerceAtLeast(0)
+            grantSlotsLocked()
+        }
+    }
+
+    private fun grantSlotsLocked() {
+        while (activeSlots < config.maxConcurrentTasks) {
+            val waiter = slotWaiters.pollFirst() ?: break
+            activeSlots++
+            waiter.granted = true
+            waiter.deferred.complete(Unit)
+        }
+    }
+
+    private fun retireClient(client: okhttp3.OkHttpClient) {
+        // updateConfig may run while synchronous calls are still in flight.
+        // Shutting down the dispatcher only rejects future async work; evictAll
+        // closes idle sockets, while active calls retain their own connection.
+        runCatching { client.dispatcher.executorService.shutdown() }
+        runCatching { client.connectionPool.evictAll() }
+    }
+
+    private suspend fun runTaskWithLease(id: Long, request: DownloadRequest, policy: UnverifiableResumePolicy) {
+        val lease = request.stableKey
+            ?.takeIf { it.isNotBlank() }
+            ?.let {
+                val chunkDir = chunkDirOf(id)
+                rejectAmbiguousLegacyProgress(chunkDir, it)
+                StableKeyLease.acquire(chunkDir, id)
+            }
+        try {
+            runTask(id, request, policy)
+        } finally {
+            lease?.close()
+        }
+    }
+
+    private suspend fun runTask(id: Long, request: DownloadRequest, policy: UnverifiableResumePolicy) {
         setState(id, request, TaskState.PROBING)
 
         val chunkDir = chunkDirOf(id).apply { mkdirs() }
@@ -309,8 +569,9 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
         // Backend context: bridges a DownloadBackend to the engine's progress/state/rate-limit
         // without exposing any client internals. The state machine, event emission, merging and
         // integrity checks all stay here in TurboClient.
-        val context = object : BackendContext {
+        val context = object : BackendContext, ResumePolicyContext {
             override val taskId: Long = id
+            override val unverifiableResumePolicy: UnverifiableResumePolicy = policy
             override val request: DownloadRequest = request
             override val workDir: File = chunkDir
             override val config: TurboConfig get() = this@TurboClient.config
@@ -325,6 +586,28 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
                 probeMs: Long,
                 resumeNote: String,
             ) {
+                reportResolvedMetadata(
+                    suggestedFileName,
+                    contentType,
+                    etag,
+                    lastModified,
+                    probeMs,
+                    resumeNote,
+                    null,
+                    null,
+                )
+            }
+
+            override fun reportResolvedMetadata(
+                suggestedFileName: String?,
+                contentType: String?,
+                etag: String?,
+                lastModified: String?,
+                probeMs: Long,
+                resumeNote: String,
+                resolvedUrl: String?,
+                supportsRange: Boolean?,
+            ) {
                 // 静默发一个元数据事件：宿主可选择消费（重命名/补扩展名），不消费也不影响下载。
                 emit(
                     TurboEvent.Metadata(
@@ -334,14 +617,22 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
                         etag = etag,
                         lastModified = lastModified,
                         totalBytes = totalRef.get(),
-                        supportsRange = totalRef.get() > 0,
-                        resolvedUrl = request.url,
+                        supportsRange = supportsRange ?: (totalRef.get() > 0),
+                        resolvedUrl = resolvedUrl?.takeIf { it.isNotBlank() } ?: request.url,
                         probeMs = probeMs,
                         resumeNote = resumeNote,
                     )
                 )
             }
             override suspend fun reportProgress(absoluteBytes: Long, activeConnections: Int) {
+                val currentState = progress.value[id]?.state
+                if (currentState == TaskState.COMPLETED ||
+                    currentState == TaskState.FAILED ||
+                    currentState == TaskState.CANCELED ||
+                    currentState == TaskState.PAUSED
+                ) {
+                    return
+                }
                 downloadedRef.set(absoluteBytes)
                 liveConnsRef.set(activeConnections)
                 // 进度上报节流：每次上报都要重建进度 Map + 启协程发事件，宿主侧还可能写库/刷 UI。
@@ -373,7 +664,10 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
 
         // Delegate the protocol layer to the resolved backend (built-in HTTP by default;
         // a plugin backend when the optional runtime installs a resolver).
-        val backend = backendFor(request)
+        val backend = backendFor(request, policy)
+        if (context.unverifiableResumePolicy == UnverifiableResumePolicy.FAIL && backend !is BuiltinHttpBackend) {
+            throw UnsupportedOperationException("Resume verification policy is unsupported by backend ${backend.name}")
+        }
         val result = backend.download(context)
         finish(id, request, result.orderedParts, result.totalBytes, result.partOffsets)
     }
@@ -385,7 +679,7 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
         total: Long,
         offsets: List<Long>? = null,
     ) {
-        updateProgress(id) { it.copy(state = TaskState.MERGING) }
+        setState(id, request, TaskState.MERGING)
         val dest = request.destination
         // 【预先合并命中】后端已把完整数据写进目标文件（overlap merge），
         // parts 就是目标文件本身 —— 此时**不能再合并一次**（那是把文件拷到自己身上）。
@@ -412,35 +706,102 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
         if (total > 0 && dest.length() != total) {
             throw IllegalStateException("大小校验失败：期望 $total，实际 ${dest.length()}")
         }
+        request.expectedSha256?.let { expected ->
+            val actual = withContext(Dispatchers.IO) { sha256Of(dest) }
+            if (!actual.equals(expected, ignoreCase = true)) {
+                // The bytes are complete by length but proven wrong. Drop the
+                // resume snapshot so a retry cannot reuse them as if they were
+                // valid progress.
+                clearTurbodlFileIdentity(dest)
+                chunkDirOf(id).deleteRecursively()
+                throw IllegalStateException(
+                    "SHA-256 校验失败：期望 ${expected.lowercase()}，实际 $actual",
+                )
+            }
+        }
+        clearTurbodlFileIdentity(dest)
         chunkDirOf(id).deleteRecursively()
+        setState(id, request, TaskState.COMPLETED)
         updateProgress(id) {
-            it.copy(state = TaskState.COMPLETED, downloadedBytes = dest.length(), totalBytes = dest.length())
+            it.copy(downloadedBytes = dest.length(), totalBytes = dest.length())
         }
         emit(TurboEvent.Completed(id, dest, dest.length()))
         completions[id]?.complete(Result.success(dest))
     }
 
     private fun chunkDirOf(id: Long): File {
-        val base = config.workDir ?: File(System.getProperty("java.io.tmpdir"), "turbodl")
         val req = requests[id]
+        val base = taskWorkDirs[id]
+            ?: config.workDir
+            ?: File(System.getProperty("java.io.tmpdir"), "turbodl")
         // 优先用调用方提供的稳定键（如 Room 任务 id），使同一业务任务多次 submit/resume 复用同一分片目录；
         // 为空则回退到内部自增 id（行为与旧版一致）。
-        val key = req?.stableKey?.takeIf { it.isNotBlank() }?.let { sanitizeKey(it) } ?: "task_$id"
+        val key = req?.stableKey?.takeIf { it.isNotBlank() }
+            ?.let { stableKeyDirectoryName(it) }
+            ?: "client_$unkeyedNamespace/task_$id"
         return File(base, key)
     }
 
-    /** 将稳定键规整为安全目录名（避免路径分隔符/非法字符）。 */
-    private fun sanitizeKey(raw: String): String =
-        "key_" + raw.map { if (it.isLetterOrDigit() || it == '-' || it == '_') it else '_' }.joinToString("")
+    /** Exposes the computed task directory to same-module regression tests. */
+    internal fun chunkDirForTesting(id: Long): File = chunkDirOf(id)
+
+    /** Stream the final file so checksum verification does not allocate it in memory. */
+    private fun sha256Of(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().buffered(1024 * 1024).use { input: InputStream ->
+            val buffer = ByteArray(1024 * 1024)
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    }
 
     private fun emit(event: TurboEvent) {
-        scope.launch { _events.emit(event) }
+        eventQueue.offer(event)
     }
 
     private fun setState(id: Long, request: DownloadRequest, state: TaskState) {
         updateProgress(id) { it.copy(state = state) }
         emit(TurboEvent.StateChanged(id, state))
+        if (state.isTerminal()) rememberTerminal(id)
     }
+
+    private fun rememberTerminal(id: Long) {
+        synchronized(terminalLock) {
+            if (id in resumingTasks) return
+            if (!terminalSet.add(id)) return
+            terminalIds.add(id)
+            terminalCount.incrementAndGet()
+            while (terminalCount.get() > maxRetainedTerminalTasks) {
+                val oldest = terminalIds.poll() ?: break
+                terminalCount.decrementAndGet()
+                if (oldest == id) continue
+                terminalSet.remove(oldest)
+                requests.remove(oldest)
+                resumePolicies.remove(oldest)
+                taskWorkDirs.remove(oldest)
+                completions.remove(oldest)
+                _progress.update { it - oldest }
+            }
+        }
+    }
+
+    private fun setNonTerminalState(id: Long, state: TaskState): Boolean {
+        var changed = false
+        _progress.update { progressById ->
+            val current = progressById[id]
+            changed = current != null && !current.state.isTerminal()
+            if (changed) progressById + (id to current!!.copy(state = state)) else progressById
+        }
+        if (changed) emit(TurboEvent.StateChanged(id, state))
+        return changed
+    }
+
+    private fun TaskState.isTerminal(): Boolean =
+        this == TaskState.COMPLETED || this == TaskState.FAILED || this == TaskState.CANCELED
 
     private fun updateProgress(id: Long, transform: (TaskProgress) -> TaskProgress) {
         var next: TaskProgress? = null

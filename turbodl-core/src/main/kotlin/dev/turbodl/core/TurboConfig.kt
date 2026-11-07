@@ -1,5 +1,12 @@
 package dev.turbodl.core
 
+private fun defaultUseDirectIoBuffers(): Boolean {
+    val name = System.getProperty("java.vm.name").orEmpty()
+    val vendor = System.getProperty("java.vm.vendor").orEmpty()
+    return !name.contains("Dalvik", ignoreCase = true) &&
+        !vendor.contains("Android", ignoreCase = true)
+}
+
 /**
  * TurboDL 全局引擎配置。
  *
@@ -45,6 +52,16 @@ data class TurboConfig(
     /** 同时下载的最大任务数（队列并发）。范围 1..64。 */
     val maxConcurrentTasks: Int = 3,
 
+    /**
+     * 所有任务合计的最大活动连接数；0 = 不设全局上限。
+     *
+     * [maxConnectionsPerTask] 只约束单个任务。三个任务各 64 连接时，旧实现会
+     * 同时建立 192 条连接；桌面/移动端都可能因此触发路由器和远端风控。
+     * 非 0 时，内置 HTTP 后端会在任务开始前申请一个连接预算，按实际获得的
+     * 数量运行，并在完成/暂停/失败后归还。
+     */
+    val maxTotalConnections: Int = 0,
+
     /** 全局下载速度上限（字节/秒），所有任务合计。0 = 不限速。 */
     val globalSpeedLimitBytesPerSec: Long = 0,
 
@@ -89,13 +106,12 @@ data class TurboConfig(
      * 收尾托管的最小剩余量（字节）：低于此值不拆分。
      *
      * aria2-next 用的是「剩余时间 > 请求成本 × 2」这种时间判据（更精确，但需要
-     * 每条连接的实时速率）；本引擎用字节阈值近似 —— 默认 2MB，配合默认
-     * `blockSize=16MB`，即最多拆成 8 份，且只在前几份足够大时才拆。
+     * 每条连接的实时速率）；本引擎用字节阈值近似，默认 8 KiB。
      *
      * 取值理由：一次请求的往返成本（RTT + 建连）在 WAN 上约 0.1~0.5s，
      * 若拆出来的部分只有几百 KB，新连接还没跑满就被付掉的开销吃回去了。
      */
-    val tailAssistMinBytes: Long = 2L * 1024 * 1024,
+    val tailAssistMinBytes: Long = 8L * 1024,
 
     /**
      * 单个分片最多被拆几次（防病态裂变）。
@@ -103,7 +119,7 @@ data class TurboConfig(
      * 只允许 2 次：16MB 的块最多裂成 4 段（4MB 起），足以让收尾阶段的空闲连接
      * 都有活干；再往上拆，新增请求数会超过收益，且更容易触发风控。
      */
-    val maxSplitsPerSegment: Int = 2,
+    val maxSplitsPerSegment: Int = 3,
 
     /**
      * 下载中预先合并（overlap merge）：分片一完成就写进目标文件的临时副本，
@@ -383,31 +399,62 @@ data class TurboConfig(
      */
     val warmUpConnections: Boolean = true,
 
-    /** 预热时建立的空连接数；<=0 时取 min(maxConnectionsPerTask, 8)。 */
+    /**
+     * 预热时建立的空连接数。
+     *
+     * <=0 表示自动：先取任务实际获得的连接额度，再受 [warmUpMaxParallel] 限制。
+     * 默认 [warmUpMaxParallel]=4，因此 16/64 路任务默认只预热 4 条，以免弱网下
+     * 几十个 TLS 握手互相争抢。
+     */
     val warmUpConnectionCount: Int = 0,
 
     /**
-     * 慢启动（默认开）：分片并发从少逐步上调到 [maxConnectionsPerTask]，而非一上来就全开。
+     * 慢启动（默认开）：传统慢启动的爬升开关。
      *
-     * 好处：避免瞬时几十个连接同时握手冲击服务器/被风控，也避免小文件刚开就过度建连；
-     * 与背压正交：背压负责“遇错降”，慢启动负责“健康升”。
+     * [adaptiveConcurrency] 为 DOWNWARD 时，默认直接从 [maxConnectionsPerTask] 起跑；
+     * 显式设置 [slowStartInitial] 才会从更低档开始。UPWARD 或关闭自适应时，本字段
+     * 决定是否按健康窗口逐步爬升。与背压正交：背压负责“遇错降”，慢启动负责“健康升”。
      */
     val slowStart: Boolean = true,
 
-    /** 慢启动初始并发；<=0 时取 min(maxConnectionsPerTask, 4)。 */
+    /**
+     * 慢启动/自适应初始并发；显式大于 0 时覆盖策略默认值。
+     *
+     * 为 0 时：DOWNWARD 自适应从 [maxConnectionsPerTask] 起跑；UPWARD 从保守档起跑；
+     * 关闭自适应但开启传统慢启动时使用四分之一档。只有调用方明确希望先保守起跑时，
+     * 才设置一个较小的值。
+     */
     val slowStartInitial: Int = 0,
 
     /**
-     * 基于任务总吞吐的并发收敛（默认开）。
+     * 基于任务总吞吐的并发搜索（默认开）。
      *
-     * 在慢启动档位上先测稳定窗口吞吐，再试探更高并发；只有吞吐有明确提升才接受新档。
-     * 若总吞吐进入平台期或下降，则回到最后一个有效档位，并在稳定一段时间后低频回探。
+     * 自适应默认从 [maxConnectionsPerTask] 起跑，先在用户要求的高并发下测总吞吐；
+     * 只有在多个稳定窗口证明降低并发不会明显损失吞吐时，才向下收敛。
+     * 它不会从 8 路慢慢向上爬，因此大文件不会“下一半了线程数还没上去”。
+     *
+     * worker 仍按实际目标懒启动；请求 256 路时会先启动到用户设置的并发上限，
+     * 之后自适应若向下收敛，空闲 worker 会自然 park。
+     *
+     * 默认**从用户设定的并发上限起跑**，给链路一个完整的快速窗口；只有在
+     * 多个稳定窗口证明更高并发没有收益时才下探（向下搜索），而不是从 8 路
+     * 慢慢往上试探。这样既不会让短任务卡在低线程数，也能在聚合限速时收敛。
      *
      * 不根据每连接吞吐低就降档：服务端按连接独立限速时，单连接速度本来就低，
      * 增加连接仍可能提高总吞吐。若启用了全局限速，吞吐判定会自动停用，避免把用户限速误判成服务器平台期。
      * 固定并发测量台可显式关闭此项。
      */
     val adaptiveConcurrency: Boolean = true,
+
+    /**
+     * 自适应并发的搜索方向（默认 [AdaptiveConcurrencyMode.DOWNWARD]）。
+     *
+     * 默认先以用户设置的并发上限起跑，让多线程加速立即生效；随后根据总吞吐
+     * 向下探测（在聚合限速时减小连接数节省资源）。
+     * 若需要保守从少逐步翻倍，可显式指定 [AdaptiveConcurrencyMode.UPWARD]。
+     */
+    val adaptiveConcurrencyMode: AdaptiveConcurrencyMode =
+        AdaptiveConcurrencyMode.DOWNWARD,
 
     /**
      * 预热并发度上限（默认 4）。
@@ -483,6 +530,15 @@ data class TurboConfig(
      */
     val ioBufferTotalBudgetBytes: Int = 32 * 1024 * 1024,
 
+    /**
+     * 分片读取是否使用直接内存（DirectByteBuffer）。
+     *
+     * 桌面 JVM 上，直接缓冲可以直接交给 FileChannel，少一次堆数组到本地缓冲区的
+     * 复制；Android/Dalvik 上则默认关闭，避免把 DirectByteBuffer 计入不可回收的
+     * 本地内存。总量仍受 [ioBufferTotalBudgetBytes] 约束。
+     */
+    val useDirectIoBuffers: Boolean = defaultUseDirectIoBuffers(),
+
 
     /**
      * 进度上报最小间隔（毫秒，默认 200ms）0 = 不节流。
@@ -540,6 +596,10 @@ data class TurboConfig(
      * 连续卡死重置次数上限（默认 3）。达到后任务失败，避免无限重试假活。
      * 分片已保留，用户重试即从断点继续。
      */
+    @Deprecated(
+        "现代调度器按单分片取消并由 maxRetries 收尾；任务级卡死计数已移除。",
+        level = DeprecationLevel.WARNING,
+    )
     val maxStallRecoveries: Int = 3,
 
     /**
@@ -548,9 +608,21 @@ data class TurboConfig(
      */
     val warmUpTimeoutMs: Long = 8_000,
 ) {
+    /**
+     * 实际生效的收尾托管开关。
+     *
+     * [dynamicSegmentation] 是这一能力的旧字段名；保留两者取 AND 的语义，
+     * 使旧调用方显式关闭它时仍然有效，而不是继续静默 no-op。
+     */
+    val effectiveTailAssist: Boolean
+        get() = tailAssist && dynamicSegmentation
+
     init {
         require(maxConnectionsPerTask in 1..256) { "maxConnectionsPerTask 必须在 1..256" }
         require(maxConcurrentTasks in 1..64) { "maxConcurrentTasks 必须在 1..64" }
+        require(maxTotalConnections == 0 || maxTotalConnections in 1..8192) {
+            "maxTotalConnections 必须为 0 或 1..8192"
+        }
         require(globalSpeedLimitBytesPerSec >= 0) { "globalSpeedLimitBytesPerSec 不能为负" }
         require(maxRetries in 0..50) { "maxRetries 必须在 0..50" }
         require(minSegmentSize >= 4096) { "minSegmentSize 至少 4KB" }
@@ -561,6 +633,8 @@ data class TurboConfig(
         // 实际生效值由 SegmentScheduler 的 effBlock 计算决定（见那里的注释）。
         require(segmentsPerConnection in 1..64) { "segmentsPerConnection 必须在 1..64" }
         require(maxSegmentsPerTask >= 0) { "maxSegmentsPerTask 不能为负（0 = 不限）" }
+        require(tailAssistMinBytes >= 0) { "tailAssistMinBytes 不能为负" }
+        require(maxSplitsPerSegment >= 0) { "maxSplitsPerSegment 不能为负" }
         require(maxConnectionsPerHost >= 0) { "maxConnectionsPerHost 不能为负" }
         require(warmUpConnectionCount >= 0) { "warmUpConnectionCount 不能为负" }
         require(slowStartInitial >= 0) { "slowStartInitial 不能为负" }

@@ -23,6 +23,7 @@ class ConcurrencySaturationTest {
     private class CountingServer(payload: ByteArray, chunkSleepMs: Long = 2) {
         val peak = AtomicInteger(0)
         private val current = AtomicInteger(0)
+        private val executor = Executors.newFixedThreadPool(300)
         val server: HttpServer = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         val port: Int get() = server.address.port
 
@@ -62,11 +63,14 @@ class ConcurrencySaturationTest {
                 }
             }
             // 线程池要足够大，否则是服务端而非客户端限制了并发
-            server.executor = Executors.newFixedThreadPool(300)
+            server.executor = executor
             server.start()
         }
 
-        fun stop() = server.stop(0)
+        fun stop() {
+            server.stop(0)
+            executor.shutdownNow()
+        }
     }
 
     @Test
@@ -80,6 +84,8 @@ class ConcurrencySaturationTest {
             TurboConfig(
                 maxConnectionsPerTask = connections,
                 maxConcurrentTasks = 1,
+                slowStart = false,
+                adaptiveConcurrency = false,
             )
         )
         val out = File.createTempFile("sat", ".bin").apply { deleteOnExit() }
@@ -112,7 +118,12 @@ class ConcurrencySaturationTest {
         val connections = 32
 
         val client = TurboClient(
-            TurboConfig(maxConnectionsPerTask = connections, maxConcurrentTasks = 1)
+            TurboConfig(
+                maxConnectionsPerTask = connections,
+                maxConcurrentTasks = 1,
+                slowStart = false,
+                adaptiveConcurrency = false,
+            )
         )
         val out = File.createTempFile("sat-small", ".bin").apply { deleteOnExit() }
         try {
@@ -128,5 +139,84 @@ class ConcurrencySaturationTest {
             client.shutdown()
             srv.stop()
         }
+    }
+
+    @Test
+    fun `downward adaptive starts at the user connection count`() = runBlocking {
+        val size = 16 * 1024 * 1024
+        val payload = ByteArray(size) { (it % 113).toByte() }
+        val srv = CountingServer(payload, chunkSleepMs = 8)
+        val connections = 24
+        val client = TurboClient(
+            TurboConfig(
+                maxConnectionsPerTask = connections,
+                maxConcurrentTasks = 1,
+                slowStart = true,
+                adaptiveConcurrency = true,
+                adaptiveConcurrencyMode = AdaptiveConcurrencyMode.DOWNWARD,
+                warmUpConnections = false,
+            )
+        )
+        val out = File.createTempFile("sat-down", ".bin").apply { deleteOnExit() }
+        try {
+            val id = client.submit(DownloadRequest("http://127.0.0.1:${srv.port}/f.bin", out))
+            assertTrue(client.await(id).isSuccess)
+            // The DOWNWARD policy must expose the user's concurrency immediately,
+            // not spend the first part of the transfer at an 8-connection ramp.
+            assertTrue(
+                srv.peak.get() >= connections - 1,
+                "DOWNWARD 模式应从 $connections 路起跑，实际峰值 ${srv.peak.get()}",
+            )
+        } finally {
+            client.shutdown()
+            srv.stop()
+        }
+    }
+
+    @Test
+    fun `downward learning waits for a meaningful steady-state sample`() {
+        assertTrue(
+            !SegmentScheduler.downwardLearningReady(
+                downloaded = 32L * 1024 * 1024,
+                total = 32L * 1024 * 1024,
+                elapsedMs = 10_000,
+            ),
+            "文件本身小于下探门限时不应在收尾阶段降档",
+        )
+        assertTrue(
+            !SegmentScheduler.downwardLearningReady(
+                downloaded = 128L * 1024 * 1024,
+                total = 1024L * 1024 * 1024,
+                elapsedMs = 1_999,
+            ),
+            "即使字节足够，也要经过最短稳态窗口",
+        )
+        assertTrue(
+            SegmentScheduler.downwardLearningReady(
+                downloaded = 64L * 1024 * 1024,
+                total = 1024L * 1024 * 1024,
+                elapsedMs = 2_000,
+            ),
+            "达到字节和时间门限后应允许学习",
+        )
+    }
+
+    @Test
+    fun `single-connection scheduling keeps one segment`() {
+        val workers = 1
+        val config = TurboConfig(
+            maxConnectionsPerTask = 1,
+            maxConcurrentTasks = 1,
+            segmentsPerConnection = 8,
+        )
+        assertEquals(
+            1L,
+            SegmentScheduler.targetSegmentCount(
+                workers = workers,
+                segmentsPerConnection = config.segmentsPerConnection,
+                segmentCap = Long.MAX_VALUE,
+            ),
+            "单连接不应被拆成多个串行分片；实际传输是否使用 GET 由后端选择",
+        )
     }
 }

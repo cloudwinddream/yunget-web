@@ -18,9 +18,75 @@ import kotlin.test.assertTrue
  */
 class SlowStartWarmUpTest {
 
+    @Test
+    fun `initial concurrency policy is deterministic for every host mode`() {
+        val downward = TurboConfig(
+            maxConnectionsPerTask = 64,
+            slowStart = true,
+            slowStartInitial = 0,
+            adaptiveConcurrency = true,
+            adaptiveConcurrencyMode = AdaptiveConcurrencyMode.DOWNWARD,
+        )
+        assertEquals(
+            64,
+            SegmentScheduler.initialConcurrency(downward, 64, resuming = false, adaptiveEnabled = true),
+            "DOWNWARD 默认必须从用户上限起跑",
+        )
+        assertEquals(
+            4,
+            SegmentScheduler.initialConcurrency(
+                downward.copy(slowStartInitial = 4),
+                64,
+                resuming = false,
+                adaptiveEnabled = true,
+            ),
+            "显式 slowStartInitial 必须覆盖 DOWNWARD 默认",
+        )
+
+        val upward = downward.copy(adaptiveConcurrencyMode = AdaptiveConcurrencyMode.UPWARD)
+        assertEquals(
+            8,
+            SegmentScheduler.initialConcurrency(upward, 64, resuming = false, adaptiveEnabled = true),
+            "UPWARD 默认从保守档起跑",
+        )
+
+        val legacySlowStart = downward.copy(adaptiveConcurrency = false)
+        assertEquals(
+            16,
+            SegmentScheduler.initialConcurrency(
+                legacySlowStart,
+                64,
+                resuming = false,
+                adaptiveEnabled = false,
+            ),
+            "关闭自适应时保留传统慢启动四分之一档",
+        )
+        assertEquals(
+            64,
+            SegmentScheduler.initialConcurrency(
+                legacySlowStart.copy(slowStart = false),
+                64,
+                resuming = false,
+                adaptiveEnabled = false,
+            ),
+            "关闭慢启动时直接满并发",
+        )
+        assertEquals(
+            64,
+            SegmentScheduler.initialConcurrency(
+                legacySlowStart,
+                64,
+                resuming = true,
+                adaptiveEnabled = false,
+            ),
+            "续传直接满并发",
+        )
+    }
+
     private class Server(payload: ByteArray, val chunkSleepMs: Long) {
         val peak = AtomicInteger(0)
         private val cur = AtomicInteger(0)
+        private val executor = Executors.newFixedThreadPool(300)
         /** 记录下载启动早期（前若干请求）观测到的并发，检验没有一上来就全开。 */
         val earlyPeak = AtomicInteger(0)
         private val servedReqs = AtomicInteger(0)
@@ -61,24 +127,28 @@ class SlowStartWarmUpTest {
                     cur.decrementAndGet()
                 }
             }
-            server.executor = Executors.newFixedThreadPool(300)
+            server.executor = executor
             server.start()
         }
 
-        fun stop() = server.stop(0)
+        fun stop() {
+            server.stop(0)
+            executor.shutdownNow()
+        }
     }
 
     @Test
     fun `slow start ramps up and completes byte-exact`() = runBlocking {
-        val size = 24 * 1024 * 1024
+        val size = 32 * 1024 * 1024
         val payload = ByteArray(size) { ((it * 13 + 5) % 256).toByte() }
-        val srv = Server(payload, chunkSleepMs = 8)
+        val srv = Server(payload, chunkSleepMs = 16)
         val connections = 64
         val client = TurboClient(
             TurboConfig(
                 maxConnectionsPerTask = connections,
                 maxConcurrentTasks = 1,
                 slowStart = true,
+                adaptiveConcurrency = false,
                 slowStartInitial = 4,
                 warmUpConnections = true,
             )
@@ -88,6 +158,10 @@ class SlowStartWarmUpTest {
             val id = client.submit(DownloadRequest("http://127.0.0.1:${srv.port}/f.bin", out))
             assertTrue(client.await(id).isSuccess)
             assertEquals(size.toLong(), out.length())
+            assertTrue(
+                srv.earlyPeak.get() <= 4,
+                "显式 slowStartInitial=4 时，首批请求不应直接冲到 $connections 路，实际 ${srv.earlyPeak.get()}",
+            )
             // 最终应爬升到接近设定并发（放宽到一半以上吸收抖动）
             assertTrue(srv.peak.get() >= connections / 2, "慢启动应最终爬升到接近 $connections，实际峰值 ${srv.peak.get()}")
         } finally {
@@ -98,15 +172,16 @@ class SlowStartWarmUpTest {
 
     @Test
     fun `disabling slow start opens full concurrency`() = runBlocking {
-        val size = 16 * 1024 * 1024
+        val size = 24 * 1024 * 1024
         val payload = ByteArray(size) { ((it * 3 + 1) % 256).toByte() }
-        val srv = Server(payload, chunkSleepMs = 10)
+        val srv = Server(payload, chunkSleepMs = 16)
         val connections = 48
         val client = TurboClient(
             TurboConfig(
                 maxConnectionsPerTask = connections,
                 maxConcurrentTasks = 1,
                 slowStart = false,
+                adaptiveConcurrency = false,
                 warmUpConnections = false,
             )
         )

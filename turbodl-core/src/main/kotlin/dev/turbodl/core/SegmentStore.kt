@@ -59,13 +59,27 @@ internal class SegmentStore(
      * [end] 是 `var` 而不是 `val`：收尾托管会把在飞分片的后半段让给新连接，
      * 需要就地缩短区间（[dev.turbodl.core.SegmentScheduler] 的 tryTailAssist）。
      */
-    class Piece(val start: Long, var end: Long, var written: Long = 0L) {
+    class Piece(
+        val start: Long,
+        @Volatile var end: Long,
+        @Volatile var written: Long = 0L,
+    ) {
         val length: Long get() = end - start + 1
         val complete: Boolean get() = written >= length
     }
 
     private var raf: RandomAccessFile? = null
     private var channel: FileChannel? = null
+    /** 侧车写入的串行化锁：多个下载 worker 会同时触发 persist。 */
+    private val persistLock = Any()
+    /**
+     * File length captured before `ensureLength()` extends it.
+     *
+     * Resume validation must use this snapshot, not the live length: a newly
+     * recreated empty file that was just extended to `total` would otherwise
+     * look as if it still contained the old progress.
+     */
+    private var lengthAtOpen: Long = -1L
 
     /**
      * 每个写入线程**自己的**通道。
@@ -96,6 +110,53 @@ internal class SegmentStore(
         val r = RandomAccessFile(dest, "rw")
         raf = r
         channel = r.channel
+        lengthAtOpen = r.length()
+    }
+
+    /**
+     * Ensure the destination has its final logical length before concurrent writes.
+     *
+     * Extending a file is a metadata operation that serializes inside the OS.
+     * With 128/256 positional writers, every Range that lands beyond the current
+     * EOF can contend on that same lock. Reserving the last byte once turns the
+     * transfer phase into pure positional writes and avoids repeated file-growth
+     * stalls. A one-byte positional write is used instead of `setLength(total)`
+     * because it does not force filesystems to materialize a large zero-filled
+     * allocation up front. On filesystems that implement holes the unwritten
+     * regions remain sparse; NTFS may materialize the range, so this is a
+     * deliberate one-time tradeoff rather than a promise of sparse storage.
+     */
+    fun ensureLength() {
+        ensureLengthChecked()
+    }
+
+    /**
+     * Variant used by the scheduler to learn whether the destination shrank
+     * between `loadOrCreate()` and this call. In that case the restored grid
+     * must be reloaded/discarded instead of trusting its completed pieces.
+     */
+    internal fun ensureLengthChecked(): Boolean {
+        // A caller may truncate/replace the destination after open() but before
+        // the grid is loaded. Preserve that shorter observation so ensureLength
+        // cannot turn a freshly extended hole back into a false resume hit.
+        val invalidated = lengthAtOpen >= 0 && dest.length() < lengthAtOpen
+        if (invalidated) {
+            lengthAtOpen = 0L
+        }
+        if (total <= 0) return invalidated
+        val ch = channel ?: error("SegmentStore 未 open()")
+        if (dest.length() > total) {
+            ch.truncate(total)
+        }
+        if (dest.length() >= total) return invalidated
+        val marker = ByteBuffer.wrap(byteArrayOf(0))
+        var position = total - 1
+        while (marker.hasRemaining()) {
+            val n = ch.write(marker, position)
+            if (n <= 0) throw java.io.IOException("无法预留目标文件长度：$total")
+            position += n
+        }
+        return invalidated
     }
 
     fun close() {
@@ -108,6 +169,7 @@ internal class SegmentStore(
         runCatching { raf?.close() }
         channel = null
         raf = null
+        lengthAtOpen = -1L
         // ThreadLocal 已无意义，清掉避免线程池复用时拿到已关闭的通道。
         runCatching { threadChannel.remove() }
     }
@@ -120,6 +182,25 @@ internal class SegmentStore(
      */
     fun loadOrCreate(blockSize: Long): List<Piece> {
         val existing = readState()
+        if (existing != null) {
+            when (identityStatus(existing)) {
+                IdentityStatus.MATCH -> Unit
+                IdentityStatus.UNKNOWN -> {
+                    if (existing.pieces.any { it.written > 0 } && destCovers(existing.pieces)) {
+                        throw ResumeVerificationException()
+                    }
+                    reset()
+                    return buildGrid(blockSize)
+                }
+                IdentityStatus.MISMATCH -> {
+                    // A same-length replacement is invisible to length checks.
+                    // Missing/unreadable identity is also unsafe: without proof,
+                    // old progress must never be accepted.
+                    reset()
+                    return buildGrid(blockSize)
+                }
+            }
+        }
         if (existing != null && existing.total == total && existing.pieces.isNotEmpty() &&
             destCovers(existing.pieces)
         ) {
@@ -127,8 +208,10 @@ internal class SegmentStore(
         }
         // 目标文件撑不起记录里的进度（被删过/被截断）：清空重来，绝不在空洞上续传。
         if (existing != null && !destCovers(existing.pieces)) {
-            runCatching { stateFile.delete() }
-            runCatching { dest.delete() }
+            // reset() removes the primary snapshot, backup and temp file, then
+            // closes/reopens the destination so Windows does not keep a stale
+            // handle that prevents replacement.
+            reset()
         }
         return buildGrid(blockSize)
     }
@@ -150,7 +233,13 @@ internal class SegmentStore(
         //   于是每次续传都作废 —— 那正是"暂停后从头下"最隐蔽的一种成因。
         val need = pieces.filter { it.written > 0 }
             .maxOfOrNull { it.start + it.written } ?: return true
-        return dest.length() >= need
+        // Use the length observed at open time. `ensureLength()` may run before
+        // `peek/loadOrCreate` and must not turn a deleted/recreated file into a
+        // false-positive resume candidate.
+        val available =
+            if (lengthAtOpen >= 0) minOf(lengthAtOpen, dest.length())
+            else dest.length()
+        return available >= need
     }
 
     /**
@@ -160,9 +249,38 @@ internal class SegmentStore(
      */
     fun peek(expectedTotal: Long): List<Piece>? {
         val st = readState() ?: return null
+        if (identityStatus(st) != IdentityStatus.MATCH) return null
         if (st.total != expectedTotal || st.pieces.isEmpty()) return null
         if (!destCovers(st.pieces)) return null
         return st.pieces
+    }
+
+    internal fun hasRecordedBytes(): Boolean? =
+        readState()?.pieces?.any { it.written > 0 }
+
+    /** Existing bytes without a usable identity; callers must verify before adopting. */
+    internal fun unverifiedLegacyPieces(expectedTotal: Long): List<Piece>? {
+        val state = readState() ?: return null
+        if (state.embeddedIdentity != null || state.total != expectedTotal ||
+            state.pieces.none { it.written > 0 } || !destCovers(state.pieces) ||
+            identityStatus(state) != IdentityStatus.UNKNOWN) return null
+        return state.pieces
+    }
+
+    internal fun identityForMigration(): String? = currentFileIdentity(createIfMissing = true)
+
+    internal fun adoptVerifiedLegacyPieces(pieces: List<Piece>, identity: String) {
+        if (currentFileIdentity() != identity) throw ResumeVerificationException()
+        persist(pieces)
+        if (currentFileIdentity() != identity || peek(total) == null) throw ResumeVerificationException()
+    }
+
+    internal fun requireKnownProgressIdentity() {
+        val state = readState() ?: return
+        if (state.pieces.any { it.written > 0 } && destCovers(state.pieces) &&
+            identityStatus(state) == IdentityStatus.UNKNOWN) {
+            throw ResumeVerificationException()
+        }
     }
 
     /** 按固定块大小切网格（最后一片可能更短）。 */
@@ -204,6 +322,28 @@ internal class SegmentStore(
         return written
     }
 
+    /**
+     * 直接缓冲版本的位置写。
+     *
+     * FileChannel 对 DirectByteBuffer 可以直接交给操作系统，避免堆数组再次
+     * 复制到本地缓冲；调用方负责在每次读取前 clear。
+     */
+    fun writeBufferAt(position: Long, src: ByteBuffer): Int {
+        val ch = threadChannel.get()
+        var written = 0
+        while (src.hasRemaining()) {
+            val n = ch.write(src, position + written)
+            if (n <= 0) {
+                throw java.io.IOException(
+                    "直接缓冲写入失败（偏移 ${position + written}，" +
+                        "还剩 ${src.remaining()} 字节）",
+                )
+            }
+            written += n
+        }
+        return written
+    }
+
     /** 从目标文件的 [position] 读最多 [len] 字节（用于续传前的内容指纹比对）。 */
     fun readAt(position: Long, len: Int): ByteArray {
         val ch = channel ?: error("SegmentStore 未 open()")
@@ -220,47 +360,225 @@ internal class SegmentStore(
 
     /** 落盘进度记录（原子替换：先写临时文件再改名）。 */
     fun persist(pieces: List<Piece>) {
+        // 【必须串行】persist 会被多个下载 worker 同时调用（persistProgress 里的
+        // lastPersistAt 是普通变量，多个线程可以同时通过节流检查）。两个 writer 会
+        // 互相 setLength(0)、交错写头与分片记录，并竞争同一个 .tmp / .bak 的改名 ——
+        // 轻则丢断点，重则生成"可解析但混合了两个时刻"的快照。
+        synchronized(persistLock) {
+        val snapshot = canonicalSnapshot(pieces) ?: return
+        val identity = currentFileIdentity(createIfMissing = true) ?: return
         runCatching {
+            // A checkpoint must never become durable before the bytes it
+            // claims. Flush the destination data first, then fsync the sidecar
+            // temp file and atomically publish it. Without this order, sudden
+            // power loss can leave a sidecar claiming ranges that are still
+            // only page-cache writes.
+            channel?.force(false)
             val tmp = File(stateFile.parentFile, stateFile.name + ".tmp")
             stateFile.parentFile?.mkdirs()
             RandomAccessFile(tmp, "rw").use { f ->
                 f.setLength(0)
                 f.write(MAGIC)
                 f.writeInt(VERSION)
+                val identityBytes = identity.toByteArray(Charsets.UTF_8)
+                f.writeInt(identityBytes.size)
+                f.write(identityBytes)
                 f.writeLong(total)
-                f.writeInt(pieces.size)
-                for (p in pieces) {
+                f.writeInt(snapshot.size)
+                for (p in snapshot) {
                     f.writeLong(p.start)
                     f.writeLong(p.end)
                     f.writeLong(p.written)
                 }
+                // Make the new sidecar durable before replacing the old one.
+                f.fd.sync()
             }
-            // Windows 下目标存在时不可直接 rename 覆盖：先删再改名。
-            if (stateFile.exists()) runCatching { stateFile.delete() }
+            // Keep the last durable snapshot until the new one is visible.
+            // File.renameTo avoids java.nio.file (unavailable on Android 24/25).
+            val backup = File(stateFile.parentFile, stateFile.name + ".bak")
+            runCatching { backup.delete() }
+            if (stateFile.exists()) {
+                if (!stateFile.renameTo(backup)) {
+                    stateFile.copyTo(backup, overwrite = true)
+                    stateFile.delete()
+                }
+            }
             if (!tmp.renameTo(stateFile)) {
-                // 改名失败（跨卷/占用）：退回直接写，宁可慢也不能丢进度。
                 tmp.copyTo(stateFile, overwrite = true)
                 tmp.delete()
             }
+            runCatching { backup.delete() }
         }
+        }
+    }
+
+    /**
+     * Copy the live grid into an immutable, ordered snapshot.
+     *
+     * Dynamic splitting can append a tail after earlier grid entries, and a
+     * concurrent persist can observe the brief interval where the old piece
+     * has been shortened but its tail has not been appended yet. Rejecting an
+     * incomplete snapshot keeps the last durable resume point intact.
+     */
+    private fun canonicalSnapshot(pieces: List<Piece>): List<Piece>? {
+        val snapshot = ArrayList<Piece>(pieces.size)
+        for (piece in pieces) {
+            val start = piece.start
+            val end = piece.end
+            val written = piece.written
+            if (start < 0 || end < start || written < 0 || written > end - start + 1) {
+                return null
+            }
+            snapshot.add(Piece(start, end, written))
+        }
+        snapshot.sortBy { it.start }
+
+        if (total == 0L) return snapshot.takeIf { it.isEmpty() }
+        if (snapshot.isEmpty()) return null
+        var expectedStart = 0L
+        for (piece in snapshot) {
+            if (piece.start != expectedStart) return null
+            expectedStart = piece.end + 1
+        }
+        return snapshot.takeIf { expectedStart == total }
     }
 
     /** 清掉进度记录与目标文件（内容已变、无法安全续传时）。 */
     fun reset() {
-        runCatching { stateFile.delete() }
+        // Close destination handles before trying to delete on Windows. Keep
+        // sidecars intact until the destination deletion is known to succeed,
+        // otherwise a permission/lock failure would destroy the only recovery
+        // metadata while leaving the old file in place.
         close()
-        runCatching { dest.delete() }
+        if (dest.exists() && !dest.delete()) {
+            throw java.io.IOException(
+                "无法丢弃失效的目标文件：${dest.absolutePath}",
+            )
+        }
+        synchronized(persistLock) {
+            // 【三件一起删】readState 会自动回退到 .bak：只删主文件的话，
+            // 明确丢弃旧进度之后仍然可能把旧备份读回来，等于没重置。
+            listOf(
+                stateFile,
+                File(stateFile.parentFile, stateFile.name + ".bak"),
+                File(stateFile.parentFile, stateFile.name + ".tmp"),
+                identityFile(),
+                File(identityFile().parentFile, identityFile().name + ".tmp"),
+            ).forEach { file ->
+                if (file.exists() && !file.delete()) {
+                    throw java.io.IOException(
+                        "无法删除失效的进度侧车：${file.absolutePath}",
+                    )
+                }
+            }
+        }
         open()
     }
 
-    private class Loaded(val total: Long, val pieces: List<Piece>)
+    private enum class IdentityStatus { MATCH, MISMATCH, UNKNOWN }
 
-    private fun readState(): Loaded? = runCatching {
-        if (!stateFile.isFile) return@runCatching null
-        RandomAccessFile(stateFile, "r").use { f ->
+    private class Loaded(
+        val total: Long,
+        val pieces: List<Piece>,
+        val embeddedIdentity: String?,
+    )
+
+    private fun identityFile(): File =
+        File(stateFile.parentFile, stateFile.name + ".identity")
+
+    private fun currentFileIdentity(createIfMissing: Boolean = false): String? = runCatching {
+        // Android API 24/25 does not expose java.nio.file.Files. Its public
+        // android.system.Os.stat API provides the filesystem device and inode.
+        val vm = System.getProperty("java.vm.name").orEmpty()
+        if (vm.contains("Dalvik", ignoreCase = true) || vm.contains("ART", ignoreCase = true)) {
+            val os = Class.forName("android.system.Os")
+            val stat = os.getMethod("stat", String::class.java).invoke(null, dest.absolutePath)
+            val dev = stat.javaClass.getField("st_dev").getLong(stat)
+            val ino = stat.javaClass.getField("st_ino").getLong(stat)
+            return@runCatching if (ino != 0L) "android-inode:$dev:$ino" else null
+        }
+        val attrs = java.nio.file.Files.readAttributes(
+            dest.toPath(),
+            java.nio.file.attribute.BasicFileAttributes::class.java,
+        )
+        val created = attrs.creationTime().toMillis()
+        val key = attrs.fileKey()?.toString()?.takeIf { it.isNotBlank() }
+        if (key != null) return@runCatching "$key|$created"
+        if (!System.getProperty("os.name").startsWith("Windows", ignoreCase = true)) {
+            return@runCatching null
+        }
+
+        // Windows' default FileSystemProvider returns fileKey=null. Use an NTFS
+        // alternate data stream as a persistent token for this destination.
+        val ads = File(dest.absolutePath + ":turbodl.id")
+        val existing = runCatching {
+            RandomAccessFile(ads, "r").use { handle ->
+                val length = handle.length().coerceAtMost(128).toInt()
+                val bytes = ByteArray(length)
+                handle.readFully(bytes)
+                String(bytes, Charsets.UTF_8).trim()
+            }
+        }.getOrNull()
+        if (!existing.isNullOrEmpty()) return@runCatching "ads:$existing"
+        if (!createIfMissing) return@runCatching "ads-absent"
+
+        val token = java.util.UUID.randomUUID().toString()
+        RandomAccessFile(ads, "rw").use { handle ->
+            handle.setLength(0)
+            handle.write(token.toByteArray(Charsets.UTF_8))
+            handle.fd.sync()
+        }
+        "ads:$token"
+    }.getOrNull()
+
+    private fun identityStatus(state: Loaded): IdentityStatus {
+        val current = currentFileIdentity() ?: return IdentityStatus.UNKNOWN
+        val embedded = state.embeddedIdentity
+        if (embedded != null) {
+            return if (embedded == current) {
+                IdentityStatus.MATCH
+            } else {
+                IdentityStatus.MISMATCH
+            }
+        }
+
+        // Version 1 snapshots stored identity in a separate file. If that file
+        // is missing/unreadable, the state cannot prove which destination it
+        // belongs to; refuse to resume instead of silently accepting it.
+        val stored = runCatching {
+            identityFile().takeIf { it.isFile }?.readText()?.trim()
+        }.getOrNull()
+        if (stored.isNullOrEmpty() || !stored.startsWith("v1:")) {
+            return IdentityStatus.UNKNOWN
+        }
+        return if (stored == "v1:$current") {
+            IdentityStatus.MATCH
+        } else {
+            IdentityStatus.MISMATCH
+        }
+    }
+
+    private fun readState(): Loaded? =
+        readStateFile(stateFile)
+            ?: readStateFile(File(stateFile.parentFile, stateFile.name + ".bak"))
+
+    private fun readStateFile(source: File): Loaded? = runCatching {
+        if (!source.isFile) return@runCatching null
+        RandomAccessFile(source, "r").use { f ->
             val magic = ByteArray(MAGIC.size)
             if (f.read(magic) != magic.size || !magic.contentEquals(MAGIC)) return@runCatching null
-            if (f.readInt() != VERSION) return@runCatching null
+            val version = f.readInt()
+            if (version !in 1..VERSION) return@runCatching null
+            val embeddedIdentity = if (version >= 2) {
+                val identityLength = f.readInt()
+                if (identityLength !in 1..MAX_IDENTITY_BYTES) return@runCatching null
+                val bytes = ByteArray(identityLength)
+                f.readFully(bytes)
+                String(bytes, Charsets.UTF_8).takeIf { it.isNotBlank() }
+                    ?: return@runCatching null
+            } else {
+                null
+            }
             val totalRead = f.readLong()
             val count = f.readInt()
             // 防御：损坏的计数不该导致巨额分配。
@@ -270,18 +588,44 @@ internal class SegmentStore(
                 val s = f.readLong()
                 val e = f.readLong()
                 val w = f.readLong()
-                if (s < 0 || e < s || w < 0) return@runCatching null
-                list.add(Piece(s, e, w.coerceAtMost(e - s + 1)))
+                if (s < 0 || e < s || w < 0 || w > e - s + 1) {
+                    return@runCatching null
+                }
+                list.add(Piece(s, e, w))
             }
-            Loaded(totalRead, list)
+            // 【整网格校验】只检查单条区间不够：一个损坏但可解析的快照可以声明
+            // "整文件已完成"，实际留下零/旧数据，而长度校验照样通过。
+            // 要求：有序、无重叠、无空洞、完整覆盖 [0, total)。
+            if (totalRead > 0 && list.isNotEmpty()) {
+                var expectedStart = 0L
+                for (p in list) {
+                    if (p.start != expectedStart) return@runCatching null
+                    expectedStart = p.end + 1
+                }
+                if (expectedStart != totalRead) return@runCatching null
+            }
+            Loaded(totalRead, list, embeddedIdentity)
         }
     }.getOrNull()
 
     private companion object {
         val MAGIC = byteArrayOf('T'.code.toByte(), 'D'.code.toByte(), 'L'.code.toByte(), 'P'.code.toByte())
-        const val VERSION = 1
+        const val VERSION = 2
+        const val MAX_IDENTITY_BYTES = 512
 
         /** 网格上限：正常文件几千片足够；超过这个数说明记录已损坏。 */
         const val MAX_PIECES = 2_000_000
     }
+}
+
+/**
+ * Remove the Windows-only persistent identity token when a task reaches a
+ * terminal state. The sidecar itself is deleted with the chunk directory; the
+ * ADS lives on the destination and must be cleaned separately.
+ */
+internal fun clearTurbodlFileIdentity(destination: File) {
+    if (!System.getProperty("os.name").startsWith("Windows", ignoreCase = true)) {
+        return
+    }
+    runCatching { File(destination.absolutePath + ":turbodl.id").delete() }
 }
