@@ -62,6 +62,16 @@ data class DownloadSubmitRequest(
 )
 
 @Serializable
+data class DownloadSubmitResponse(
+    /** 全部相关任务（新入队 + 认领续下），兼容既有前端读法 */
+    val taskIds: List<Long>,
+    /** 本次新入队的任务数 */
+    val newCount: Int,
+    /** 本次命中并原地换链续下的存量未完成任务数 */
+    val claimedCount: Int
+)
+
+@Serializable
 data class ExpandRequest(val sessionId: String, val files: List<FileItem>)
 
 @Serializable
@@ -126,7 +136,9 @@ data class TaskInfo(
     val batchName: String = "",
     val relPath: String = "",
     // 排队优先级（-1 低 / 0 普通 / 1 高）
-    val priority: Int = 0
+    val priority: Int = 0,
+    // 是否可「刷新链接并继续」（任务存有来源说明书或可由 resumeKey 反推来源）
+    val canRefresh: Boolean = false
 )
 
 @Serializable

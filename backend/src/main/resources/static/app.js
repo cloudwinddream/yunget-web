@@ -462,14 +462,23 @@ async function downloadSelected() {
       btn.textContent = '取链中…（每个文件需转存+取直链，请耐心等）';
       const r = await api('/api/downloads', 'POST', { sessionId: curSession, expandId: ex.data.expandId });
       if (!r.ok) { showMsg('dlMsg', r.message || '提交失败', false); return; }
-      showMsg('dlMsg', `已加入 ${r.data.taskIds.length} 个下载任务，可到「下载任务」页查看进度`, true);
+      showMsg('dlMsg', downloadSubmitMsg(r.data), true);
     } else {
       btn.textContent = '取链中…（每个文件需转存+取直链）';
       const r = await api('/api/downloads', 'POST', { sessionId: curSession, files: items });
       if (!r.ok) { showMsg('dlMsg', r.message || '提交失败', false); return; }
-      showMsg('dlMsg', `已加入 ${r.data.taskIds.length} 个下载任务，可到「下载任务」页查看进度`, true);
+      showMsg('dlMsg', downloadSubmitMsg(r.data), true);
     }
   } finally { btn.disabled = false; btn.textContent = '下载选中'; }
+}
+/** 提交下载的完成文案：区分「新入队 N 个」与「认领续下 M 个存量未完成任务」 */
+function downloadSubmitMsg(data) {
+  const claimed = data.claimedCount || 0;
+  const fresh = data.newCount != null ? data.newCount : (data.taskIds || []).length;
+  if (claimed > 0) {
+    return `已加入 ${fresh} 个新下载任务；另有 ${claimed} 个未完成任务命中同一文件，已换新链接原地续下（进度保留）。可到「下载任务」页查看进度`;
+  }
+  return `已加入 ${(data.taskIds || []).length} 个下载任务，可到「下载任务」页查看进度`;
 }
 async function directDownload() {
   const url = document.getElementById('directUrl').value.trim();
@@ -497,6 +506,7 @@ function renderTask(t) {
   let actions = '';
   if (t.status === 'downloading' || t.status === 'queued' || t.status === 'retry_wait') actions += `<button class="ghost small" onclick="taskOp(${t.id},'pause')">暂停</button>`;
   if (t.status === 'paused' || t.status === 'failed' || t.status === 'retry_wait') actions += `<button class="ghost small" onclick="taskOp(${t.id},'resume')">继续</button>`;
+  if ((t.status === 'failed' || t.status === 'paused' || t.status === 'retry_wait') && t.canRefresh) actions += `<button class="ghost small" onclick="taskRefresh(${t.id})" title="链接过期时凭来源重新取一条新链，已下进度保留、接着下">刷新链接并继续</button>`;
   actions += `<button class="danger small" onclick="taskDel(${t.id})">删除</button>`;
   if (t.status === 'completed') actions += `<button class="danger small" onclick="taskDelFile(${t.id})">删除任务＋文件</button>`;
   if (t.status !== 'completed') {
@@ -687,6 +697,13 @@ async function delSelected(withFile) {
   loadTasks();
 }
 async function taskOp(id, op) { await api(`/api/tasks/${id}/${op}`, 'POST'); loadTasks(); }
+async function taskRefresh(id) {
+  showMsg('taskMsg', '正在重新获取链接…', true);
+  const r = await api(`/api/tasks/${id}/refresh-resume`, 'POST');
+  if (r.ok) showMsg('taskMsg', '已换上新链接，继续下载（已下进度保留）', true);
+  else showMsg('taskMsg', r.message || '刷新链接失败', false);
+  loadTasks();
+}
 async function taskPriority(id, p) {
   const r = await api(`/api/tasks/${id}/priority`, 'POST', { priority: p });
   if (!r.ok) { showMsg('taskMsg', r.message || '设置优先级失败', false); return; }

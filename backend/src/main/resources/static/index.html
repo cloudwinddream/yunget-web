@@ -10,7 +10,7 @@
 <header>
   <h1>☁️ YunGet 网页版</h1>
   <span class="sub">网盘分享解析 · 高速下载 · 夸克 / UC / 迅雷 / 百度 / 123 / 139 / 蓝奏 / 优享 / 光鸭 / 115 · 视频解析 / GitHub / 磁力</span>
-  <button class="ver" onclick="showChangelog()" title="查看更新日志">v1.0.47</button>
+  <button class="ver" onclick="showChangelog()" title="查看更新日志">v1.0.48</button>
 </header>
 <nav class="tabs">
   <button class="active" data-tab="parse">解析下载</button>
@@ -507,8 +507,9 @@
   <!-- 更新日志弹窗 -->
   <div class="modal" id="logModal" style="display:none">
     <div class="modal-box log-box">
-      <h3>📋 更新日志 <span class="hint">当前版本 v1.0.47</span></h3>
+      <h3>📋 更新日志 <span class="hint">当前版本 v1.0.48</span></h3>
       <div class="changelog">
+        <div class="cl-item"><span class="cl-ver">v1.0.48</span><span class="cl-txt">大文件链接失效可续下了：任务入队时会存一份「来源说明书」，链接过期后点任务上的「刷新链接并继续」即可换一条新链接、保留已下进度原地续下（换链前核对文件大小，变了会拒绝防续错）；个人盘的老任务无需重建直接可用；分享的老任务重新粘贴同一分享解析一次，老任务会被认领换链续下而不是新建；任务因链接失效类错误（401/403/410）失败时会自动刷新链接重试（最多 3 次、间隔递增，下载有明显进展会自动重置次数）；视频/YouTube 分轨任务整组一起换链</span></div>
         <div class="cl-item"><span class="cl-ver">v1.0.47</span><span class="cl-txt">删除安全大修（防误删整批下载）：新增回收站——删除任务时文件先移入下载目录的 .yunget-trash 保留 7 天，设置页可恢复/彻底删除，过期自动清理；每个已完成任务新增「删除任务＋文件」直达按钮；「删批次（任务＋文件）」改为强确认弹窗（列明文件数与总大小、需勾选确认）；批量删文件超过 10 个后端强制要求强确认标记；所有删除入口补齐确认；删文件前校验路径必须在下载目录内，异常路径只删记录不动文件</span></div>
         <div class="cl-item"><span class="cl-ver">v1.0.46</span><span class="cl-txt">下载引擎大升级（TurboDL 0.2.7.0 → 0.5.0.0）：重点修复三个可能静默损坏文件的缺陷（续传混编、回退残留、断点快照混乱）并新增断点身份自校验——升级后未下完的任务会先核验断点再续传，个别任务可能从头下载，已完成文件不受影响。行为变化两点：连接改为开局按设置全开再自动收敛（不再慢爬升）；全局限速改为全任务共享一份（数值自此名副其实，按旧体感设过的话请重新感受）。另含新版调度、限流处理与稳定性修复一批</span></div>
         <div class="cl-item"><span class="cl-ver">v1.0.45</span><span class="cl-txt">同步上游修复（蓝奏 / 光鸭）：蓝奏新增 lanzn.com 域名识别（这类链接之前会被判不支持）；蓝奏新版带密码分享页可正确识别；光鸭分享目录超过 100 项可完整翻页（之前只出第一页）；光鸭分享令牌改为每次取链时刷新（长时浏览不再被判受限）；另修光鸭个别接口数据读空与账号请求头加固</span></div>

@@ -16,6 +16,7 @@ import com.yunget.web.model.DirListResponse
 import com.yunget.web.model.QrStatusResponse
 import com.yunget.web.model.DirectDownloadRequest
 import com.yunget.web.model.DownloadSubmitRequest
+import com.yunget.web.model.DownloadSubmitResponse
 import com.yunget.web.model.ExpandRequest
 import com.yunget.web.model.FavoriteRequest
 import com.yunget.web.model.FileItem
@@ -428,7 +429,7 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
         post("/downloads") {
             try {
                 val req = call.receive<DownloadSubmitRequest>()
-                val ids = if (req.expandId.isNotBlank()) {
+                val r = if (req.expandId.isNotBlank()) {
                     netdisk.resolveAndEnqueueExpanded(req.expandId)
                 } else {
                     if (req.files.isEmpty()) {
@@ -437,7 +438,16 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
                     }
                     netdisk.resolveAndEnqueue(req.sessionId, req.files)
                 }
-                call.respond(ok(mapOf("taskIds" to ids)))
+                // claimedCount：本次解析命中并原地换链续下的存量未完成任务数（前端文案区分展示）
+                call.respond(
+                    ok(
+                        DownloadSubmitResponse(
+                            taskIds = r.allTaskIds,
+                            newCount = r.newTaskIds.size,
+                            claimedCount = r.claimedTaskIds.size
+                        )
+                    )
+                )
             } catch (e: Exception) {
                 call.respond(fail(e.message ?: "提交下载失败"))
             }
@@ -478,6 +488,18 @@ fun Route.apiRoutes(netdisk: NetdiskService, downloads: DownloadService, gopeed:
                 ?: return@post call.respond(fail("任务不存在"))
             downloads.resume(id)
             call.respond(ok(mapOf("done" to true)))
+        }
+
+        /** 刷新链接并继续：链接过期的大文件凭来源说明书重新取链、原地换链续下（分片与进度保留） */
+        post("/tasks/{id}/refresh-resume") {
+            val id = call.parameters["id"]?.toLongOrNull()
+                ?: return@post call.respond(fail("任务不存在"))
+            try {
+                downloads.refreshAndResume(id, manual = true)
+                call.respond(ok(mapOf("done" to true)))
+            } catch (e: Exception) {
+                call.respond(fail(e.message ?: "刷新链接失败"))
+            }
         }
 
         post("/tasks/{id}/priority") {

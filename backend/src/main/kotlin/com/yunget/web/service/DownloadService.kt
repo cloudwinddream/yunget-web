@@ -39,7 +39,8 @@ data class TaskRecord(
     val createdAt: Long = System.currentTimeMillis(),
     // 来源网盘 id（quark/uc/xunlei/baidu/pan123/c139），用于分网盘连接数；空=全局设置
     val platform: String = "",
-    // 来源文件稳定键（platform+fid+size）：分片目录按它命名，删任务重下同文件也能续传；空=按任务 id
+    // 来源文件稳定键（platform+fid+size）：引擎分片目录按它命名，同一任务换链续下靠它命中旧分片；
+    // 注意删任务会连该键的分片目录与本任务的 .part 一并清掉，删除后重新下载无法找回已下字节；空=按任务 id
     val resumeKey: String = "",
     // 已自动重试次数（失败后退避续传；有明显进度推进会清零）
     val autoRetry: Int = 0,
@@ -49,8 +50,34 @@ data class TaskRecord(
     val relPath: String = "",
     // 排队优先级（-1 低 / 0 普通 / 1 高）：只影响同网盘排队放行顺序，不抢占运行中任务；
     // 旧 tasks.json 无此字段时靠默认值 0 自动兼容
-    val priority: Int = 0
+    val priority: Int = 0,
+    // 来源说明书（SourceRef 编码）：链接失效后凭它重新取链原地换上续下；空=不可刷新
+    // （旧 tasks.json 无此字段靠默认值兼容；存量网盘任务可由 resumeKey 反推个人盘来源）
+    val sourceRef: String = "",
+    // 链接分组：同一次解析产出的多条任务（如 DASH 双轨、YouTube 视频+字幕）共享一个组 id，
+    // 刷新时整组从同一次重解析结果一起换链；空=独立任务
+    val linkGroup: String = "",
+    // 已自动刷新链接次数（与 autoRetry 分开记账；手动刷新链接会清零）
+    val autoRefreshCount: Int = 0
 )
+
+/** 重新取到的新链接（换链续下用）：url/headers 必须整套替换；size>0 时与任务记录 total 核对防续错文件 */
+data class FreshLink(
+    val url: String,
+    val headers: Map<String, String>,
+    val size: Long = -1,
+    /** 取链方回填的来源说明书（存量任务首次刷新时补写来源）；null=沿用记录里已有的 */
+    val sourceRef: String? = null
+)
+
+/**
+ * 换链取链方（接缝）：由 Main 装配、按 sourceRef 分发到各来源服务
+ * （NetdiskService / VideoService / YouTubeService）。入参为触发任务（sourceRef 已由
+ * DownloadService 补齐为有效值）与同 linkGroup 的可刷新成员（含触发任务自身）；
+ * 返回 taskId → 新链接（须覆盖全部成员，缺一视为失败）；无法取链抛异常（文案透传给用户）。
+ * 测试时可注入替身，不必真跑网络。
+ */
+typealias LinkRefreshProvider = suspend (TaskRecord, List<TaskRecord>) -> Map<Long, FreshLink>?
 
 /**
  * 下载服务：TurboDL 引擎的 Web 封装。
@@ -83,6 +110,12 @@ class DownloadService(dataDir: File) {
     // 失败自动重试：待执行的重试 Job + 失败时的进度基线（进度推进足够多则重置重试计数）
     private val retryJobs = ConcurrentHashMap<Long, kotlinx.coroutines.Job>()
     private val retryBaseline = ConcurrentHashMap<Long, Long>()
+    // 链接失效后的自动刷新：待执行的刷新 Job（与 retryJobs 分开，互不覆盖）
+    private val autoRefreshJobs = ConcurrentHashMap<Long, kotlinx.coroutines.Job>()
+
+    /** 换链取链方（Main 装配；为空时刷新链接功能不可用，refreshAndResume 给出可读报错） */
+    @Volatile
+    var refreshProvider: LinkRefreshProvider? = null
 
     // 正在启动中的任务（startInternal 已登记、协程尚未结束）：防双开守卫 + 优先级闸门的「等待者」判定依据。
     // 必须声明在 init 之前：init 的重启接管会同步调用 startInternal 并 add 本集合，
@@ -257,6 +290,20 @@ class DownloadService(dataDir: File) {
         const val TRASH_RETENTION_MS = TRASH_RETENTION_DAYS * 86_400_000L
         /** 到期清理轮询间隔（启动一轮＋每 24 小时一轮） */
         const val TRASH_SWEEP_INTERVAL_MS = 24L * 3600 * 1000
+
+        /** 可换链续下的任务状态（手动刷新与存量认领共用；completed/下载中不在内） */
+        val REFRESHABLE_STATES = setOf("failed", "paused", "retry_wait", "queued")
+        /** 自动刷新链接的次数上限（与 autoRetry 分开记账，手动刷新清零） */
+        const val MAX_AUTO_REFRESH = 3
+        /** 自动刷新最小间隔：5 分钟；第 n 次在此基础上再叠加 (n-1) 个 5 分钟 */
+        const val AUTO_REFRESH_BASE_MS = 5L * 60 * 1000
+
+        /**
+         * 自动刷新是否该接管这次失败（纯函数，供单测）：任务可刷新、失败像链接失效、
+         * 且自动刷新次数未封顶，三者同时成立才接管；接管后不再并行走原死链重试。
+         */
+        fun autoRefreshEligible(refreshable: Boolean, autoRefreshCount: Int, reason: String): Boolean =
+            refreshable && autoRefreshCount < MAX_AUTO_REFRESH && isLinkExpiryFailure(reason)
     }
 
     /** 恢复默认设置：回到 SettingsData() 初始值（各网盘连接数 32、迅雷固定 8 等）；
@@ -297,6 +344,8 @@ class DownloadService(dataDir: File) {
         batchId: String = "",
         batchName: String = "",
         relPath: String = "",
+        sourceRef: String = "",
+        linkGroup: String = "",
         onComplete: (suspend () -> Unit)? = null
     ): Long {
         val safeName = sanitizeFileName(
@@ -309,7 +358,8 @@ class DownloadService(dataDir: File) {
         tasks[id] = TaskRecord(
             id = id, fileName = safeName, url = url, headers = headers, total = size,
             platform = platform, resumeKey = resumeKey,
-            batchId = batchId, batchName = batchName, relPath = relPath
+            batchId = batchId, batchName = batchName, relPath = relPath,
+            sourceRef = sourceRef, linkGroup = linkGroup
         )
         if (headers.isNotEmpty()) headersCache[id] = headers
         if (onComplete != null) callbacks[id] = onComplete
@@ -369,6 +419,7 @@ class DownloadService(dataDir: File) {
 
     fun pause(id: Long) {
         cancelRetry(id)
+        cancelAutoRefresh(id)
         val turboId = turboIds.remove(id)
         if (turboId != null) turboToTask.remove(turboId)
         speeds.remove(id); etas.remove(id)
@@ -389,9 +440,164 @@ class DownloadService(dataDir: File) {
         if (t.status == "downloading" || t.status == "merging") return
         if (t.status == "queued" && starting.contains(id)) return
         cancelRetry(id)
+        cancelAutoRefresh(id)
         // 手动继续：重试计数清零，给自动重试重新留额度
         tasks[id] = t.copy(autoRetry = 0)
         startInternal(id)
+    }
+
+    /** 注册/替换任务的完成回调（换链续下时新链接若带临时转存清理目录，需按新链接重登记） */
+    fun registerOnComplete(id: Long, cb: suspend () -> Unit) {
+        callbacks[id] = cb
+    }
+
+    // ---------- 换链续下（刷新链接并继续） ----------
+
+    /** 任务是否具备刷新链接的来源：有 sourceRef，或存量网盘任务可由 resumeKey 反推个人盘来源 */
+    fun canRefresh(t: TaskRecord): Boolean =
+        SourceRef.parse(t.sourceRef) != null ||
+            SourceRef.parseLegacyDriveResumeKey(t.resumeKey) != null
+
+    /**
+     * 刷新链接并继续：按来源重新取一条新链，原地替换任务的 url/headers 后重新启动。
+     * resumeKey / 分片目录 / .part / 已下进度一律不动，引擎靠 stableKey 命中旧分片续下。
+     * 同 linkGroup 的成员（DASH 双轨等）由取链方从同一次重解析结果一起换链。
+     * 失败一律抛异常（文案直接透传给用户），任务记录保持原样。
+     * @param manual true=用户手动点击（成功后自动刷新计数清零）；false=自动刷新调度触发
+     */
+    suspend fun refreshAndResume(id: Long, manual: Boolean = true) {
+        val t = tasks[id] ?: throw IllegalArgumentException("任务不存在")
+        if (t.status !in REFRESHABLE_STATES) {
+            throw IllegalStateException("任务当前状态不能刷新链接（仅失败/已暂停/等待重试/排队中的任务可以）")
+        }
+        // 有效来源：优先记录里的 sourceRef；存量任务按 resumeKey 反推个人盘来源
+        var backfilled: String? = null
+        val parsed = SourceRef.parse(t.sourceRef) ?: run {
+            val legacy = SourceRef.parseLegacyDriveResumeKey(t.resumeKey)
+                ?: throw IllegalStateException(
+                    "该任务没有记录来源信息，无法刷新链接（多为旧版本创建的非网盘任务），请重新解析后下载"
+                )
+            if (legacy.platform == "pan115") {
+                throw IllegalStateException(
+                    "115 旧任务缺少取链凭证（pickcode），无法自动刷新链接，请到「网盘文件」页重新下载该文件"
+                )
+            }
+            backfilled = legacy.encode()
+            legacy
+        }
+        val provider = refreshProvider
+            ?: throw IllegalStateException("刷新链接服务未就绪，请稍后重试")
+        // 同组成员（双轨/字幕）一起换链；无组则只有自己
+        val members = if (t.linkGroup.isNotBlank()) {
+            tasks.values
+                .filter { it.linkGroup == t.linkGroup && it.status in REFRESHABLE_STATES }
+                .sortedBy { it.id }
+                .ifEmpty { listOf(t) }
+        } else listOf(t)
+        val trigger = t.copy(sourceRef = backfilled ?: t.sourceRef)
+        val fresh = provider(trigger, members)
+            ?: throw IllegalStateException("未能获取新链接，请稍后重试")
+        if (!fresh.containsKey(id)) throw IllegalStateException("未能获取新链接，请稍后重试")
+        applyFreshLinks(fresh, triggerId = id, manual = manual, backfillSourceRef = backfilled)
+        members.forEach { startInternal(it.id) }
+        System.out.println("[refresh] task=$id 已换新链接续下（manual=$manual，同组 ${members.size} 个任务）")
+    }
+
+    /**
+     * 把取链方给的新链接原地落到任务记录上（refreshAndResume 与分享存量认领共用）。
+     * 大小守卫：任一成员的新链大小与记录 total 不一致 → 整体拒绝、一个都不动
+     * （双轨尤其要整体成败一致，不能一条换了另一条没换）。
+     */
+    private fun applyFreshLinks(
+        fresh: Map<Long, FreshLink>,
+        triggerId: Long,
+        manual: Boolean,
+        backfillSourceRef: String? = null
+    ) {
+        for ((mid, fl) in fresh) {
+            val m = tasks[mid] ?: continue
+            if (fl.size > 0 && m.total > 0 && fl.size != m.total) {
+                throw IllegalStateException("来源文件已发生变化（大小与原记录不一致），无法安全续下：${m.fileName}")
+            }
+        }
+        for ((mid, fl) in fresh) {
+            val m = tasks[mid] ?: continue
+            tasks[mid] = m.copy(
+                url = fl.url,
+                headers = fl.headers,
+                sourceRef = fl.sourceRef
+                    ?: if (mid == triggerId && backfillSourceRef != null) backfillSourceRef else m.sourceRef,
+                error = "",
+                autoRetry = 0,
+                autoRefreshCount = if (mid == triggerId && manual) 0 else m.autoRefreshCount
+            )
+            headersCache[mid] = fl.headers
+            cancelRetry(mid)
+            cancelAutoRefresh(mid)
+        }
+        persistTasks()
+    }
+
+    /**
+     * 分享存量认领：用户重新解析同一分享时，入队前按 resumeKey 找一个未完成的老任务，
+     * 命中则把本次解析的新链原地换给它续下（不新建任务）。只认领「无 sourceRef 的存量任务」
+     * 与「来源同为分享的新任务」——个人盘来源的任务 resumeKey 同形，不得被分享认领劫持。
+     * 同批重复解析同一文件只认领一次：已认领的 id 由调用方经 [excludeIds] 排除。
+     */
+    fun findClaimCandidate(resumeKey: String, excludeIds: Set<Long> = emptySet()): TaskRecord? {
+        if (resumeKey.isBlank()) return null
+        return tasks.values
+            .filter {
+                it.resumeKey == resumeKey && it.id !in excludeIds &&
+                    it.status in REFRESHABLE_STATES &&
+                    (it.sourceRef.isBlank() || it.sourceRef.startsWith("share|"))
+            }
+            .minWithOrNull(compareBy({ it.createdAt }, { it.id }))
+    }
+
+    /**
+     * 认领落链：把新链原地换给被认领的老任务并启动（大小守卫不过抛异常，调用方回退正常入队）。
+     */
+    fun applyClaimedLink(id: Long, fresh: FreshLink) {
+        val t = tasks[id] ?: throw IllegalArgumentException("任务不存在")
+        if (t.status !in REFRESHABLE_STATES) throw IllegalStateException("任务状态已变化，无法认领续下")
+        applyFreshLinks(mapOf(id to fresh), triggerId = id, manual = true)
+        startInternal(id)
+    }
+
+    // ---------- 自动刷新（链接失效类失败时） ----------
+
+    private fun scheduleAutoRefresh(id: Long) {
+        val t = tasks[id] ?: return
+        cancelAutoRefresh(id)
+        autoRefreshJobs[id] = scope.launch {
+            // 间隔 ≥5 分钟：第 n 次再叠加 (n-1) 个 5 分钟；另按任务 id 抖动 ≤30 秒，
+            // 多个任务同时失效时把重取链请求天然错峰（取链接口有节奏要求）
+            val wait = AUTO_REFRESH_BASE_MS * t.autoRefreshCount.coerceAtLeast(1) +
+                (id % 31) * 1000L
+            delay(wait)
+            autoRefreshJobs.remove(id)
+            // 等待期间用户可能暂停/删除/手动处理：状态变了就作罢
+            if (tasks[id]?.status != "retry_wait") return@launch
+            try {
+                refreshAndResume(id, manual = false)
+            } catch (e: Exception) {
+                // 取链失败（如游客凭证过期需登录、分享已删）：停止自动尝试，原因明示给用户
+                tasks[id]?.let {
+                    if (it.status == "retry_wait" || it.status == "queued") {
+                        tasks[id] = it.copy(
+                            status = "failed",
+                            error = "自动刷新链接失败：${e.message ?: "未知原因"}（可手动点「刷新链接并继续」重试）"
+                        )
+                        persistTasks()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun cancelAutoRefresh(id: Long) {
+        autoRefreshJobs.remove(id)?.cancel()
     }
 
     /** 设置排队优先级（-1 低 / 0 普通 / 1 高）。排队中改档下一轮闸门轮询即生效；
@@ -428,6 +634,7 @@ class DownloadService(dataDir: File) {
 
     fun delete(id: Long, deleteFile: Boolean) {
         cancelRetry(id)
+        cancelAutoRefresh(id)
         val turboId = turboIds.remove(id)
         if (turboId != null) turboToTask.remove(turboId)
         speeds.remove(id); etas.remove(id)
@@ -628,7 +835,8 @@ class DownloadService(dataDir: File) {
             speed = speeds[t.id] ?: 0L, etaMillis = etas[t.id] ?: -1L,
             error = t.error, createdAt = t.createdAt,
             batchId = t.batchId, batchName = t.batchName, relPath = t.relPath,
-            priority = t.priority
+            priority = t.priority,
+            canRefresh = canRefresh(t)
         )
     }
 
@@ -658,19 +866,24 @@ class DownloadService(dataDir: File) {
                     }
                     // 自动重试计数：自失败点后又推进 ≥32MB，说明这次重试是有效的，清零重新计数
                     var newRetry = t.autoRetry
+                    // 自动刷新计数同口径清零：否则链接每几小时过期一次的大文件会被 3 次上限卡死
+                    var newRefresh = t.autoRefreshCount
                     val base = retryBaseline[id]
-                    if (newRetry > 0 && base != null && p.downloadedBytes >= base + 32L * 1024 * 1024) {
-                        newRetry = 0
-                        retryBaseline.remove(id)
+                    if (base != null && p.downloadedBytes >= base + 32L * 1024 * 1024) {
+                        if (newRetry > 0) newRetry = 0
+                        if (newRefresh > 0) newRefresh = 0
+                        if (newRetry != t.autoRetry || newRefresh != t.autoRefreshCount) retryBaseline.remove(id)
                     }
                     if (p.downloadedBytes != t.downloaded ||
-                        (p.totalBytes > 0 && p.totalBytes != t.total) || st != t.status || newRetry != t.autoRetry
+                        (p.totalBytes > 0 && p.totalBytes != t.total) || st != t.status ||
+                        newRetry != t.autoRetry || newRefresh != t.autoRefreshCount
                     ) {
                         tasks[id] = t.copy(
                             downloaded = p.downloadedBytes,
                             total = if (p.totalBytes > 0) p.totalBytes else t.total,
                             status = st,
-                            autoRetry = newRetry
+                            autoRetry = newRetry,
+                            autoRefreshCount = newRefresh
                         )
                         // 进度落盘节流：不做高频写
                         if (System.currentTimeMillis() - lastPersistTs > 5000) persistTasks()
@@ -684,6 +897,16 @@ class DownloadService(dataDir: File) {
                 releasePlatformSlot(id)
                 File(tmpDir, "task_${id}.part").delete()
                 val t = tasks[id] ?: return@launch
+                if (autoRefreshEligible(canRefresh(t), t.autoRefreshCount, ev.reason)) {
+                    // 链接失效类失败且任务可刷新：换新链才是正解，原死链退避重试毫无意义，
+                    // 故自动刷新接管这次失败（与 autoRetry 分开记账，预算/间隔见常量）
+                    val next = t.autoRefreshCount + 1
+                    retryBaseline[id] = t.downloaded
+                    tasks[id] = t.copy(status = "retry_wait", error = ev.reason, autoRefreshCount = next)
+                    persistTasks()
+                    scheduleAutoRefresh(id)
+                    return@launch
+                }
                 val maxAuto = if (settings.autoRetry) settings.autoRetryMax.coerceIn(0, 50) else 0
                 if (t.autoRetry < maxAuto) {
                     // 自动重试：退避后续传（被限流时等一阵再试往往就好了）；手动暂停可随时打断等待

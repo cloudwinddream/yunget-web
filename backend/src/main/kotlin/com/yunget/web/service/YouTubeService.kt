@@ -572,6 +572,8 @@ class YouTubeService(
         val base = VideoNaming.renderBase(settings.videoNameTemplate, vars, info.title)
         val ids = mutableListOf<Long>()
         val notes = mutableListOf<String>()
+        // 换链续下身份：本次入队的轨道与字幕共享一个 linkGroup，刷新时整组同解析换链
+        val group = UUID.randomUUID().toString()
         val v = pick.video
         val a = pick.audio
         when {
@@ -580,16 +582,16 @@ class YouTubeService(
                 if (canMux) {
                     val (outExt, faststart) = muxContainer(pick)
                     val finalName = "$base.$outExt"
-                    ids += enqueueMuxPair(v, a, finalName, faststart, relPath)
+                    ids += enqueueMuxPair(v, a, finalName, faststart, relPath, info.id, group)
                     notes += "分轨下载，完成后自动合轨为 $finalName"
                 } else {
-                    ids += enqueueTrack(v, "$base.${v.ext.ifBlank { "mp4" }}", relPath)
-                    ids += enqueueTrack(a, "$base.audio.${a.ext.ifBlank { "m4a" }}", relPath)
+                    ids += enqueueTrack(v, "$base.${v.ext.ifBlank { "mp4" }}", relPath, info.id, group)
+                    ids += enqueueTrack(a, "$base.audio.${a.ext.ifBlank { "m4a" }}", relPath, info.id, group)
                     notes += "未检测到 ffmpeg：音视频分轨以两个文件下载，需自行合轨（设置页可一键安装 ffmpeg）"
                 }
             }
-            v != null -> ids += enqueueTrack(v, "$base.${v.ext.ifBlank { "mp4" }}", relPath)
-            a != null -> ids += enqueueTrack(a, "$base.${a.ext.ifBlank { "m4a" }}", relPath)
+            v != null -> ids += enqueueTrack(v, "$base.${v.ext.ifBlank { "mp4" }}", relPath, info.id, group)
+            a != null -> ids += enqueueTrack(a, "$base.${a.ext.ifBlank { "m4a" }}", relPath, info.id, group)
         }
         // 字幕：与成品同基名，「基名.<lang>.vtt」；取不到轨的语言跳过并记进提示
         for (lang in subLangs.distinct()) {
@@ -606,7 +608,9 @@ class YouTubeService(
                 size = -1,
                 platform = "video",
                 resumeKey = "youtube-sub-" + Integer.toHexString(sub.url.hashCode()),
-                relPath = relPath
+                relPath = relPath,
+                sourceRef = SourceRef.Yt(info.id, "", "sub", lang).encode(),
+                linkGroup = group
             )
         }
         return EnqueueOutcome(ids, notes.joinToString("；"))
@@ -645,7 +649,10 @@ class YouTubeService(
     private fun sanitizeLangKey(lang: String): String =
         lang.replace(Regex("[^A-Za-z0-9._-]"), "_").ifBlank { "sub" }
 
-    private suspend fun enqueueTrack(f: YtFormat, fileName: String, relPath: String = ""): Long =
+    private suspend fun enqueueTrack(
+        f: YtFormat, fileName: String, relPath: String = "",
+        videoId: String = "", group: String = ""
+    ): Long =
         downloadService.enqueue(
             url = f.url,
             fileName = fileName,
@@ -653,8 +660,41 @@ class YouTubeService(
             size = f.size ?: -1,
             platform = "video",
             resumeKey = "youtube-" + Integer.toHexString(f.url.hashCode()),
-            relPath = relPath
+            relPath = relPath,
+            sourceRef = if (videoId.isNotBlank()) SourceRef.Yt(videoId, f.id, "track").encode() else "",
+            linkGroup = group
         )
+
+    // ---------- 换链续下：YouTube 来源的重新取链（DownloadService.refreshProvider 的 YouTube 分发） ----------
+
+    /**
+     * 凭 video id 重跑一次 -J 解析，整组按 itag 精确匹配换链（itag 比「按高度重挑」
+     * 稳：格式集漂移时高度规则可能选到另一条流）；字幕成员按 lang 重取
+     * （官方优先、自动兜底，与入队时 resolveSubtitle 同口径）。
+     * 任一成员匹配不到 → 抛错、整组不换链。
+     */
+    suspend fun refreshLinks(task: TaskRecord, members: List<TaskRecord>): Map<Long, FreshLink>? {
+        val ref = SourceRef.parse(task.sourceRef) as? SourceRef.Yt ?: return null
+        val j = runParseJson("https://www.youtube.com/watch?v=${ref.videoId}", flatPlaylist = false)
+        val info = toVideoInfo(j)
+        val out = LinkedHashMap<Long, FreshLink>()
+        for (member in members) {
+            val mr = SourceRef.parse(member.sourceRef) as? SourceRef.Yt
+                ?: throw IllegalStateException("同组任务缺少来源信息，无法整组刷新：${member.fileName}")
+            out[member.id] = if (mr.role == "sub") {
+                val sub = resolveSubtitle(info, mr.lang, includeAuto = true)
+                    ?: throw IllegalStateException("字幕「${mr.lang}」已无可用轨道，无法刷新链接")
+                FreshLink(sub.url, emptyMap(), -1)
+            } else {
+                val f = info.formats.firstOrNull { it.id == mr.itag }
+                    ?: throw IllegalStateException(
+                        "原格式在重新解析后已不可用（平台可能调整了格式），无法刷新链接：${member.fileName}"
+                    )
+                FreshLink(f.url, f.headers, f.size ?: -1)
+            }
+        }
+        return out
+    }
 
     // ------------------------------------------------------------------
     // DASH 合轨协调（同 VideoService 模式的自包含实现：两轨下完 → ffmpeg -c copy）
@@ -676,7 +716,8 @@ class YouTubeService(
     private val muxJobs = ConcurrentHashMap<String, YtMuxJob>()
 
     private suspend fun enqueueMuxPair(
-        v: YtFormat, a: YtFormat, finalName: String, faststart: Boolean, targetRelPath: String = ""
+        v: YtFormat, a: YtFormat, finalName: String, faststart: Boolean, targetRelPath: String = "",
+        videoId: String = "", linkGroup: String = ""
     ): List<Long> {
         val groupId = UUID.randomUUID().toString()
         val rel = "$MUX_STAGING_DIR/$groupId"
@@ -687,12 +728,16 @@ class YouTubeService(
         val vId = downloadService.enqueue(
             url = v.url, fileName = vName, headers = v.headers, size = v.size ?: -1,
             platform = "video", resumeKey = "youtube-mux-$groupId-v", relPath = rel,
+            sourceRef = if (videoId.isNotBlank()) SourceRef.Yt(videoId, v.id, "mux-v").encode() else "",
+            linkGroup = linkGroup,
             onComplete = { onMuxTrackComplete(groupId) }
         )
         job.videoTaskId.set(vId)
         val aId = downloadService.enqueue(
             url = a.url, fileName = aName, headers = a.headers, size = a.size ?: -1,
             platform = "video", resumeKey = "youtube-mux-$groupId-a", relPath = rel,
+            sourceRef = if (videoId.isNotBlank()) SourceRef.Yt(videoId, a.id, "mux-a").encode() else "",
+            linkGroup = linkGroup,
             onComplete = { onMuxTrackComplete(groupId) }
         )
         job.audioTaskId.set(aId)

@@ -95,8 +95,19 @@ data class ResolveSession(
     val id: String,
     val platform: Platform,
     val session: ShareSession,
+    /** 原始分享链接与提取码：入队时写进任务 sourceRef，链接失效后凭它重建会话换新链 */
+    val shareUrl: String = "",
+    val pwd: String = "",
     val createdAt: Long = System.currentTimeMillis()
 )
+
+/** 入队结果：新任务与「认领续下」的存量任务分开计数，供界面文案区分 */
+data class EnqueueResult(
+    val newTaskIds: List<Long>,
+    val claimedTaskIds: List<Long>
+) {
+    val allTaskIds: List<Long> get() = newTaskIds + claimedTaskIds
+}
 
 /**
  * 网盘业务层：直接复用 YunGet 的协议解析代码（data/network + data/repository）。
@@ -460,17 +471,25 @@ class NetdiskService(
         return lanzouApi.listCloudFiles(cookie, params.uid, params.vei, folderId)
     }
 
-    suspend fun lanzouDriveDownload(fid: String, fname: String): Long {
+    /** 取链半段（下载入队与换链续下共用）：返回直链 + 派生 headers 用的凭证 */
+    private suspend fun lanzouDriveLink(fid: String, fname: String): Pair<DownloadLink, String> {
         val (cookie, params) = lanzouParams()
         val fileId = fid.removePrefix(LanzouConstants.FILE_PREFIX)
         val link = lanzouApi.getPersonalDownloadLink(cookie, params.uid, params.vei, fileId, fname)
+        return link to cookie
+    }
+
+    suspend fun lanzouDriveDownload(fid: String, fname: String): Long {
+        val (link, cookie) = lanzouDriveLink(fid, fname)
+        val fileId = fid.removePrefix(LanzouConstants.FILE_PREFIX)
         return downloadService.enqueue(
             url = link.downloadUrl,
             fileName = link.filename.ifBlank { fname },
             headers = downloadHeaders(Platform.LANZOU, link, cookie),
             size = link.size,
             platform = "lanzou",
-            resumeKey = "src-lanzou-$fileId-${link.size}"
+            resumeKey = "src-lanzou-$fileId-${link.size}",
+            sourceRef = SourceRef.Drive("lanzou", fid).encode()
         )
     }
 
@@ -549,19 +568,27 @@ class NetdiskService(
         return ilanzouApi.listFiles(token, uuid, folderId)
     }
 
-    suspend fun ilanzouDriveDownload(fid: String, fname: String): Long {
+    /** 取链半段（下载入队与换链续下共用） */
+    private suspend fun ilanzouDriveLink(fid: String): Pair<DownloadLink, String> {
         val (token, uuid) = ilanzouTokenUuid()
         val fileId = fid.removePrefix(ILanzouConstants.FILE_PREFIX)
         val userId = ilanzouAccounts.ensureUserId() ?: ""
         val link = ilanzouApi.getDownloadLink(token, uuid, fileId, userId)
             ?: throw IllegalStateException("蓝奏优享未返回下载地址")
+        return link to token
+    }
+
+    suspend fun ilanzouDriveDownload(fid: String, fname: String): Long {
+        val (link, token) = ilanzouDriveLink(fid)
+        val fileId = fid.removePrefix(ILanzouConstants.FILE_PREFIX)
         return downloadService.enqueue(
             url = link.downloadUrl,
             fileName = link.filename.ifBlank { fname },
             headers = downloadHeaders(Platform.ILANZOU, link, token),
             size = link.size,
             platform = "ilanzou",
-            resumeKey = "src-ilanzou-$fileId-${link.size}"
+            resumeKey = "src-ilanzou-$fileId-${link.size}",
+            sourceRef = SourceRef.Drive("ilanzou", fid).encode()
         )
     }
 
@@ -669,18 +696,25 @@ class NetdiskService(
     suspend fun guangyaDriveList(dirFid: String): List<ShareFile> =
         guangyaApi.listCloudFiles(guangyaToken(), dirFid)
 
-    suspend fun guangyaDriveDownload(fid: String, fname: String): Long {
+    /** 取链半段（下载入队与换链续下共用） */
+    private suspend fun guangyaDriveLink(fid: String, fname: String): Pair<DownloadLink, String> {
         val token = guangyaToken()
         val file = ShareFile(fid = fid, fname = fname, fsize = 0L, isdir = false, pdirFid = "", fidToken = "")
         val link = guangyaApi.getDownloadLink(token, file)
             ?: throw IllegalStateException("光鸭未返回有效下载地址，请确认下载权限")
+        return link to token
+    }
+
+    suspend fun guangyaDriveDownload(fid: String, fname: String): Long {
+        val (link, token) = guangyaDriveLink(fid, fname)
         return downloadService.enqueue(
             url = link.downloadUrl,
             fileName = link.filename.ifBlank { fname },
             headers = downloadHeaders(Platform.GUANGYA, link, token),
             size = link.size,
             platform = "guangya",
-            resumeKey = "src-guangya-$fid-${link.size}"
+            resumeKey = "src-guangya-$fid-${link.size}",
+            sourceRef = SourceRef.Drive("guangya", fid).encode()
         )
     }
 
@@ -718,19 +752,25 @@ class NetdiskService(
         return all
     }
 
-    suspend fun pan115DriveDownload(fid: String, fname: String, fidToken: String): Long {
+    /** 取链半段（下载入队与换链续下共用）：个人盘直链靠 pickcode（fidToken）走加密接口，缺它取不到链 */
+    private suspend fun pan115DriveLink(fid: String, fname: String, fidToken: String): Pair<DownloadLink, String> {
         val cookie = credentialOf(Platform.PAN115)
-        // 个人盘直链靠 pickcode（列表项 fidToken）走电脑端加密接口，缺它取不到链
         val file = ShareFile(fid = fid, fname = fname, fsize = 0L, isdir = false, pdirFid = "", fidToken = fidToken)
         val link = pan115Api.getDownloadLink(file, cookie)
             ?: throw IllegalStateException("115 未返回下载地址")
+        return link to cookie
+    }
+
+    suspend fun pan115DriveDownload(fid: String, fname: String, fidToken: String): Long {
+        val (link, cookie) = pan115DriveLink(fid, fname, fidToken)
         return downloadService.enqueue(
             url = link.downloadUrl,
             fileName = link.filename.ifBlank { fname },
             headers = downloadHeaders(Platform.PAN115, link, cookie),
             size = link.size,
             platform = "pan115",
-            resumeKey = "src-pan115-$fid-${link.size}"
+            resumeKey = "src-pan115-$fid-${link.size}",
+            sourceRef = SourceRef.Drive("pan115", fid, fidToken).encode()
         )
     }
 
@@ -777,17 +817,24 @@ class NetdiskService(
         return listCloudAll { page -> quarkApi.listCloudFiles(pdir, cookie, page = page, size = CLOUD_PAGE_SIZE) }
     }
 
-    suspend fun quarkDriveDownload(fid: String, fname: String): Long {
+    /** 取链半段（下载入队与换链续下共用） */
+    private suspend fun quarkDriveLink(fid: String): Pair<DownloadLink, String> {
         val cookie = freshCookieAsync(Platform.QUARK)
         val link = quarkApi.getDownloadLink(fid, cookie)
             ?: throw IllegalStateException("夸克未返回下载地址")
+        return link to cookie
+    }
+
+    suspend fun quarkDriveDownload(fid: String, fname: String): Long {
+        val (link, cookie) = quarkDriveLink(fid)
         return downloadService.enqueue(
             url = link.downloadUrl,
             fileName = link.filename.ifBlank { fname },
             headers = downloadHeaders(Platform.QUARK, link, cookie),
             size = link.size,
             platform = "quark",
-            resumeKey = "src-quark-$fid-${link.size}"
+            resumeKey = "src-quark-$fid-${link.size}",
+            sourceRef = SourceRef.Drive("quark", fid).encode()
         )
     }
 
@@ -824,17 +871,24 @@ class NetdiskService(
         return listCloudAll { page -> ucApi.listCloudFiles(pdir, cookie, page = page, size = CLOUD_PAGE_SIZE) }
     }
 
-    suspend fun ucDriveDownload(fid: String, fname: String): Long {
+    /** 取链半段（下载入队与换链续下共用） */
+    private suspend fun ucDriveLink(fid: String): Pair<DownloadLink, String> {
         val cookie = freshCookieAsync(Platform.UC)
         val link = ucApi.cloudGetDownloadLink(fid, cookie)
             ?: throw IllegalStateException("UC 未返回下载地址")
+        return link to cookie
+    }
+
+    suspend fun ucDriveDownload(fid: String, fname: String): Long {
+        val (link, cookie) = ucDriveLink(fid)
         return downloadService.enqueue(
             url = link.downloadUrl,
             fileName = link.filename.ifBlank { fname },
             headers = downloadHeaders(Platform.UC, link, cookie),
             size = link.size,
             platform = "uc",
-            resumeKey = "src-uc-$fid-${link.size}"
+            resumeKey = "src-uc-$fid-${link.size}",
+            sourceRef = SourceRef.Drive("uc", fid).encode()
         )
     }
 
@@ -887,19 +941,26 @@ class NetdiskService(
             ?: throw IllegalStateException("获取迅雷文件列表失败，请稍后重试")
     }
 
-    suspend fun xunleiDriveDownload(fid: String, fname: String): Long {
+    /** 取链半段（下载入队与换链续下共用）：直链抽取与分享下载完全一致
+     * （getFileDetail 内部 links.application/octet-stream 优先、web_content_link 兜底） */
+    private suspend fun xunleiDriveLink(fid: String): Pair<DownloadLink, String> {
         val token = xunleiToken()
-        // 直链抽取与分享下载完全一致：getFileDetail 内部 links.application/octet-stream 优先、web_content_link 兜底
         val link = xunleiApi.getFileDetail(fid, token, XunleiDeviceFingerprint.deviceId(), "")
             ?: throw IllegalStateException("迅雷未返回下载地址")
         if (link.downloadUrl.isBlank()) throw IllegalStateException("迅雷未返回下载地址")
+        return link to token
+    }
+
+    suspend fun xunleiDriveDownload(fid: String, fname: String): Long {
+        val (link, token) = xunleiDriveLink(fid)
         return downloadService.enqueue(
             url = link.downloadUrl,
             fileName = link.filename.ifBlank { fname },
             headers = downloadHeaders(Platform.XUNLEI, link, token),
             size = link.size,
             platform = "xunlei",
-            resumeKey = "src-xunlei-$fid-${link.size}"
+            resumeKey = "src-xunlei-$fid-${link.size}",
+            sourceRef = SourceRef.Drive("xunlei", fid).encode()
         )
     }
 
@@ -1013,7 +1074,10 @@ class NetdiskService(
         val repo = repos[platform]!!
         val sess = repo.createSession(effectiveLink, pwd?.takeIf { it.isNotBlank() }, cred).getOrThrow()
         val id = UUID.randomUUID().toString()
-        sessions[id] = ResolveSession(id, platform, sess)
+        sessions[id] = ResolveSession(
+            id, platform, sess,
+            shareUrl = effectiveLink, pwd = pwd?.takeIf { it.isNotBlank() } ?: ""
+        )
         // 记入解析历史（带分享主名称，历史页/收藏区一眼能认出是什么）
         val entry = history.record(
             effectiveLink, pwd?.takeIf { it.isNotBlank() } ?: "",
@@ -1043,7 +1107,7 @@ class NetdiskService(
      * 批量取直链并提交下载。转存+取链是串行的（网盘接口有节奏要求），
      * 每个文件取到直链后立即入队，不阻塞等待全部完成。
      */
-    suspend fun resolveAndEnqueue(sessionId: String, files: List<FileItem>): List<Long> =
+    suspend fun resolveAndEnqueue(sessionId: String, files: List<FileItem>): EnqueueResult =
         enqueueFiles(sessionId, files, batchId = "", batchName = "")
 
     // ---------- 文件夹下载：递归展开 ----------
@@ -1137,7 +1201,7 @@ class NetdiskService(
     }
 
     /** 用展开结果正式提交下载（预建目录含空目录，再逐个取链入队）。 */
-    suspend fun resolveAndEnqueueExpanded(expandId: String): List<Long> {
+    suspend fun resolveAndEnqueueExpanded(expandId: String): EnqueueResult {
         val exp = expansions.remove(expandId)
             ?: throw IllegalStateException("展开结果已过期，请重新选择")
         val base = downloadService.resolvedDownloadsDir()
@@ -1145,15 +1209,55 @@ class NetdiskService(
         return enqueueFiles(exp.sessionId, exp.files, batchId = exp.id, batchName = exp.batchName)
     }
 
+    /**
+     * 分享取链（入队与换链续下共用同一条路径，保证配方一致）：
+     * 未登录的夸克/UC 走游客取链；夸克登录态优先免转存、失败回退转存；其余走标准转存取链。
+     */
+    private suspend fun fetchShareLink(
+        s: ResolveSession,
+        repo: ShareResolveRepository,
+        shareFile: ShareFile,
+        cred: String
+    ): DownloadLink = when {
+        // 未登录（夸克/UC）：游客取链，夸克约 50MB 内、UC 实测不限；超限会给出登录提示
+        (s.platform == Platform.QUARK || s.platform == Platform.UC) && cred.isBlank() ->
+            repo.getGuestShareDownloadLink(s.session, shareFile).getOrThrow()
+        // 夸克登录态：优先免转存直取链（不占本账号空间），个别分享失败后自动回退转存
+        s.platform == Platform.QUARK && downloadService.settings.quarkNoSave ->
+            repo.getShareDownloadLinkWithoutSave(s.session, shareFile, cred)
+                .getOrElse { repo.getShareDownloadLink(s.session, shareFile, cred).getOrThrow() }
+        else -> repo.getShareDownloadLink(s.session, shareFile, cred).getOrThrow()
+    }
+
+    /** 下载完成回调：夸克/UC 转存路径下载完成后清理临时转存目录（link 无 cleanupDirFid 时为空操作） */
+    private fun completionCallback(
+        platform: Platform,
+        repo: ShareResolveRepository,
+        link: DownloadLink
+    ): suspend () -> Unit = {
+        val dirFid = link.cleanupDirFid
+        if (dirFid != null) {
+            val c = runCatching {
+                if (platform == Platform.QUARK || platform == Platform.UC) freshCookieAsync(platform)
+                else credentialOf(platform)
+            }.getOrNull()
+            if (!c.isNullOrBlank()) {
+                runCatching { repo.cleanupTempDir(dirFid, c) }
+            }
+        }
+    }
+
     private suspend fun enqueueFiles(
         sessionId: String,
         files: List<FileItem>,
         batchId: String,
         batchName: String
-    ): List<Long> {
+    ): EnqueueResult {
         val s = sessions[sessionId] ?: throw IllegalStateException("解析会话已过期，请重新解析")
         val repo = repos[s.platform]!!
-        val ids = mutableListOf<Long>()
+        val newIds = mutableListOf<Long>()
+        val claimedIds = mutableListOf<Long>()
+        val claimedThisRun = mutableSetOf<Long>()
         for (f in files) {
             if (f.isdir) continue
             val cred = shareCred(s.platform)
@@ -1162,44 +1266,115 @@ class NetdiskService(
                 isdir = false, pdirFid = f.pdirFid, fidToken = f.fidToken,
                 modifyTime = f.modifyTime
             )
-            val link = when {
-                // 未登录（夸克/UC）：游客取链，夸克约 50MB 内、UC 实测不限；超限会给出登录提示
-                (s.platform == Platform.QUARK || s.platform == Platform.UC) && cred.isBlank() ->
-                    repo.getGuestShareDownloadLink(s.session, shareFile).getOrThrow()
-                // 夸克登录态：优先免转存直取链（不占本账号空间），个别分享失败后自动回退转存
-                s.platform == Platform.QUARK && downloadService.settings.quarkNoSave ->
-                    repo.getShareDownloadLinkWithoutSave(s.session, shareFile, cred)
-                        .getOrElse { repo.getShareDownloadLink(s.session, shareFile, cred).getOrThrow() }
-                else -> repo.getShareDownloadLink(s.session, shareFile, cred).getOrThrow()
-            }
+            val link = fetchShareLink(s, repo, shareFile, cred)
             val headers = downloadHeaders(s.platform, link, cred)
+            val sourceRef = SourceRef.Share(s.platform.id, s.shareUrl, s.pwd, f.fid, f.fidToken).encode()
+            val resumeKey = "src-${s.platform.id}-${f.fid}-${link.size}"
+            // 存量认领：同一文件已有未完成的老任务（旧版入队没存来源、或来源同为分享）时，
+            // 不新建任务——把本次的新链原地换给老任务续下，它已下的分片与进度都保留。
+            // 大小守卫不过（来源文件已变）时 applyClaimedLink 抛错，回退正常入队。
+            val candidate = downloadService.findClaimCandidate(resumeKey, claimedThisRun)
+            if (candidate != null) {
+                val ok = runCatching {
+                    downloadService.applyClaimedLink(
+                        candidate.id,
+                        FreshLink(link.downloadUrl, headers, link.size, sourceRef)
+                    )
+                    // 完成回调按新链接重登记（新转存目录的清理凭据在新 link 里）
+                    downloadService.registerOnComplete(
+                        candidate.id, completionCallback(s.platform, repo, link)
+                    )
+                }.onFailure {
+                    println("[claim] 认领任务 ${candidate.id} 失败，回退新建任务：${it.message}")
+                }.isSuccess
+                if (ok) {
+                    claimedThisRun += candidate.id
+                    claimedIds += candidate.id
+                    continue
+                }
+            }
             val id = downloadService.enqueue(
                 url = link.downloadUrl,
                 fileName = link.filename.ifBlank { f.fname },
                 headers = headers,
                 size = link.size,
                 platform = s.platform.id,
-                resumeKey = "src-${s.platform.id}-${f.fid}-${link.size}",
+                resumeKey = resumeKey,
                 batchId = batchId,
                 batchName = batchName,
                 relPath = f.relPath,
-                onComplete = {
-                    // 夸克：下载完成后清理临时转存目录
-                    val dirFid = link.cleanupDirFid
-                    if (dirFid != null) {
-                        val c = runCatching {
-                            if (s.platform == Platform.QUARK || s.platform == Platform.UC) freshCookieAsync(s.platform)
-                            else credentialOf(s.platform)
-                        }.getOrNull()
-                        if (!c.isNullOrBlank()) {
-                            runCatching { repo.cleanupTempDir(dirFid, c) }
-                        }
-                    }
-                }
+                sourceRef = sourceRef,
+                onComplete = completionCallback(s.platform, repo, link)
             )
-            ids.add(id)
+            newIds.add(id)
         }
-        return ids
+        if (claimedIds.isNotEmpty()) {
+            println("[claim] 本次解析认领续下 ${claimedIds.size} 个存量任务：$claimedIds")
+        }
+        return EnqueueResult(newIds, claimedIds)
+    }
+
+    // ---------- 换链续下：网盘来源的重新取链（DownloadService.refreshProvider 的网盘分发） ----------
+
+    /**
+     * 凭任务的来源说明书重新取一条新链。headers 一律经 downloadHeaders 用新 link 与
+     * 现取凭证整套重新派生（游客 __pugs 在新 link 里、115 的 CDN Cookie 也在新 link 里），
+     * 绝不沿用任务记录里的旧 headers。members（同组任务）网盘侧不用——网盘任务无组。
+     */
+    suspend fun refreshLinks(
+        task: TaskRecord,
+        @Suppress("UNUSED_PARAMETER") members: List<TaskRecord>
+    ): Map<Long, FreshLink>? {
+        return when (val ref = SourceRef.parse(task.sourceRef)) {
+            is SourceRef.Drive -> {
+                val p = Platform.fromId(ref.platform)
+                    ?: throw IllegalStateException("未知网盘平台：${ref.platform}")
+                val fname = task.fileName
+                val (link, cred) = when (p) {
+                    Platform.QUARK -> quarkDriveLink(ref.fid)
+                    Platform.UC -> ucDriveLink(ref.fid)
+                    Platform.XUNLEI -> xunleiDriveLink(ref.fid)
+                    Platform.LANZOU -> lanzouDriveLink(ref.fid, fname)
+                    Platform.ILANZOU -> ilanzouDriveLink(ref.fid)
+                    Platform.GUANGYA -> guangyaDriveLink(ref.fid, fname)
+                    Platform.PAN115 -> {
+                        if (ref.fidToken.isBlank()) {
+                            throw IllegalStateException(
+                                "115 任务缺少取链凭证（pickcode），无法刷新链接，请到「网盘文件」页重新下载该文件"
+                            )
+                        }
+                        pan115DriveLink(ref.fid, fname, ref.fidToken)
+                    }
+                    else -> throw IllegalStateException("${p.displayName}暂不支持刷新链接")
+                }
+                mapOf(task.id to FreshLink(link.downloadUrl, downloadHeaders(p, link, cred), link.size))
+            }
+            is SourceRef.Share -> {
+                val p = Platform.fromId(ref.platform)
+                    ?: throw IllegalStateException("未知网盘平台：${ref.platform}")
+                val repo = repos[p]!!
+                val cred = shareCred(p)
+                // 重建分享会话（凭证现取；游客平台未登录时 cred 为空、走游客取链配方）
+                val sess = repo.createSession(ref.shareUrl, ref.pwd.takeIf { it.isNotBlank() }, cred).getOrThrow()
+                val rs = ResolveSession(
+                    id = "refresh-${task.id}", platform = p, session = sess,
+                    shareUrl = ref.shareUrl, pwd = ref.pwd
+                )
+                val shareFile = ShareFile(
+                    fid = ref.fid, fname = task.fileName, fsize = task.total,
+                    isdir = false, pdirFid = "", fidToken = ref.fidToken
+                )
+                val link = fetchShareLink(rs, repo, shareFile, cred)
+                // 完成回调按新链接重新登记（回调表里还留着入队时那条、绑的是旧转存目录）
+                downloadService.registerOnComplete(task.id, completionCallback(p, repo, link))
+                mapOf(
+                    task.id to FreshLink(
+                        link.downloadUrl, downloadHeaders(p, link, cred), link.size, ref.encode()
+                    )
+                )
+            }
+            else -> null
+        }
     }
 
     private fun joinRel(a: String, b: String): String = if (a.isBlank()) b else "$a/$b"

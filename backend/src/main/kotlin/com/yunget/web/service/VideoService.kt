@@ -81,6 +81,10 @@ class VideoService(
         val season: BilibiliSeason.Info? = null,
         /** B站分P选集（web 层补查得到，含各分P的 cid）；非多P视频为 null */
         val parts: BilibiliPart.Info? = null,
+        /** 短链展开后的作品页 URL：入队时写进任务 sourceRef，链接失效后凭它重解析 */
+        val pageUrl: String = "",
+        /** 主媒体实际取流的分P cid（B站 ?p=N / 换流失败回退第 1 集时按真实内容记）；0=走整页重解析 */
+        val mainCid: Long = 0,
         val createdAt: Long = System.currentTimeMillis()
     )
 
@@ -168,8 +172,19 @@ class VideoService(
             }
         }
         val id = UUID.randomUUID().toString()
+        // 换链续下的重取流身份：主媒体若是按某个分P cid 取的流（指定分P/换流成功），
+        // 记该 cid；换流失败回退第 1 集时记第 1 集的 cid，与实际下载内容保持一致
+        val mainCid = if (parts != null && bvid != null) {
+            val cur = parts.parts.firstOrNull { it.index == parts.currentIndex }
+            when {
+                cur == null -> 0L
+                partMismatch -> parts.parts.firstOrNull()?.cid ?: 0L
+                else -> cur.cid
+            }
+        } else 0L
         videoSessions[id] = VideoSession(
-            id, effectiveResult, workId = detected.id, season = season, parts = parts
+            id, effectiveResult, workId = detected.id, season = season, parts = parts,
+            pageUrl = detected.url, mainCid = mainCid
         )
         return VideoParseResponse(
             sessionId = id,
@@ -363,7 +378,10 @@ class VideoService(
         val ids = mutableListOf<Long>()
         for (i in wanted) {
             val m = s.result.medias.getOrNull(i) ?: continue
-            ids += enqueueMedia(s.result, s.workId, i, m, relPath = "", canMux = canMux)
+            ids += enqueueMedia(
+                s.result, s.workId, i, m, relPath = "", canMux = canMux,
+                pageUrl = s.pageUrl, cid = s.mainCid
+            )
         }
         if (ids.isEmpty()) throw IllegalArgumentException("没有可下载的媒体")
         return ids
@@ -381,11 +399,19 @@ class VideoService(
         index: Int,
         m: VideoMedia,
         relPath: String,
-        canMux: Boolean
+        canMux: Boolean,
+        pageUrl: String,
+        cid: Long = 0
     ): List<Long> {
         val name = renderedName(result, workId, index, m)
+        // 换链续下身份：同一媒体的各轨共享 linkGroup，刷新时整组从同一次重解析换链
+        val group = UUID.randomUUID().toString()
+        fun refFor(role: String): String = SourceRef.Video(
+            platform = result.platform.name, pageUrl = pageUrl,
+            quality = m.quality, kind = m.kind.name, role = role, cid = cid
+        ).encode()
         if (m.audioUrl.isNotBlank() && canMux) {
-            return enqueueMuxPair(m, name, relPath)
+            return enqueueMuxPair(m, name, relPath, group, refFor = ::refFor)
         }
         val ids = mutableListOf<Long>()
         ids += downloadService.enqueue(
@@ -395,7 +421,9 @@ class VideoService(
             size = m.size,
             platform = "video",
             resumeKey = "video-" + Integer.toHexString(m.url.hashCode()),
-            relPath = relPath
+            relPath = relPath,
+            sourceRef = refFor("main"),
+            linkGroup = group
         )
         if (m.audioUrl.isNotBlank()) {
             ids += downloadService.enqueue(
@@ -405,7 +433,9 @@ class VideoService(
                 size = -1,
                 platform = "video",
                 resumeKey = "video-" + Integer.toHexString(m.audioUrl.hashCode()) + "-audio",
-                relPath = relPath
+                relPath = relPath,
+                sourceRef = refFor("audio"),
+                linkGroup = group
             )
         }
         return ids
@@ -451,7 +481,10 @@ class VideoService(
                 // ——渲染前以该集在合集内的 episodes[].title 覆盖 {title} 来源（{index}
                 // 仍为合集序号，见 enqueueMedia → renderedName）；集标题为空才回退总标题
                 val named = if (ep.title.isNotBlank()) r.copy(title = ep.title) else r
-                val ids = enqueueMedia(named, ep.bvid, ep.index - 1, m, relPath = season.folder, canMux = canMux)
+                val ids = enqueueMedia(
+                    named, ep.bvid, ep.index - 1, m, relPath = season.folder, canMux = canMux,
+                    pageUrl = "https://www.bilibili.com/video/${ep.bvid}"
+                )
                 val note = when {
                     m.audioUrl.isBlank() -> ""
                     canMux -> "分轨下载，完成后自动合轨"
@@ -494,7 +527,10 @@ class VideoService(
                 val m = BilibiliPart.fetchMedia(parts.bvid, part.cid, cookie, part.title, parts.title)
                 // 命名口径：{title} 以该分P的 part 标题为准（与单集 parse 的覆盖一致）
                 val named = s.result.copy(title = part.title.ifBlank { parts.title })
-                val ids = enqueueMedia(named, parts.bvid, part.index - 1, m, relPath = parts.folder, canMux = canMux)
+                val ids = enqueueMedia(
+                    named, parts.bvid, part.index - 1, m, relPath = parts.folder, canMux = canMux,
+                    pageUrl = "https://www.bilibili.com/video/${parts.bvid}", cid = part.cid
+                )
                 val note = when {
                     m.audioUrl.isBlank() -> ""
                     canMux -> "分轨下载，完成后自动合轨"
@@ -512,6 +548,74 @@ class VideoService(
             }
         }
         return VideoListDownloadResponse(folder = parts.folder, results = results)
+    }
+
+    // ---------- 换链续下：视频来源的重新取链（DownloadService.refreshProvider 的视频分发） ----------
+
+    /**
+     * 凭来源说明书重解析并给整组（linkGroup 成员，含双轨）各配一条新链：
+     * 整组只解析一次——带 cid 的（B站分P）按 cid 取流，否则整页重解析；
+     * 逐成员按 quality＋kind 匹配（不按下标记忆，重解析后媒体顺序可能漂移）。
+     * 任一成员匹配不到 → 抛错、整组不换链（DownloadService 只在拿到全量结果时才落链）。
+     */
+    suspend fun refreshLinks(task: TaskRecord, members: List<TaskRecord>): Map<Long, FreshLink>? {
+        val ref = SourceRef.parse(task.sourceRef) as? SourceRef.Video ?: return null
+        val platform = runCatching { VideoPlatform.valueOf(ref.platform) }.getOrNull()
+            ?: throw IllegalStateException("未知视频平台：${ref.platform}")
+        // 与 parseVideo 同口径：仅 B站注入保存的登录 Cookie（DASH 高清），其余平台匿名
+        val cookie = if (platform == VideoPlatform.BILIBILI) {
+            accounts.get(BILIBILI_KEY)?.cookie?.takeIf { it.isNotBlank() } ?: ""
+        } else ""
+        val medias: List<VideoMedia> = if (ref.cid > 0) {
+            val bvid = ref.pageUrl.substringBefore('?').substringAfterLast('/')
+                .takeIf { it.startsWith("BV", ignoreCase = true) }
+                ?: throw IllegalStateException("原分P信息不完整，无法刷新链接")
+            listOf(BilibiliPart.fetchMedia(bvid, ref.cid, cookie, "", ""))
+        } else {
+            val detected = resolveDetected(ref.pageUrl)
+                ?: throw IllegalStateException("无法识别原视频链接，无法刷新链接")
+            val parser = VideoParsers.of(platform)
+                ?: throw IllegalStateException("暂不支持${platform.displayName}")
+            val result = try {
+                parser.parse(detected, cookie = cookie)
+            } catch (e: VideoParseException) {
+                throw IllegalStateException(e.userMessage())
+            }
+            result.medias
+        }
+        if (medias.isEmpty()) throw IllegalStateException("重新解析没有得到可下载的媒体")
+        val out = LinkedHashMap<Long, FreshLink>()
+        for (member in members) {
+            val mr = SourceRef.parse(member.sourceRef) as? SourceRef.Video
+                ?: throw IllegalStateException("同组任务缺少来源信息，无法整组刷新：${member.fileName}")
+            out[member.id] = matchVideoFreshLink(mr, medias)
+                ?: throw IllegalStateException(
+                    "重新解析后找不到原来的媒体（清晰度可能已被平台调整），无法刷新链接：${member.fileName}"
+                )
+        }
+        return out
+    }
+
+    /** 在重解析的媒体里按 kind 收窄、quality 优先匹配一条；音轨角色必须落在带音轨的 DASH 媒体上 */
+    private fun matchVideoFreshLink(ref: SourceRef.Video, medias: List<VideoMedia>): FreshLink? {
+        val cands = medias.filter { it.kind.name == ref.kind }
+        if (cands.isEmpty()) return null
+        val byQuality = cands.filter { it.quality == ref.quality }
+        val pool = if (byQuality.isNotEmpty()) byQuality else cands
+        return when (ref.role) {
+            "audio", "mux-a" -> {
+                val m = pool.firstOrNull { it.audioUrl.isNotBlank() } ?: return null
+                FreshLink(m.audioUrl, m.audioHeaders, -1)
+            }
+            "mux-v" -> {
+                val m = pool.firstOrNull { it.audioUrl.isNotBlank() } ?: pool.first()
+                FreshLink(m.url, m.headers, m.size)
+            }
+            else -> {
+                val m = pool.first()
+                FreshLink(m.url, m.headers, m.size)
+            }
+        }
     }
 
     /** 「片名.mp4」→「片名.audio.m4s」；无扩展名时直接追加 */
@@ -544,7 +648,13 @@ class VideoService(
 
     private val muxJobs = ConcurrentHashMap<String, MuxJob>()
 
-    private suspend fun enqueueMuxPair(m: VideoMedia, displayName: String, targetRelPath: String = ""): List<Long> {
+    private suspend fun enqueueMuxPair(
+        m: VideoMedia,
+        displayName: String,
+        targetRelPath: String = "",
+        linkGroup: String = "",
+        refFor: ((String) -> String)? = null
+    ): List<Long> {
         val groupId = UUID.randomUUID().toString()
         val rel = "$MUX_STAGING_DIR/$groupId"
         val job = MuxJob(groupId = groupId, finalName = ensureMp4Name(displayName), targetRelPath = targetRelPath)
@@ -557,6 +667,8 @@ class VideoService(
             platform = "video",
             resumeKey = "video-mux-$groupId-v",
             relPath = rel,
+            sourceRef = refFor?.invoke("mux-v") ?: "",
+            linkGroup = linkGroup,
             onComplete = { onMuxTrackComplete(groupId) }
         )
         job.videoTaskId.set(vId)
@@ -568,6 +680,8 @@ class VideoService(
             platform = "video",
             resumeKey = "video-mux-$groupId-a",
             relPath = rel,
+            sourceRef = refFor?.invoke("mux-a") ?: "",
+            linkGroup = linkGroup,
             onComplete = { onMuxTrackComplete(groupId) }
         )
         job.audioTaskId.set(aId)

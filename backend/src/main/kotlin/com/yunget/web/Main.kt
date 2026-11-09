@@ -58,6 +58,14 @@ fun main() {
     val gopeed = GopeedService(dataDir, downloads)
     val video = VideoService(downloads, accounts, dataDir)
     val youtube = YouTubeService(downloads, accounts, dataDir)
+    // 换链续下的取链分发：按来源说明书前缀路由到各来源服务（网盘 share/drive 走 NetdiskService）
+    downloads.refreshProvider = { task, members ->
+        when {
+            task.sourceRef.startsWith("video|") -> video.refreshLinks(task, members)
+            task.sourceRef.startsWith("yt|") -> youtube.refreshLinks(task, members)
+            else -> netdisk.refreshLinks(task, members)
+        }
+    }
     // 工具自动更新调度（后台协程：启动约 60 秒后首检、每 24 小时一轮，只动应用托管工具）
     val toolAutoUpdater = ToolAutoUpdater(downloads, youtube, gopeed)
     toolAutoUpdater.start()
